@@ -28,13 +28,17 @@ from run_trial import (
 RANDOM_SEED = 42
 
 
-def select_trials(trials, only_type, id_prefix, limit):
-    """Filter by type and trial_id prefix (if given), shuffle with a fixed seed, then cut to limit."""
+def select_trials(trials, only_type, id_prefix, conditions, limit):
+    """Filter by type, trial_id prefix, and condition_id (each if given), shuffle
+    with a fixed seed, then cut to limit."""
     if only_type:
         trials = [t for t in trials if t["type"] == only_type]
 
     if id_prefix:
         trials = [t for t in trials if t["trial_id"].startswith(id_prefix)]
+
+    if conditions:
+        trials = [t for t in trials if t["condition_id"] in conditions]
 
     trials = list(trials)
     Random(RANDOM_SEED).shuffle(trials)
@@ -134,7 +138,7 @@ def run_one(trial, replicate_id, model, attempt_id):
     return "invalid" if validation_error else "valid"
 
 
-def select_failed_observations(existing_results, trials_by_id, model, only_type, id_prefix, limit):
+def select_failed_observations(existing_results, trials_by_id, model, only_type, id_prefix, conditions, limit):
     """Find (trial, replicate_id) pairs that have failed attempts and no successful one.
 
     Only observations for the current model are considered, since a different
@@ -151,6 +155,8 @@ def select_failed_observations(existing_results, trials_by_id, model, only_type,
             continue
         if id_prefix and not trial_id.startswith(id_prefix):
             continue
+        if conditions and trial["condition_id"] not in conditions:
+            continue
         candidates.append((trial, replicate_id))
 
     Random(RANDOM_SEED).shuffle(candidates)
@@ -164,6 +170,12 @@ def main():
     parser.add_argument("--replicates", type=int, default=1, help="How many times to run each trial")
     parser.add_argument("--type", choices=["single", "comparison"], help="Only run this trial type")
     parser.add_argument("--id-prefix", help="Only run trials whose trial_id starts with this prefix")
+    parser.add_argument(
+        "--condition",
+        action="append",
+        dest="conditions",
+        help="Only run trials with this condition_id (repeatable to allow several)",
+    )
     parser.add_argument("--limit", type=int, help="Only run the first N selected trials (for testing)")
     parser.add_argument(
         "--retry-failed",
@@ -176,14 +188,16 @@ def main():
     model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
     existing_results = load_existing_results(RESULTS_FILE)
 
+    conditions = set(args.conditions) if args.conditions else None
+
     if args.retry_failed:
         trials_by_id = {t["trial_id"]: t for t in load_trials(TRIALS_FILE)}
         observations = select_failed_observations(
-            existing_results, trials_by_id, model, args.type, args.id_prefix, args.limit
+            existing_results, trials_by_id, model, args.type, args.id_prefix, conditions, args.limit
         )
     else:
         trials = load_trials(TRIALS_FILE)
-        trials = select_trials(trials, args.type, args.id_prefix, args.limit)
+        trials = select_trials(trials, args.type, args.id_prefix, conditions, args.limit)
         observations = build_observations(trials, args.replicates)
 
     total = len(observations)
