@@ -28,10 +28,13 @@ from run_trial import (
 RANDOM_SEED = 42
 
 
-def select_trials(trials, only_type, limit):
-    """Filter by type (if given), shuffle with a fixed seed, then cut to limit."""
+def select_trials(trials, only_type, id_prefix, limit):
+    """Filter by type and trial_id prefix (if given), shuffle with a fixed seed, then cut to limit."""
     if only_type:
         trials = [t for t in trials if t["type"] == only_type]
+
+    if id_prefix:
+        trials = [t for t in trials if t["trial_id"].startswith(id_prefix)]
 
     trials = list(trials)
     Random(RANDOM_SEED).shuffle(trials)
@@ -115,6 +118,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run many trials through the Claude API.")
     parser.add_argument("--replicates", type=int, default=1, help="How many times to run each trial")
     parser.add_argument("--type", choices=["single", "comparison"], help="Only run this trial type")
+    parser.add_argument("--id-prefix", help="Only run trials whose trial_id starts with this prefix")
     parser.add_argument("--limit", type=int, help="Only run the first N selected trials (for testing)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would run without calling the API")
     args = parser.parse_args()
@@ -122,7 +126,7 @@ def main():
     model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
 
     trials = load_trials(TRIALS_FILE)
-    trials = select_trials(trials, args.type, args.limit)
+    trials = select_trials(trials, args.type, args.id_prefix, args.limit)
     observations = build_observations(trials, args.replicates)
     existing = load_existing_observations(RESULTS_FILE)
 
