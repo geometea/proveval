@@ -43,13 +43,35 @@ def load_contrasts(path=CONTRASTS_FILE):
     return contrasts
 
 
-def contrast_context_texts(dimensions, contrast):
-    """Render the two context strings named by a contrast's "a"/"b" values.
+def assert_no_shared_identity_contradiction(dimensions, contrast):
+    """Refuse contrasts that would make one claimed identity contradict itself.
 
-    Some dimensions (e.g. writer_status) can't be rendered without a parent
-    dimension also set; a contrast can supply that via an optional "carrier"
-    dict, held constant across both sides.
+    A two-story prompt has a single "I" speaking for both stories at once. Any
+    dimension that depends_on another dimension (currently just writer_status,
+    which depends on provenance) describes a property of *the person*, not of
+    the individual story -- so it cannot validly take two different values
+    across Story A and Story B in the same prompt, no matter what carrier is
+    used: "I am a published author" for Story A and "this is my first time
+    writing" for Story B contradict each other, since they're both said by the
+    same "I" in the same breath.
+
+    Dimensions like this are single-story only (see context_single_prompts.py,
+    where each API call only ever claims one identity for one story).
     """
+    dim = dimensions[contrast["dimension"]]
+    if dim.get("depends_on"):
+        raise ValueError(
+            f"Contrast {contrast['id']!r} uses dimension {contrast['dimension']!r}, which "
+            f"depends on {dim['depends_on']!r}. Dependent dimensions describe a claimed "
+            f"identity shared by both stories in a two-story prompt, so they can't be "
+            f"contrasted across Story A/B without contradicting themselves. Use "
+            f"context_single_prompts.py for this dimension instead."
+        )
+
+
+def contrast_context_texts(dimensions, contrast):
+    """Render the two context strings named by a contrast's "a"/"b" values."""
+    assert_no_shared_identity_contradiction(dimensions, contrast)
     carrier = contrast.get("carrier", {})
     packet_a = {**carrier, contrast["dimension"]: contrast["a"]}
     packet_b = {**carrier, contrast["dimension"]: contrast["b"]}

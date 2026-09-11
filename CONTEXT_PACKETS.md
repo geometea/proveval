@@ -63,12 +63,12 @@ rating?", not "does X matter when embedded in a fully-specified packet?".
 
 ## Comparison prompt format
 
-`context_comparisons.py` implements a separate, natural-sounding comparison
-prompt (not the numeric 1-5 + preference format `comparisons.py` uses):
+`context_comparisons.py` holds a separate, natural-sounding comparison prompt
+(not the numeric 1-5 + preference format `comparisons.py` uses):
 
 - Frames the request as a casual "help me choose between these two stories,"
   with no language suggesting an experiment.
-- Story A and Story B each get their own (possibly empty) context text.
+- Story A and Story B each get their own context text.
 - Asks for a plain **A / B / tie** choice per category (plot_structure,
   prose_style, characterisation, originality, overall_quality), returned as
   JSON.
@@ -77,25 +77,41 @@ Story A and Story B are always **two different underlying texts**. An earlier
 version of this design put the same story on both sides (reasoning that
 identical text would isolate the context variable most cleanly), but models
 can reliably tell when they're being shown the same text twice, which would
-give the game away and contaminate the comparison. Two different stories
-avoids that.
+give the game away and contaminate the comparison.
 
-Since the two stories necessarily differ in underlying quality as well as
-context, isolating the context effect requires a **flip**, not a single
-comparison: `context_comparisons.single_variable_flip_examples()` builds a
-*forward* and a *swapped* trial per condition —
+A second, separate bug went through two iterations: first, giving one story a
+context signal and the other *nothing at all* is not a valid control either —
+both stories need context, and the "no signal" side isn't a neutral choice.
+The fix is `data/context_contrasts.jsonl` + `context_contrasts.py`:
 
-- forward: story_1 carries the context signal, story_2 gets nothing
-- swapped: story_2 carries the context signal, story_1 gets nothing
+- A **contrast** names two specific values of one dimension to pit against
+  each other (`{"id": ..., "dimension": ..., "a": ..., "b": ..., "hypothesis": ...}`),
+  not a signal vs. nothing.
+- For a fixed pair of two different stories, `build_contrast_trials()` builds
+  a **forward** trial (story_1 gets value `a`, story_2 gets value `b`) and a
+  **flipped** trial (the assignment is swapped). Both stories carry context in
+  both trials.
 
 If the model's preference tracks the underlying stories, the same story
 should win both trials (just moving between the A and B slots). If the
-preference instead follows whichever story is carrying the context signal —
-flipping when the signal flips — that's evidence the context, not the prose,
-is driving the choice. This is the same swap logic as the
+preference instead follows whichever story is currently carrying value `a`
+(or `b`) — flipping when the assignment flips — that's evidence the context,
+not the prose, is driving the choice. This is the same swap logic as the
 self_vs_ai/ai_vs_self and ai_vs_journal/journal_vs_ai conditions already
 analyzed in `analyze.py`, generalized to the new dimensions and to this A/B/tie
 prompt format.
+
+### Dependent dimensions can't be contrasted across two stories
+
+A two-story prompt has one "I" speaking for both stories in the same breath.
+`writer_status` describes a property of *the person*, not of the individual
+story, so a contrast like "published author" (Story A) vs "first-time writer"
+(Story B) would have that same "I" contradicting itself. `context_contrasts.py`
+refuses to build any contrast whose dimension `depends_on` another dimension
+(`assert_no_shared_identity_contradiction`) — `data/context_contrasts.jsonl`
+does not include `writer_status` contrasts for this reason. `writer_status`
+is still fully testable, just single-story only (see below), where each API
+call only ever claims one identity for one story.
 
 ## Single-story numeric rating still works
 
@@ -110,7 +126,7 @@ path the original pilot used, still available for context-packet signals.
 ## Status
 
 This only builds and prints example prompts (`python3 context_packets.py`,
-`python3 context_comparisons.py`, `python3 context_single_prompts.py`) — it
+`python3 context_contrasts.py`, `python3 context_single_prompts.py`) — it
 does not call the API, does not touch `data/items.jsonl` or
 `data/trials.jsonl`, and does not run through `run_batch.py` or `analyze.py`.
 Wiring it into an actual batch run (its own results file, its own analysis
