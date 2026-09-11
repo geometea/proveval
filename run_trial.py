@@ -33,11 +33,19 @@ def find_trial(trials, trial_id):
     return None
 
 
+def get_api_key():
+    """Read ANTHROPIC_API_KEY from the environment, stripped of whitespace."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY is not set")
+    return api_key
+
+
 def call_claude(prompt, model):
     """Send the prompt as a single user message and return the reply text."""
     import anthropic  # imported here so --dry-run works without the package installed
 
-    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+    client = anthropic.Anthropic(api_key=get_api_key())
     response = client.messages.create(
         model=model,
         max_tokens=1024,  # required by the API; not a sampling parameter
