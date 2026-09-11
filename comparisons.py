@@ -1,11 +1,11 @@
-"""Build comparison prompts for every unique pair of stories.
+"""Build comparison prompts for every pair of stories, in both A/B orders.
 
 Run this file directly to print each generated prompt to the terminal.
 No model API calls happen here yet.
 """
 
 import json
-from itertools import combinations
+from itertools import permutations
 
 ITEMS_FILE = "data/items.jsonl"
 
@@ -45,7 +45,8 @@ def build_comparison_prompt(text_a, text_b):
 
 def main():
     items = load_items(ITEMS_FILE)
-    for item_a, item_b in combinations(items, 2):
+    # permutations gives both A/B orderings for every pair
+    for item_a, item_b in permutations(items, 2):
         text_a = load_story(item_a["path"])
         text_b = load_story(item_b["path"])
         prompt = build_comparison_prompt(text_a, text_b)
