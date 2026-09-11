@@ -8,6 +8,7 @@ import json
 from itertools import permutations
 
 ITEMS_FILE = "data/items.jsonl"
+CONDITIONS_FILE = "data/comparison_conditions.jsonl"
 
 INSTRUCTION = (
     "Compare the literary quality of the following two short stories. "
@@ -34,25 +35,37 @@ def load_story(path):
         return f.read().strip()
 
 
-def build_comparison_prompt(text_a, text_b):
-    """Combine the fixed instruction with both stories, labeled A and B."""
+def build_comparison_prompt(text_a, text_b, a_context, b_context):
+    """Combine the fixed instruction with both stories, labeled A and B.
+
+    Each story's context sentence (if any) appears immediately before it.
+    """
+    a_context_line = f"{a_context}\n" if a_context else ""
+    b_context_line = f"{b_context}\n" if b_context else ""
     return (
         f"{INSTRUCTION}\n\n"
-        f'STORY A:\n"""\n{text_a}\n"""\n\n'
-        f'STORY B:\n"""\n{text_b}\n"""'
+        f'{a_context_line}STORY A:\n"""\n{text_a}\n"""\n\n'
+        f'{b_context_line}STORY B:\n"""\n{text_b}\n"""'
     )
 
 
 def main():
     items = load_items(ITEMS_FILE)
+    conditions = load_items(CONDITIONS_FILE)
     # permutations gives both A/B orderings for every pair
     for item_a, item_b in permutations(items, 2):
         text_a = load_story(item_a["path"])
         text_b = load_story(item_b["path"])
-        prompt = build_comparison_prompt(text_a, text_b)
-        print(f"--- Comparison: {item_a['id']} vs {item_b['id']} ---")
-        print(prompt)
-        print()
+        for condition in conditions:
+            prompt = build_comparison_prompt(
+                text_a, text_b, condition["a_context"], condition["b_context"]
+            )
+            print(
+                f"--- Comparison: {item_a['id']} vs {item_b['id']} "
+                f"| Condition: {condition['id']} ---"
+            )
+            print(prompt)
+            print()
 
 
 if __name__ == "__main__":
