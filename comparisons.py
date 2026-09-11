@@ -72,6 +72,11 @@ def build_comparison_prompt(text_a, text_b, a_context, b_context):
     )
 
 
+def get_control_pairs(items):
+    """Pair each story with itself, for identical-text control comparisons."""
+    return [(item, item) for item in items]
+
+
 def main():
     items = load_items(ITEMS_FILE)
     conditions = load_items(CONDITIONS_FILE)
@@ -87,6 +92,18 @@ def main():
                 f"--- Comparison: {item_a['id']} vs {item_b['id']} "
                 f"| Condition: {condition['id']} ---"
             )
+            print(prompt)
+            print()
+
+    # identical-text controls: each story compared against itself
+    for item_a, item_b in get_control_pairs(items):
+        text_a = load_story(item_a["path"])
+        text_b = load_story(item_b["path"])
+        for condition in conditions:
+            prompt = build_comparison_prompt(
+                text_a, text_b, condition["a_context"], condition["b_context"]
+            )
+            print(f"--- Comparison Control: {item_a['id']} | Condition: {condition['id']} ---")
             print(prompt)
             print()
 

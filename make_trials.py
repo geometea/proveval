@@ -66,8 +66,34 @@ def build_comparison_trials():
     return trials
 
 
+def build_comparison_control_trials():
+    """One control trial per story x comparison condition, story compared against itself."""
+    items = comparisons.load_items(comparisons.ITEMS_FILE)
+    conditions = comparisons.load_items(comparisons.CONDITIONS_FILE)
+
+    trials = []
+    for item_a, item_b in comparisons.get_control_pairs(items):
+        text = comparisons.load_story(item_a["path"])
+        for condition in conditions:
+            prompt = comparisons.build_comparison_prompt(
+                text, text, condition["a_context"], condition["b_context"]
+            )
+            trial_id = f"comparison_control__{item_a['id']}__{condition['id']}"
+            trials.append(
+                {
+                    "trial_id": trial_id,
+                    "type": "comparison_control",
+                    "story_a_id": item_a["id"],
+                    "story_b_id": item_b["id"],
+                    "condition_id": condition["id"],
+                    "prompt": prompt,
+                }
+            )
+    return trials
+
+
 def main():
-    trials = build_single_trials() + build_comparison_trials()
+    trials = build_single_trials() + build_comparison_trials() + build_comparison_control_trials()
 
     with open(TRIALS_FILE, "w") as f:
         for trial in trials:
@@ -76,10 +102,12 @@ def main():
     trial_ids = [t["trial_id"] for t in trials]
     num_single = sum(1 for t in trials if t["type"] == "single")
     num_comparison = sum(1 for t in trials if t["type"] == "comparison")
+    num_comparison_control = sum(1 for t in trials if t["type"] == "comparison_control")
 
     print(f"Total trials: {len(trials)}")
     print(f"Single-story trials: {num_single}")
     print(f"Comparative trials: {num_comparison}")
+    print(f"Identical-text control trials: {num_comparison_control}")
     print(f"All trial IDs unique: {len(trial_ids) == len(set(trial_ids))}")
 
 
