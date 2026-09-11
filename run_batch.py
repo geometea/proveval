@@ -77,10 +77,18 @@ def is_completed(records):
     return any(r["parsed_response"] is not None and r["validation_error"] is None for r in records)
 
 
-def run_one(trial, replicate_id, model):
+def next_attempt_id(records):
+    """Return the next attempt number for an observation. A missing attempt_id counts as 1."""
+    if not records:
+        return 1
+    return max(r.get("attempt_id", 1) for r in records) + 1
+
+
+def run_one(trial, replicate_id, model, attempt_id):
     """Call the API for one trial, validate it, save a result row, and return a status word.
 
-    Always saves a row, even on failure, so a failed call can still be diagnosed later.
+    Always saves a new row, even on failure, so a failed call can still be diagnosed
+    later; existing rows (from earlier attempts) are never modified or removed.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
 
@@ -93,6 +101,7 @@ def run_one(trial, replicate_id, model):
                 "trial_id": trial["trial_id"],
                 "model": model,
                 "replicate_id": replicate_id,
+                "attempt_id": attempt_id,
                 "timestamp": timestamp,
                 "stop_reason": None,
                 "input_tokens": None,
@@ -112,6 +121,7 @@ def run_one(trial, replicate_id, model):
             "trial_id": trial["trial_id"],
             "model": model,
             "replicate_id": replicate_id,
+            "attempt_id": attempt_id,
             "timestamp": timestamp,
             "stop_reason": api_result["stop_reason"],
             "input_tokens": api_result["input_tokens"],
@@ -124,21 +134,57 @@ def run_one(trial, replicate_id, model):
     return "invalid" if validation_error else "valid"
 
 
+def select_failed_observations(existing_results, trials_by_id, model, only_type, id_prefix, limit):
+    """Find (trial, replicate_id) pairs that have failed attempts and no successful one.
+
+    Only observations for the current model are considered, since a different
+    model's failure can't be retried without also re-running everything else.
+    """
+    candidates = []
+    for (trial_id, result_model, replicate_id), records in existing_results.items():
+        if result_model != model or is_completed(records):
+            continue
+        trial = trials_by_id.get(trial_id)
+        if trial is None:
+            continue  # trial no longer exists in data/trials.jsonl
+        if only_type and trial["type"] != only_type:
+            continue
+        if id_prefix and not trial_id.startswith(id_prefix):
+            continue
+        candidates.append((trial, replicate_id))
+
+    Random(RANDOM_SEED).shuffle(candidates)
+    if limit is not None:
+        candidates = candidates[:limit]
+    return candidates
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run many trials through the Claude API.")
     parser.add_argument("--replicates", type=int, default=1, help="How many times to run each trial")
     parser.add_argument("--type", choices=["single", "comparison"], help="Only run this trial type")
     parser.add_argument("--id-prefix", help="Only run trials whose trial_id starts with this prefix")
     parser.add_argument("--limit", type=int, help="Only run the first N selected trials (for testing)")
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Only select observations with a failed attempt and no successful one (ignores --replicates)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Show what would run without calling the API")
     args = parser.parse_args()
 
     model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
-
-    trials = load_trials(TRIALS_FILE)
-    trials = select_trials(trials, args.type, args.id_prefix, args.limit)
-    observations = build_observations(trials, args.replicates)
     existing_results = load_existing_results(RESULTS_FILE)
+
+    if args.retry_failed:
+        trials_by_id = {t["trial_id"]: t for t in load_trials(TRIALS_FILE)}
+        observations = select_failed_observations(
+            existing_results, trials_by_id, model, args.type, args.id_prefix, args.limit
+        )
+    else:
+        trials = load_trials(TRIALS_FILE)
+        trials = select_trials(trials, args.type, args.id_prefix, args.limit)
+        observations = build_observations(trials, args.replicates)
 
     total = len(observations)
     for i, (trial, replicate_id) in enumerate(observations, start=1):
@@ -151,16 +197,18 @@ def main():
             continue
 
         is_retry = bool(records)  # records exist, but none of them are valid
+        attempt_id = next_attempt_id(records)
 
         if args.dry_run:
-            print(f"{label} — {'retrying-failed' if is_retry else 'planned'}")
+            status = f"retrying-failed (attempt {attempt_id})" if is_retry else "planned"
+            print(f"{label} — {status}")
             continue
 
         if is_retry:
-            print(f"{label} — retrying-failed")
+            print(f"{label} — retrying-failed (attempt {attempt_id})")
 
         try:
-            status = run_one(trial, replicate_id, model)
+            status = run_one(trial, replicate_id, model, attempt_id)
             print(f"{label} — {status}")
         except Exception as e:
             print(f"{label} — error: {e}")
