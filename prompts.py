@@ -20,6 +20,12 @@ def load_items(path):
     return items
 
 
+def load_story(path):
+    """Read the story text from its .txt file."""
+    with open(path, "r") as f:
+        return f.read().strip()
+
+
 def build_prompt(text):
     """Wrap a piece of prose in a neutral evaluation prompt."""
     return (
@@ -32,7 +38,8 @@ def build_prompt(text):
 def main():
     items = load_items(ITEMS_FILE)
     for item in items:
-        prompt = build_prompt(item["text"])
+        text = load_story(item["path"])
+        prompt = build_prompt(text)
         print(f"--- Prompt for item {item['id']} ---")
         print(prompt)
         print()
