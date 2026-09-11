@@ -53,9 +53,13 @@ def build_observations(trials, replicates):
     return observations
 
 
-def load_existing_observations(path):
-    """Return the set of (trial_id, model, replicate_id) already saved."""
-    existing = set()
+def load_existing_results(path):
+    """Return {(trial_id, model, replicate_id): [existing result records]}.
+
+    A key can have more than one record if earlier attempts failed and were
+    retried; failures are never deleted, only added to.
+    """
+    existing = {}
     if not os.path.exists(path):
         return existing
     with open(path, "r") as f:
@@ -63,8 +67,14 @@ def load_existing_observations(path):
             line = line.strip()
             if line:
                 result = json.loads(line)
-                existing.add((result["trial_id"], result["model"], result["replicate_id"]))
+                key = (result["trial_id"], result["model"], result["replicate_id"])
+                existing.setdefault(key, []).append(result)
     return existing
+
+
+def is_completed(records):
+    """A key is done only if one of its records has a valid parsed response."""
+    return any(r["parsed_response"] is not None and r["validation_error"] is None for r in records)
 
 
 def run_one(trial, replicate_id, model):
@@ -128,24 +138,29 @@ def main():
     trials = load_trials(TRIALS_FILE)
     trials = select_trials(trials, args.type, args.id_prefix, args.limit)
     observations = build_observations(trials, args.replicates)
-    existing = load_existing_observations(RESULTS_FILE)
+    existing_results = load_existing_results(RESULTS_FILE)
 
     total = len(observations)
     for i, (trial, replicate_id) in enumerate(observations, start=1):
         key = (trial["trial_id"], model, replicate_id)
         label = f"{i} / {total} — {trial['trial_id']} — replicate {replicate_id}"
+        records = existing_results.get(key, [])
 
-        if key in existing:
-            print(f"{label} — skipped")
+        if records and is_completed(records):
+            print(f"{label} — skipped-valid")
             continue
+
+        is_retry = bool(records)  # records exist, but none of them are valid
 
         if args.dry_run:
-            print(f"{label} — planned")
+            print(f"{label} — {'retrying-failed' if is_retry else 'planned'}")
             continue
+
+        if is_retry:
+            print(f"{label} — retrying-failed")
 
         try:
             status = run_one(trial, replicate_id, model)
-            existing.add(key)
             print(f"{label} — {status}")
         except Exception as e:
             print(f"{label} — error: {e}")

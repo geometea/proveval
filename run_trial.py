@@ -56,7 +56,7 @@ def call_claude(prompt, model):
     client = anthropic.Anthropic(api_key=get_api_key())
     response = client.messages.create(
         model=model,
-        max_tokens=1024,  # required by the API; not a sampling parameter
+        max_tokens=4096,  # required by the API; not a sampling parameter
         messages=[{"role": "user", "content": prompt}],
     )
 
