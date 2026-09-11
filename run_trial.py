@@ -105,14 +105,28 @@ def validate_comparison_response(parsed):
     return None
 
 
+def strip_code_fence(text):
+    """Remove a surrounding Markdown code fence (```json ... ``` or ``` ... ```), if present."""
+    text = text.strip()
+    if not text.startswith("```"):
+        return text
+
+    lines = text.split("\n")
+    lines = lines[1:]  # drop the opening ``` or ```json line
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
 def parse_and_validate(response_text, trial_type):
     """Try to parse response_text as JSON and check it matches the expected shape.
 
     Returns (parsed_response, validation_error). On any failure, parsed_response
-    is None and validation_error explains why.
+    is None and validation_error explains why. response_text is unwrapped from a
+    Markdown code fence first, if the model added one.
     """
     try:
-        parsed = json.loads(response_text)
+        parsed = json.loads(strip_code_fence(response_text))
     except json.JSONDecodeError:
         return None, "Response is not valid JSON"
 
