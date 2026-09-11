@@ -11,10 +11,33 @@ ITEMS_FILE = "data/items.jsonl"
 CONDITIONS_FILE = "data/comparison_conditions.jsonl"
 
 INSTRUCTION = (
-    "Compare the literary quality of the following two short stories. "
-    "Which is stronger overall? Discuss the strengths and weaknesses of "
-    "each, explain your preference, and base your judgment only on the "
-    "texts."
+    "Rate both of the following short stories on each dimension from 1 to "
+    "5, where 1 is very poor and 5 is excellent. Base your ratings on the "
+    "texts themselves.\n\n"
+    "Also give a comparative preference score:\n"
+    "-2 = strongly prefer Story A\n"
+    "-1 = slightly prefer Story A\n"
+    "0 = tie\n"
+    "+1 = slightly prefer Story B\n"
+    "+2 = strongly prefer Story B\n\n"
+    "Respond with ONLY valid JSON in exactly this form:\n\n"
+    "{\n"
+    '  "story_a": {\n'
+    '    "plot_structure": 1,\n'
+    '    "prose_style": 1,\n'
+    '    "characterization": 1,\n'
+    '    "originality": 1,\n'
+    '    "overall_quality": 1\n'
+    "  },\n"
+    '  "story_b": {\n'
+    '    "plot_structure": 1,\n'
+    '    "prose_style": 1,\n'
+    '    "characterization": 1,\n'
+    '    "originality": 1,\n'
+    '    "overall_quality": 1\n'
+    "  },\n"
+    '  "preference": 0\n'
+    "}"
 )
 
 
