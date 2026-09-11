@@ -51,7 +51,13 @@ def call_claude(prompt, model):
         max_tokens=1024,  # required by the API; not a sampling parameter
         messages=[{"role": "user", "content": prompt}],
     )
-    return response.content[0].text
+
+    text_blocks = [block.text for block in response.content if block.type == "text"]
+    if not text_blocks:
+        block_types = [block.type for block in response.content]
+        raise ValueError(f"No text blocks in response. Block types were: {block_types}")
+
+    return "\n".join(text_blocks)
 
 
 def save_result(trial_id, model, response_text):
