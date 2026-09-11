@@ -73,18 +73,46 @@ prompt (not the numeric 1-5 + preference format `comparisons.py` uses):
   prose_style, characterisation, originality, overall_quality), returned as
   JSON.
 
-`context_comparisons.single_variable_examples()` builds example trials using
-the **same underlying story on both sides** — Story A gets no context, Story
-B gets exactly one context signal. Because the text is identical, the context
-sentence is the only thing that could account for any difference in the
-model's A/B/tie choices. (This mirrors the identical-text controls already
-used in `comparisons.py`.)
+Story A and Story B are always **two different underlying texts**. An earlier
+version of this design put the same story on both sides (reasoning that
+identical text would isolate the context variable most cleanly), but models
+can reliably tell when they're being shown the same text twice, which would
+give the game away and contaminate the comparison. Two different stories
+avoids that.
+
+Since the two stories necessarily differ in underlying quality as well as
+context, isolating the context effect requires a **flip**, not a single
+comparison: `context_comparisons.single_variable_flip_examples()` builds a
+*forward* and a *swapped* trial per condition —
+
+- forward: story_1 carries the context signal, story_2 gets nothing
+- swapped: story_2 carries the context signal, story_1 gets nothing
+
+If the model's preference tracks the underlying stories, the same story
+should win both trials (just moving between the A and B slots). If the
+preference instead follows whichever story is carrying the context signal —
+flipping when the signal flips — that's evidence the context, not the prose,
+is driving the choice. This is the same swap logic as the
+self_vs_ai/ai_vs_self and ai_vs_journal/journal_vs_ai conditions already
+analyzed in `analyze.py`, generalized to the new dimensions and to this A/B/tie
+prompt format.
+
+## Single-story numeric rating still works
+
+`prompts.build_prompt(text, context, instruction)` already accepts an
+arbitrary context string, so a `context_packets.render_packet()` result plugs
+straight into the existing single-story 1-5 rating pipeline with **no changes
+to `prompts.py`**. `context_single_prompts.py` demonstrates this: it builds
+one single-story rating prompt per single-variable condition, using
+`prompts.py`'s existing `rating` task unchanged. This is the numeric-score
+path the original pilot used, still available for context-packet signals.
 
 ## Status
 
 This only builds and prints example prompts (`python3 context_packets.py`,
-`python3 context_comparisons.py`) — it does not call the API, does not touch
-`data/items.jsonl` or `data/trials.jsonl`, and does not run through
-`run_batch.py` or `analyze.py`. Wiring it into an actual batch run (its own
-results file, its own analysis for A/B/tie outcomes) is a follow-up step, not
-done here.
+`python3 context_comparisons.py`, `python3 context_single_prompts.py`) — it
+does not call the API, does not touch `data/items.jsonl` or
+`data/trials.jsonl`, and does not run through `run_batch.py` or `analyze.py`.
+Wiring it into an actual batch run (its own results file, its own analysis
+for the A/B/tie flip outcomes and for the numeric ratings) is a follow-up
+step, not done here.
