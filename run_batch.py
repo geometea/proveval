@@ -29,7 +29,7 @@ RANDOM_SEED = 42
 
 
 def select_trials(trials, only_type, limit):
-    """Filter by type, shuffle with a fixed seed, then cut to limit."""
+    """Filter by type (if given), shuffle with a fixed seed, then cut to limit."""
     if only_type:
         trials = [t for t in trials if t["type"] == only_type]
 
@@ -65,8 +65,32 @@ def load_existing_observations(path):
 
 
 def run_one(trial, replicate_id, model):
-    """Call the API for one trial, validate the response, and save the result."""
-    api_result = call_claude(trial["prompt"], model)
+    """Call the API for one trial, validate it, save a result row, and return a status word.
+
+    Always saves a row, even on failure, so a failed call can still be diagnosed later.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    try:
+        api_result = call_claude(trial["prompt"], model)
+    except Exception as e:
+        print(f"Error calling the API for {trial['trial_id']} (replicate {replicate_id}): {e}")
+        save_result(
+            {
+                "trial_id": trial["trial_id"],
+                "model": model,
+                "replicate_id": replicate_id,
+                "timestamp": timestamp,
+                "stop_reason": None,
+                "input_tokens": None,
+                "output_tokens": None,
+                "response_text": None,
+                "parsed_response": None,
+                "validation_error": f"API call failed: {e}",
+            }
+        )
+        return "error"
+
     response_text = api_result["response_text"]
     parsed_response, validation_error = parse_and_validate(response_text, trial["type"])
 
@@ -75,7 +99,7 @@ def run_one(trial, replicate_id, model):
             "trial_id": trial["trial_id"],
             "model": model,
             "replicate_id": replicate_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": timestamp,
             "stop_reason": api_result["stop_reason"],
             "input_tokens": api_result["input_tokens"],
             "output_tokens": api_result["output_tokens"],
@@ -84,7 +108,7 @@ def run_one(trial, replicate_id, model):
             "validation_error": validation_error,
         }
     )
-    return validation_error
+    return "invalid" if validation_error else "valid"
 
 
 def main():
@@ -105,23 +129,22 @@ def main():
     total = len(observations)
     for i, (trial, replicate_id) in enumerate(observations, start=1):
         key = (trial["trial_id"], model, replicate_id)
-        label = f"{i} / {total} | {trial['trial_id']} | replicate {replicate_id}"
+        label = f"{i} / {total} — {trial['trial_id']} — replicate {replicate_id}"
 
         if key in existing:
-            print(f"{label} -- skipped (already have this result)")
+            print(f"{label} — skipped")
             continue
 
         if args.dry_run:
-            print(f"{label} -- would call the API (model: {model})")
+            print(f"{label} — planned")
             continue
 
         try:
-            validation_error = run_one(trial, replicate_id, model)
+            status = run_one(trial, replicate_id, model)
             existing.add(key)
-            status = "invalid" if validation_error else "valid"
-            print(f"{label} -- {status}")
+            print(f"{label} — {status}")
         except Exception as e:
-            print(f"{label} -- FAILED: {e}")
+            print(f"{label} — error: {e}")
 
 
 if __name__ == "__main__":
