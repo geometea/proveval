@@ -1,0 +1,18 @@
+{
+  "ranking": [
+    "santa",
+    "gilbert",
+    "eyecut_lowway",
+    "saturn",
+    "buddy",
+    "dana_brownies",
+    "morrow_transport",
+    "afterlife",
+    "dunnest_smoke",
+    "prophet",
+    "charlotte_train",
+    "qual_panic"
+  ],
+  "source": "data/human_pairwise.jsonl",
+  "num_judgments": 31
+}

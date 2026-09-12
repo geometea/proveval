@@ -149,11 +149,26 @@ pairwise judgments (`data/human_pairwise.jsonl`), not invented or estimated.
 `human_ranking.py` checks the judgments for cycles/contradictions and
 computes a full ranking only when the judgments collected so far uniquely
 determine one (via topological sort, requiring the "next" story to be
-unambiguous at every step). This is meant to let just enough adaptive
+unambiguous at every step). This was meant to let just enough adaptive
 pairwise comparisons be collected to pin down a full order, rather than
-requiring all C(12,2) = 66 pairs. As of this document, only 2 judgments are
-known and the ranking is **not** complete or unique -- `data/human_reference.json`
-does not exist yet, and nothing here claims otherwise.
+requiring all C(12,2) = 66 pairs, and in the end 31 judgments were needed and
+collected.
+
+**Status: complete.** All 31 judgments in `data/human_pairwise.jsonl` are
+free of direct contradictions and cycles, and uniquely determine a full
+ranking. `human_ranking.py` has written `data/human_reference.json`
+(`num_judgments: 31`):
+
+```
+1. santa            5. buddy            9.  dunnest_smoke
+2. gilbert          6. dana_brownies    10. prophet
+3. eyecut_lowway    7. morrow_transport 11. charlotte_train
+4. saturn           8. afterlife        12. qual_panic
+```
+
+`analyze_context.py` picks this up automatically (see "Rankings and human
+alignment" below) -- no code change was needed for this, since it was
+already written to gracefully use the reference once it exists.
 
 ## Rankings and human alignment
 

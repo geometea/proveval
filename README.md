@@ -22,10 +22,12 @@ preference ranking better than others.
   response validators, batch runner, and offline analysis all exist and are
   exercised with dry-runs and synthetic fixtures — see `CONTEXT_PACKETS.md`
   for exactly what's built. No benchmark API calls have been made yet.
-- **Human reference ranking: partial.** 2 of the needed pairwise judgments
-  are recorded in `data/human_pairwise.jsonl`; that's not enough to
-  determine a full order yet, so `data/human_reference.json` does not exist.
-  `human_ranking.py` will write it once enough judgments are collected.
+- **Human reference ranking: complete.** 31 pairwise judgments are recorded
+  in `data/human_pairwise.jsonl`, with no contradictions or cycles, and they
+  uniquely determine a full ranking of all 12 corpus stories.
+  `human_ranking.py` has written `data/human_reference.json`
+  (`num_judgments: 31`), which `analyze_context.py` now picks up
+  automatically for Spearman correlation and pairwise-agreement comparisons.
 
 See `EXPERIMENT.md` for the original v0.1 design write-up.
 
@@ -100,10 +102,14 @@ See `EXPERIMENT.md` for the original v0.1 design write-up.
   alongside the original 1-5 and story_a/story_b/preference schemas, fully
   backward compatible. `--dry-run` never calls the API in either script.
 - `data/human_pairwise.jsonl` — known human pairwise judgments (winner,
-  loser), seeded only with judgments actually made.
+  loser); 31 judgments, all actually made (never invented).
 - `human_ranking.py` — checks those judgments for cycles/contradictions and
   writes `data/human_reference.json` only once they uniquely determine a
-  complete ranking (not yet — see Status above).
+  complete ranking. They now do — see Status above.
+- `data/human_reference.json` — the complete, unique 12-story human
+  preference ranking derived from the above (regenerate with
+  `python3 human_ranking.py`; only written when the judgments are
+  contradiction-free and uniquely determine a full order).
 - `analyze_context.py` — separate from `analyze.py`: collapses retries,
   joins each result to its trial's structured metadata (embedded in the
   result row, or by looking the trial back up if needed), summarizes
