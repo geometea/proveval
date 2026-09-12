@@ -91,6 +91,26 @@ def render_packet(dimensions, packet):
     return " ".join(sentences)
 
 
+def neutral_condition():
+    """The empty-context baseline for context_single trials: no dimension set
+    at all, so context_text is "". This is v0.2's own clean single-text
+    baseline (separate from the v0.1 pilot's "neutral" condition in
+    data/conditions.jsonl) -- every single-variable condition and every
+    per-condition ranking in analyze_context.py is implicitly compared
+    against this. See context_trials.build_context_single_trials, which adds
+    one of these per story alongside every single_variable_conditions() entry.
+    """
+    return {
+        "condition_id": "neutral",
+        "dimension": "neutral",
+        "value": "neutral",
+        "packet": {},
+        "context_text": "",
+        "note": "",
+        "hypothesis": "Baseline: no context signal presented at all.",
+    }
+
+
 def single_variable_conditions(dimensions):
     """Build one example condition per (dimension, value), isolating that one variable.
 

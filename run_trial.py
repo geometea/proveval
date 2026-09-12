@@ -166,8 +166,11 @@ def parse_and_validate(response_text, trial_type):
     Dispatch by trial_type, preserving the exact old behavior for the two
     original types:
       "single" / "context_single"        -> 1-5 ratings (unchanged schema)
-      "context_pairwise" / "context_prompt" -> A/B/tie per category (new;
-        parsed_response is normalized to use "characterization")
+      "context_pairwise" / "context_prompt" / "context_pairwise_same"
+        -> A/B/tie per category (new; parsed_response is normalized to use
+        "characterization"). "context_pairwise_same" is the OPTIONAL,
+        never-run same-context trial family (context_trials.py); it reuses
+        this schema since it uses the same A/B/tie prompt template.
       anything else (e.g. "comparison", "comparison_control", and any future
         or unrecognized type) -> the original story_a/story_b/preference
         schema, exactly as before this function grew a dispatch at all.
@@ -181,7 +184,7 @@ def parse_and_validate(response_text, trial_type):
         error = validate_single_response(parsed)
         return (None, error) if error else (parsed, None)
 
-    if trial_type in ("context_pairwise", "context_prompt"):
+    if trial_type in ("context_pairwise", "context_prompt", "context_pairwise_same"):
         return validate_pairwise_context_response(parsed)
 
     error = validate_comparison_response(parsed)
@@ -209,7 +212,10 @@ def resolve_model(cli_model):
 # would just duplicate what's already in the trials file. Old trial types
 # ("single", "comparison", "comparison_control") are left exactly as before:
 # their saved rows keep the same shape they've always had.
-CONTEXT_TRIAL_TYPES = ("context_single", "context_pairwise", "context_prompt")
+# "context_pairwise_same" is the OPTIONAL same-context trial family; it's
+# listed here for forward-compatibility (so it would be handled correctly
+# *if* ever run), not because it's part of any required run.
+CONTEXT_TRIAL_TYPES = ("context_single", "context_pairwise", "context_prompt", "context_pairwise_same")
 
 
 def trial_metadata(trial):

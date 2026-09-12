@@ -84,10 +84,15 @@ See `EXPERIMENT.md` for the original v0.1 design write-up.
 - `context_single_prompts.py` — drives the existing single-story numeric
   rating pipeline (`prompts.py`, unmodified) with context-packet signals.
 - `context_trials.py` — the manifest generator: combines the above into
-  `data/context_trials.jsonl` (2112 trials: 264 `context_single`, 1716
-  `context_pairwise`, 132 `context_prompt`), each trial carrying explicit
-  structured metadata (story ids, dimension, contrast_id, assignment, etc.)
-  rather than requiring trial_id parsing.
+  `data/context_trials.jsonl` (2124 trials: 276 `context_single` — 12
+  stories × (22 single-variable conditions + 1 neutral no-context baseline)
+  — 1716 `context_pairwise`, 132 `context_prompt`), each trial carrying
+  explicit structured metadata (story ids, dimension, contrast_id,
+  assignment, etc.) rather than requiring trial_id parsing. Also generates
+  an OPTIONAL, never-run same-context pairwise family (1254 trials, both
+  stories sharing one claimed context value) to a separate gitignored file,
+  `data/context_trials_optional_same_context.jsonl` — not part of the
+  required manifest or any planned run.
 - `run_trial.py` / `run_batch.py` — now accept `--trials-file`,
   `--results-file`, and `--model`, so the v0.1 pilot and v0.2 benchmark never
   share a results file by accident. Response validation now also accepts
@@ -102,11 +107,15 @@ See `EXPERIMENT.md` for the original v0.1 design write-up.
 - `analyze_context.py` — separate from `analyze.py`: collapses retries,
   joins each result to its trial's structured metadata (embedded in the
   result row, or by looking the trial back up if needed), summarizes
-  forward/flipped and prompt-level context effects, computes two provisional
-  rankings (pairwise Copeland/win-rate and single-text mean score), and
-  compares each against the human reference (Spearman rank correlation, pure
-  Python, plus pairwise agreement) when available. Writes CSVs to
-  `results/context_analysis/`.
+  forward/flipped and prompt-level context effects, and computes rankings.
+  **Primary** analysis: a separate single-text ranking per
+  `(model, dimension, value)` — including the neutral baseline — each
+  compared against the human reference (Spearman rank correlation, pure
+  Python, plus pairwise agreement) when available, since this is what can
+  actually answer "which model + context setup best matches the human
+  ranking?" Also computes a pooled single-text ranking and a pooled pairwise
+  Copeland/win-rate ranking, both clearly labelled **diagnostic only** — see
+  `FINAL_DESIGN.md`. Writes CSVs to `results/context_analysis/`.
 - `results/context_raw.jsonl` — suggested results path for the benchmark
   (via `--results-file`); not committed, and never the same file as the
   pilot's `results/raw.jsonl`.
@@ -136,7 +145,8 @@ python3 analyze.py                      # analyze results/raw.jsonl
 python3 context_packets.py              # preview single-variable example conditions
 python3 context_contrasts.py            # preview forward/flipped story-scope prompts
 python3 context_single_prompts.py       # preview single-story context prompts
-python3 context_trials.py               # regenerate data/context_trials.jsonl (2112 trials)
+python3 context_trials.py               # regenerate data/context_trials.jsonl (2124 trials)
+                                         # + optional never-run same-context family (separate file)
 
 # dry-run against the new manifest, writing to a separate results file
 python3 run_batch.py --trials-file data/context_trials.jsonl \

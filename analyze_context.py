@@ -292,6 +292,8 @@ def compute_pairwise_wins(observations):
     trials' overall_quality choice regardless of which context condition was
     applied. This deliberately treats context as noise to average over, to
     get one baseline "how does this model rank the corpus" estimate per model.
+    DIAGNOSTIC ONLY -- see rank_from_pairwise_wins for why this can't be read
+    as a ranking "under" any particular context condition.
     """
     records = defaultdict(lambda: defaultdict(lambda: {"wins": 0, "losses": 0, "ties": 0}))
     for obs in observations.values():
@@ -315,8 +317,20 @@ def compute_pairwise_wins(observations):
 def rank_from_pairwise_wins(tally_by_story):
     """Copeland score (wins - losses) as the primary sort key, win_rate as a
     tiebreaker. This is ONE simple, transparent ranking estimator -- not the
-    only possible method (e.g. it ignores strength of opponent, and pools
-    forward/flipped trials rather than analyzing them separately)."""
+    only possible method (e.g. it ignores strength of opponent).
+
+    DIAGNOSTIC ONLY, not a per-condition ranking: it pools every
+    context_pairwise observation regardless of contrast/assignment. The
+    forward/flipped contrast trials are built to measure *causal context
+    sensitivity* (see analyze_pairwise_context_effects above) -- each
+    observation only ever pits two *different* claimed context values against
+    each other, so there is no single context condition this pooled ranking
+    can honestly be said to be "under". Do not present it as a per-condition
+    human-alignment result; use it only as a rough sanity-check baseline. A
+    true per-condition pairwise ranking would need the OPTIONAL same-context
+    trial family (context_trials.build_context_pairwise_same_trials), which
+    is not part of any required run -- see FINAL_DESIGN.md.
+    """
     rows = []
     for story_id, tally in tally_by_story.items():
         games = tally["wins"] + tally["losses"] + tally["ties"]
@@ -328,13 +342,17 @@ def rank_from_pairwise_wins(tally_by_story):
 
 
 # ---------------------------------------------------------------------------
-# F. Provisional ranking from single-text overall_quality mean scores
+# F. Rankings from single-text overall_quality scores
 # ---------------------------------------------------------------------------
 
 def rank_from_single_text(observations):
-    """Per model: mean overall_quality across ALL context_single trials for
-    each story, pooling every dimension/value condition. Provisional, same
-    caveat as the pairwise ranking above."""
+    """DIAGNOSTIC ONLY: per model, mean overall_quality across ALL
+    context_single trials for each story, pooling every dimension/value
+    condition (including the neutral baseline) together. This answers "how
+    does this model rank the corpus on average, across every context this
+    benchmark happened to try" -- a rough sanity check, not a per-condition
+    human-alignment result. Use rank_from_single_text_by_condition for that.
+    """
     scores = defaultdict(lambda: defaultdict(list))
     for obs in observations.values():
         if obs["type"] != "context_single":
@@ -346,6 +364,36 @@ def rank_from_single_text(observations):
         rows = [(story_id, statistics.mean(values), len(values)) for story_id, values in by_story.items()]
         rows.sort(key=lambda r: (-r[1], r[0]))
         rankings[model] = rows
+    return rankings
+
+
+def rank_from_single_text_by_condition(observations):
+    """PRIMARY human-alignment ranking: one story ranking per
+    (model, dimension, value), built from mean overall_quality across
+    context_single trials -- kept separate rather than pooled across
+    conditions. This includes the neutral baseline as its own condition
+    (dimension="neutral", value="neutral"; see context_packets.neutral_condition
+    and context_trials.build_context_single_trials).
+
+    This is what can actually answer "which model + context setup best
+    matches the fixed human preference ranking?" -- a pooled ranking cannot,
+    since it averages away exactly the context distinction the benchmark
+    exists to measure.
+
+    Returns {(model, dimension, value): [(story_id, mean_score, n), ...]}.
+    """
+    scores = defaultdict(lambda: defaultdict(list))
+    for obs in observations.values():
+        if obs["type"] != "context_single":
+            continue
+        key = (obs["model"], obs["dimension"], obs["value"])
+        scores[key][obs["story_id"]].append(obs["parsed_response"]["overall_quality"])
+
+    rankings = {}
+    for key, by_story in scores.items():
+        rows = [(story_id, statistics.mean(values), len(values)) for story_id, values in by_story.items()]
+        rows.sort(key=lambda r: (-r[1], r[0]))
+        rankings[key] = rows
     return rankings
 
 
@@ -425,65 +473,98 @@ def main():
     prompt_effect_rows = analyze_prompt_context_effects(observations)
     summarize_prompt_context_effects(prompt_effect_rows)
 
-    # I. everything below is grouped by model so multi-model runs slot in naturally
-    pairwise_wins = compute_pairwise_wins(observations)
-    pairwise_rankings_by_model = {}
-    pairwise_ranking_rows = []
-    print("\n=== E. Pairwise (overall_quality) ranking -- provisional Copeland/win-rate estimator ===")
-    print("(pools all context_pairwise trials regardless of context condition; one of several possible ranking methods)")
-    for model, tally_by_story in sorted(pairwise_wins.items()):
-        ranked = rank_from_pairwise_wins(tally_by_story)
-        pairwise_rankings_by_model[model] = [row[0] for row in ranked]
-        print(f"  Model: {model}")
-        for i, (story_id, copeland, win_rate, games) in enumerate(ranked, start=1):
-            print(f"    {i}. {story_id}  (copeland={copeland}, win_rate={win_rate:.2f}, games={games})")
-            pairwise_ranking_rows.append(
-                {"model": model, "rank": i, "story_id": story_id, "copeland": copeland, "win_rate": round(win_rate, 3), "games": games}
-            )
+    human_reference = load_human_reference()
+    human_pairs = load_human_pairwise()
 
-    single_rankings_by_model_raw = rank_from_single_text(observations)
-    single_rankings_by_model = {}
+    def human_comparison_row(model, dimension, value, ranking_source, ranking):
+        spearman = spearman_correlation(ranking, human_reference) if human_reference is not None else None
+        agreement, checked = pairwise_agreement_with_human(ranking, human_pairs)
+        return {
+            "model": model,
+            "dimension": dimension,
+            "value": value,
+            "ranking_source": ranking_source,
+            "spearman_vs_human": round(spearman, 3) if spearman is not None else "",
+            "pairwise_agreement": round(agreement, 3) if agreement is not None else "",
+            "pairwise_agreement_n": checked,
+        }, spearman, agreement, checked
+
+    human_comparison_rows = []
+
+    # --- PRIMARY: single-text ranking vs human reference, kept separate per
+    # (model, dimension, value) -- this is what actually answers "which model
+    # + context setup best matches the human preference ranking?" ---
+    single_by_condition = rank_from_single_text_by_condition(observations)
+    single_by_condition_rows = []
+    print("\n=== F1. PRIMARY human-alignment analysis: single-text ranking per (model, dimension, value) ===")
+    print("(includes the neutral no-context baseline as its own condition; NOT pooled across conditions)")
+    if not single_by_condition:
+        print("  No context_single observations found.")
+    for (model, dimension, value), ranked in sorted(single_by_condition.items(), key=lambda kv: str(kv[0])):
+        ranking = [row[0] for row in ranked]
+        print(f"  Model: {model}  dimension={dimension}  value={value}")
+        for i, (story_id, mean_score, n) in enumerate(ranked, start=1):
+            print(f"    {i}. {story_id}  (mean_overall_quality={mean_score:.2f}, n={n})")
+            single_by_condition_rows.append(
+                {
+                    "model": model, "dimension": dimension, "value": value,
+                    "rank": i, "story_id": story_id,
+                    "mean_overall_quality": round(mean_score, 3), "n": n,
+                }
+            )
+        row, spearman, agreement, checked = human_comparison_row(
+            model, dimension, value, "single_text_per_condition", ranking
+        )
+        human_comparison_rows.append(row)
+        spearman_text = f"{spearman:.3f}" if spearman is not None else "unavailable"
+        agreement_text = f"{agreement:.2f} ({checked} known pair(s))" if agreement is not None else "unavailable"
+        print(f"    vs human reference: Spearman={spearman_text}  pairwise_agreement={agreement_text}")
+
+    # --- DIAGNOSTIC ONLY below: pooled rankings, not per-condition results ---
+    print("\n=== F2. Diagnostic only: single-text ranking pooled across ALL conditions ===")
+    print("(averages over every context_single trial regardless of dimension/value; a rough sanity check, NOT the main result)")
+    single_pooled_by_model = rank_from_single_text(observations)
     single_ranking_rows = []
-    print("\n=== F. Single-text (overall_quality) ranking -- provisional mean-score estimator ===")
-    print("(pools all context_single trials regardless of context condition; one of several possible ranking methods)")
-    for model, ranked in sorted(single_rankings_by_model_raw.items()):
-        single_rankings_by_model[model] = [row[0] for row in ranked]
+    for model, ranked in sorted(single_pooled_by_model.items()):
+        ranking = [row[0] for row in ranked]
         print(f"  Model: {model}")
         for i, (story_id, mean_score, n) in enumerate(ranked, start=1):
             print(f"    {i}. {story_id}  (mean_overall_quality={mean_score:.2f}, n={n})")
             single_ranking_rows.append(
                 {"model": model, "rank": i, "story_id": story_id, "mean_overall_quality": round(mean_score, 3), "n": n}
             )
+        row, spearman, agreement, checked = human_comparison_row(
+            model, "ALL", "ALL", "single_text_pooled_diagnostic", ranking
+        )
+        human_comparison_rows.append(row)
 
-    human_reference = load_human_reference()
-    human_pairs = load_human_pairwise()
+    print("\n=== E. Diagnostic only: pooled pairwise (overall_quality) ranking ===")
+    print("(pools all context_pairwise trials/contrasts/forward+flipped; these trials measure causal")
+    print(" context SENSITIVITY, not a ranking under any one context condition -- see")
+    print(" rank_from_pairwise_wins docstring. Not the main human-alignment result.)")
+    pairwise_wins = compute_pairwise_wins(observations)
+    pairwise_ranking_rows = []
+    for model, tally_by_story in sorted(pairwise_wins.items()):
+        ranked = rank_from_pairwise_wins(tally_by_story)
+        ranking = [row[0] for row in ranked]
+        print(f"  Model: {model}")
+        for i, (story_id, copeland, win_rate, games) in enumerate(ranked, start=1):
+            print(f"    {i}. {story_id}  (copeland={copeland}, win_rate={win_rate:.2f}, games={games})")
+            pairwise_ranking_rows.append(
+                {"model": model, "rank": i, "story_id": story_id, "copeland": copeland, "win_rate": round(win_rate, 3), "games": games}
+            )
+        row, spearman, agreement, checked = human_comparison_row(
+            model, "ALL", "ALL", "pairwise_pooled_diagnostic", ranking
+        )
+        human_comparison_rows.append(row)
 
-    print("\n=== G/H. Comparison against human reference ===")
+    print("\n=== G/H. Comparison against human reference: availability ===")
     if human_reference is None:
         print("  data/human_reference.json does not exist yet (run human_ranking.py once enough")
         print("  pairwise judgments are collected). Spearman correlation is unavailable for now.")
     if not human_pairs:
         print("  data/human_pairwise.jsonl has no judgments yet. Pairwise agreement is unavailable.")
-
-    human_comparison_rows = []
-    for source_name, rankings_by_model in (("pairwise", pairwise_rankings_by_model), ("single_text", single_rankings_by_model)):
-        for model, ranking in sorted(rankings_by_model.items()):
-            spearman = spearman_correlation(ranking, human_reference) if human_reference is not None else None
-            agreement, checked = pairwise_agreement_with_human(ranking, human_pairs)
-            print(f"  [{source_name}] model={model}:")
-            spearman_text = f"{spearman:.3f}" if spearman is not None else "unavailable"
-            print(f"    Spearman vs human reference: {spearman_text}")
-            agreement_text = f"{agreement:.2f} ({checked} known pair(s) checked)" if agreement is not None else "unavailable"
-            print(f"    Pairwise agreement with known human judgments: {agreement_text}")
-            human_comparison_rows.append(
-                {
-                    "ranking_source": source_name,
-                    "model": model,
-                    "spearman_vs_human": round(spearman, 3) if spearman is not None else "",
-                    "pairwise_agreement": round(agreement, 3) if agreement is not None else "",
-                    "pairwise_agreement_n": checked,
-                }
-            )
+    print(f"  Full model/dimension/value breakdown written to {ANALYSIS_DIR}/human_comparison.csv")
 
     os.makedirs(ANALYSIS_DIR, exist_ok=True)
 
@@ -500,16 +581,21 @@ def main():
     write_csv(
         pairwise_ranking_rows,
         ["model", "rank", "story_id", "copeland", "win_rate", "games"],
-        os.path.join(ANALYSIS_DIR, "pairwise_rankings.csv"),
+        os.path.join(ANALYSIS_DIR, "pairwise_rankings_pooled_diagnostic.csv"),
     )
     write_csv(
         single_ranking_rows,
         ["model", "rank", "story_id", "mean_overall_quality", "n"],
-        os.path.join(ANALYSIS_DIR, "single_text_rankings.csv"),
+        os.path.join(ANALYSIS_DIR, "single_text_rankings_pooled_diagnostic.csv"),
+    )
+    write_csv(
+        single_by_condition_rows,
+        ["model", "dimension", "value", "rank", "story_id", "mean_overall_quality", "n"],
+        os.path.join(ANALYSIS_DIR, "single_text_rankings_by_condition.csv"),
     )
     write_csv(
         human_comparison_rows,
-        ["ranking_source", "model", "spearman_vs_human", "pairwise_agreement", "pairwise_agreement_n"],
+        ["model", "dimension", "value", "ranking_source", "spearman_vs_human", "pairwise_agreement", "pairwise_agreement_n"],
         os.path.join(ANALYSIS_DIR, "human_comparison.csv"),
     )
 

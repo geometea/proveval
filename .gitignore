@@ -4,8 +4,11 @@ __pycache__/
 venv/
 .env
 
-# Deterministic, regeneratable build artifact (2112 trials with full story
-# text embedded twice per pairwise trial -- ~38MB). Regenerate locally with
-# `python3 context_trials.py` rather than committing it; unlike the small
-# v0.1 data/trials.jsonl, this one is too large to keep in git history.
+# Deterministic, regeneratable build artifacts (full story text embedded
+# twice per pairwise trial -- tens of MB). Regenerate locally with
+# `python3 context_trials.py` rather than committing them; unlike the small
+# v0.1 data/trials.jsonl, these are too large to keep in git history.
 data/context_trials.jsonl
+# OPTIONAL, never-run same-context pairwise family -- see context_trials.py's
+# build_context_pairwise_same_trials docstring and FINAL_DESIGN.md.
+data/context_trials_optional_same_context.jsonl

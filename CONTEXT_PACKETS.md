@@ -66,7 +66,11 @@ all).
 `(dimension, value)`, meant to be compared against an **empty baseline**
 packet (no context sentence). That keeps the comparison to exactly one
 signal — provenance is either unstated or states one thing, never a bundle of
-claims.
+claims. `context_packets.neutral_condition()` materializes that empty
+baseline as an explicit condition (`dimension="neutral"`, `value="neutral"`,
+`context_text=""`) rather than leaving it implicit — `context_trials.py`
+adds one of these per story to `data/context_trials.jsonl`, so v0.2 has its
+own clean no-context baseline trial to compare every other condition against.
 
 `writer_status` is the one exception: since it can't be expressed without a
 `provenance`, its conditions pin `provenance` to a fixed carrier value
@@ -152,12 +156,22 @@ path the original pilot used, still available for context-packet signals.
 
 `context_trials.py` combines everything above into
 `data/context_trials.jsonl` (regenerate with `python3 context_trials.py`):
-264 `context_single` trials (12 stories × 22 single-variable conditions), 1716
-`context_pairwise` trials (66 story pairs × 13 story-scope contrasts × 2
-directions), and 132 `context_prompt` trials (66 pairs × 1 prompt-scope
-contrast × 2 values). Every trial carries explicit structured metadata
-(story ids, `dimension`, `contrast_id`, `assignment`, etc.) rather than
-requiring anything to be parsed back out of `trial_id`.
+276 `context_single` trials (12 stories × (22 single-variable conditions + 1
+neutral no-context baseline)), 1716 `context_pairwise` trials (66 story pairs
+× 13 story-scope contrasts × 2 directions), and 132 `context_prompt` trials
+(66 pairs × 1 prompt-scope contrast × 2 values) -- 2124 total. Every trial
+carries explicit structured metadata (story ids, `dimension`, `contrast_id`,
+`assignment`, etc.) rather than requiring anything to be parsed back out of
+`trial_id`.
+
+`context_trials.build_context_pairwise_same_trials()` additionally generates
+an **optional** family (1254 trials: 66 pairs × 19 non-dependent
+dimension values) where Story A and Story B share the *same* claimed context
+value, written to a separate gitignored file
+(`data/context_trials_optional_same_context.jsonl`) rather than into the
+required manifest above. It exists so a true per-condition pairwise ranking
+could be computed in the future (see FINAL_DESIGN.md); it is not part of any
+required run, and no results exist for it.
 
 ## What's wired up (and what isn't)
 
@@ -174,13 +188,22 @@ requiring anything to be parsed back out of `trial_id`.
   pilot's own trials file.
 - `analyze_context.py` runs completely offline against a results file,
   collapses retries, summarizes forward/flipped and prompt-level context
-  effects, computes two provisional rankings, and compares them against
+  effects, and computes rankings. The **primary** human-alignment analysis
+  keeps single-text rankings separate per `(model, dimension, value)`
+  (including the neutral baseline) and compares each one against
   `data/human_reference.json` (once it exists) via pure-Python Spearman
   correlation plus pairwise agreement against `data/human_pairwise.jsonl`.
-  Writes CSVs to `results/context_analysis/`.
+  A pooled single-text ranking and a pooled pairwise Copeland/win-rate
+  ranking are also computed but clearly labelled **diagnostic only** — see
+  "Rankings and human alignment" in `FINAL_DESIGN.md` for why pooling across
+  conditions would hide the effect this benchmark measures. Writes CSVs to
+  `results/context_analysis/`.
 
 **Not done:** no benchmark API calls have actually been made. The trial
-count above (2112) is deliberately generated in full since generation is
-free, but running any of it is a separate, deliberate step -- see the
-"Budget constraints" section of `FINAL_DESIGN.md` for how `run_batch.py`'s
-filters are meant to be used to select a slice worth paying for.
+count above (2124, plus 1254 optional/never-run) is deliberately generated
+in full since generation is free, but running any of it is a separate,
+deliberate step -- see the "Budget constraints" section of
+`FINAL_DESIGN.md` for how `run_batch.py`'s filters are meant to be used to
+select a slice worth paying for. The optional same-context pairwise family
+is additionally excluded from `data/context_trials.jsonl` itself, not just
+from what gets run, so it can't be picked up by accident.
