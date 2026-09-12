@@ -1,5 +1,11 @@
 # Proveval v0.1 Experimental Design
 
+> **Status:** this is the original v0.1 design doc. The pilot it describes has
+> since run — see `PILOT_RESULTS.md` for what was found, `FINAL_DESIGN.md` for
+> the frozen post-pilot study design, and `CONTEXT_PACKETS.md` for a separate,
+> newer (not yet run) way of composing context signals. A couple of details
+> below have been updated inline to match what was actually implemented.
+
 ## Research question
 
 How sensitive are LLM evaluations of fixed prose to socially salient but
@@ -20,8 +26,7 @@ across conditions.
 - `literary_journal` — said to have appeared in a literary journal
 - `ai` — said to be AI-generated
 - `neutral_metadata` — irrelevant factual metadata with no obvious prestige
-  or social valence (not yet implemented in `data/conditions.jsonl`, which
-  currently has `crit_group` in this slot)
+  or social valence
 
 ### Primary single-text outcomes
 
@@ -45,6 +50,8 @@ Each pair of stories is shown in both A/B orders, under:
 - `neutral`
 - AI vs. literary journal
 - literary journal vs. AI
+- self (user-authored) vs. AI
+- AI vs. self (user-authored)
 
 ### Primary comparative outcome
 
@@ -63,7 +70,8 @@ changes or reverses the model's preference.
 - Repeated independent samples
 - Structured output validation
 - `neutral_metadata` condition
-- Later: identical-text pairwise control (comparing a story against itself)
+- Identical-text pairwise control (comparing a story against itself,
+  implemented in `comparisons.py`/`make_trials.py`)
 
 ## Limitations
 
