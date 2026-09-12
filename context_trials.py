@@ -3,11 +3,13 @@
 Three trial families, each carrying explicit structured metadata (no need to
 parse trial_id to recover it -- see item 2/6 of the design):
 
-- context_single:   one story, one story-scope context signal, 1-5 ratings
-                     (reuses prompts.py's existing "rating" task, unmodified).
-- context_pairwise: two different stories, one story-scope contrast, in both
-                     forward and flipped attribution (reuses
-                     context_contrasts.build_contrast_trials).
+- context_single:   one story, one story-scope context signal, v0.2's own
+                     1.0-10.0 decimal rating task (data/context_tasks.jsonl,
+                     separate from the v0.1 pilot's integer 1-5 task).
+- context_pairwise: two different stories, one story-scope contrast, in the
+                     full 4-cell counterbalance of context assignment x
+                     display position (reuses
+                     context_contrasts.build_contrast_block).
 - context_prompt:   two different stories with neutral (no) story-level
                      context, one prompt-scope contrast -- an extraneous
                      sentence appended to the shared request, not attributed
@@ -32,7 +34,7 @@ from itertools import combinations
 import prompts
 import context_comparisons
 from context_packets import load_dimensions, dimensions_with_scope, single_variable_conditions, neutral_condition
-from context_contrasts import load_contrasts, build_contrast_trials
+from context_contrasts import load_contrasts, build_contrast_block
 
 ITEMS_FILE = "data/items.jsonl"
 PROMPT_CONTRASTS_FILE = "data/context_prompt_contrasts.jsonl"
@@ -86,9 +88,15 @@ def story_pairs(items):
 # context_single: one story, one story-scope signal, 1-5 ratings
 # ---------------------------------------------------------------------------
 
+CONTEXT_TASKS_FILE = "data/context_tasks.jsonl"
+
+
 def build_context_single_trials(dimensions, items):
-    tasks = prompts.load_items(prompts.TASKS_FILE)
-    rating_task = next(t for t in tasks if t["id"] == "rating")
+    # v0.2 uses its own 1.0-10.0 decimal rating task (data/context_tasks.jsonl),
+    # not the v0.1 pilot's integer 1-5 "rating" task in data/tasks.jsonl --
+    # see run_trial.validate_context_single_response.
+    tasks = prompts.load_items(CONTEXT_TASKS_FILE)
+    rating_task = next(t for t in tasks if t["id"] == "context_rating")
 
     # neutral_condition() first: one no-context baseline per story, so v0.2
     # has its own clean single-text baseline (dimension="neutral",
@@ -116,7 +124,9 @@ def build_context_single_trials(dimensions, items):
 
 
 # ---------------------------------------------------------------------------
-# context_pairwise: two stories, one story-scope contrast, forward + flipped
+# context_pairwise: two stories, one story-scope contrast, full 4-cell
+# counterbalance of context assignment x display position (see
+# context_contrasts.build_contrast_block)
 # ---------------------------------------------------------------------------
 
 def build_context_pairwise_trials(dimensions, items):
@@ -125,26 +135,8 @@ def build_context_pairwise_trials(dimensions, items):
 
     for story_1, story_2 in story_pairs(items):
         for contrast in contrasts:
-            forward, flipped = build_contrast_trials(dimensions, contrast, story_1, story_2)
-
-            for trial, assignment, context_a, context_b in (
-                (forward, "forward", {"value": contrast["a"], "clause": contrast["a_clause"]}, {"value": contrast["b"], "clause": contrast["b_clause"]}),
-                (flipped, "flipped", {"value": contrast["b"], "clause": contrast["b_clause"]}, {"value": contrast["a"], "clause": contrast["a_clause"]}),
-            ):
-                trials.append(
-                    {
-                        "trial_id": trial["trial_id"],
-                        "type": "context_pairwise",
-                        "story_a_id": trial["story_a_id"],
-                        "story_b_id": trial["story_b_id"],
-                        "contrast_id": contrast["id"],
-                        "dimension": contrast["dimension"],
-                        "assignment": assignment,
-                        "context_a": context_a,
-                        "context_b": context_b,
-                        "prompt": trial["prompt"],
-                    }
-                )
+            for cell in build_contrast_block(dimensions, contrast, story_1, story_2):
+                trials.append({**cell, "type": "context_pairwise"})
     return trials
 
 

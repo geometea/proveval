@@ -45,12 +45,23 @@ Two response formats, both over the same five dimensions (plot_structure,
 prose_style, characterization, originality, overall_quality):
 
 - **Single-text multidimensional ratings** -- one story, one context
-  condition, a 1-5 score per dimension (`prompts.py`, `context_single`
-  trials in `context_trials.py`). Every story also gets its own explicit
-  no-context `neutral` baseline trial (`context_packets.neutral_condition`),
-  distinct from any of the v0.1 pilot's own conditions -- this is v0.2's own
-  clean single-text baseline, and the reference point every other
-  single-text condition is compared against.
+  condition, a **1.0-10.0 score per dimension, to one decimal place**
+  (`data/context_tasks.jsonl`, `context_single` trials in
+  `context_trials.py`) -- a distinct, separately validated schema from the
+  v0.1 pilot's coarser integer 1-5 scale (`run_trial.validate_context_single_response`
+  vs. `validate_single_response`; the pilot's own task/validator are
+  untouched). The extra resolution is anchored, not decorative: the task
+  instruction gives five verbal bands (very poor / weak / mixed-average /
+  good / excellent) spanning the 1-10 range, so a score like 7.3 means
+  something rather than being arbitrary precision. The point of the finer
+  scale is more resolution than 5 integer bins -- **not** to eliminate ties;
+  exact ties remain fully legitimate and are never broken artificially (see
+  "Rankings and human alignment" below). Every story also gets its own
+  explicit no-context `neutral` **baseline** trial
+  (`context_packets.neutral_condition`), distinct from any of the v0.1
+  pilot's own conditions. This neutral condition is a **reference point for
+  measuring context sensitivity, not a ground-truth score and not assumed
+  unbiased** -- see "Treatment vs. neutral baseline" below.
 - **Pairwise multidimensional A/B/tie judgments** -- two different stories,
   a per-dimension choice of "A", "B", or "tie" (`context_comparisons.py`,
   `context_pairwise`/`context_prompt` trials in `context_trials.py`).
@@ -86,26 +97,52 @@ Explicit value-vs-value contrasts (never a signal vs. nothing) live in
 `data/context_contrasts.jsonl` (story-scope) and
 `data/context_prompt_contrasts.jsonl` (prompt-scope).
 
-### Forward/flipped assignment
+### Four-cell counterbalanced pairwise block
 
-For pairwise trials, `story_1` is always Story A and `story_2` is always
-Story B; only which value of the contrast each side carries is swapped
-between the **forward** and **flipped** trial. If a model's A/B/tie choice
-is really about the underlying prose, the same A/B position should keep
-winning across the forward/flipped pair; if it changes when only the
-attribution is swapped, that's evidence of a context effect rather than a
-prose-quality judgment. (See `context_contrasts.py` for why: same story
-twice is detectable by the model, and one side with no context at all isn't
-a valid control either -- both were tried and rejected during design.)
+For a story pair {story_1, story_2} and a contrast {value a, value b},
+`context_contrasts.build_contrast_block()` crosses BOTH of:
+
+- **assignment** -- which contrast value each story is attributed
+  ("forward": story_1 gets `a`, story_2 gets `b`; "flipped": the reverse),
+- **position** -- which story is DISPLAYED as Story A ("story1_as_a" or
+  "story2_as_a")
+
+into 4 cells sharing one `block_id`:
+
+```
+cell 1: assignment=forward, position=story1_as_a -> A=story_1(a), B=story_2(b)
+cell 2: assignment=forward, position=story2_as_a -> A=story_2(b), B=story_1(a)
+cell 3: assignment=flipped, position=story1_as_a -> A=story_1(b), B=story_2(a)
+cell 4: assignment=flipped, position=story2_as_a -> A=story_2(a), B=story_1(b)
+```
+
+An earlier version held position fixed (story_1 was always Story A) and
+only varied assignment -- that isolates context sensitivity from story
+identity, but leaves display position fully confounded with story identity,
+so it can't separate a context-assignment effect from a raw display-position
+effect. Crossing both factors makes them separable: cells 1/2 share one
+context assignment and differ only in position; cells 3/4 share the other
+assignment and also differ only in position. (See `context_contrasts.py`
+for two more rejected designs: the same story shown twice is detectable by
+the model, and one side with no context at all isn't a valid control
+either.)
+
+Every cell's trial carries `story_1_id`/`story_2_id` (the pair's fixed
+identities, for grouping a block regardless of display position) alongside
+`story_a_id`/`story_b_id` (whichever story is actually shown in which
+position for that cell) and `context_a`/`context_b`, so analysis can always
+recover "which story got which context" and "which story was chosen"
+independent of the raw A/B letters -- see `analyze_context.choice_to_story_id`
+and "Rankings and human alignment" below.
 
 **Important limitation:** because every `context_pairwise` observation pits
 two *different* claimed context values against each other (never the same
 value on both sides), these trials are built to measure **causal context
-sensitivity** -- whether swapping the attribution changes the decision --
-not to produce a ranking "under" one context condition. A ranking pooled
-across every contrast/forward/flipped trial is a rough diagnostic at best
-(see "Rankings and human alignment" below); it is not a `context_single`
--style per-condition result and must not be read as one.
+sensitivity** -- whether the display-position-corrected preference changes
+with context assignment -- not to produce a ranking "under" one context
+condition. A ranking pooled across every contrast/cell is a rough diagnostic
+at best (see "Rankings and human alignment" below); it is not a
+`context_single`-style per-condition result and must not be read as one.
 
 ### Optional same-context pairwise family (not run)
 
@@ -142,6 +179,49 @@ itself Claude, this is intended to let later analysis separate:
 No claim is made yet about which of these, if any, is present -- that's an
 empirical question for the actual benchmark run.
 
+## Sampling regime
+
+Two named sampling regimes exist (`run_trial.SAMPLING_REGIMES`), and every
+v0.2 result row records which one produced it:
+
+- **`low_variance_primary`** (default) -- pins `temperature=0` explicitly,
+  the lowest-variance inference setting the API exposes for this request
+  type, for the cleanest causal/context-sensitivity measurement. This is
+  **not** an assumption that responses are literally deterministic --
+  repeated replicates are still collected, and backend nondeterminism is
+  expected to be empirically visible in them (see "Replication" below).
+  This is the regime the primary benchmark analysis is run under.
+- **`provider_default_secondary`** -- no temperature override; provider
+  defaults. A distinct, later robustness check on whether the same effects
+  persist under more naturalistic usage. Supported by the runner and result
+  schema now; **not run** by anything in this repo.
+
+`analyze_context.py` only ever analyzes one regime at a time
+(`--sampling-regime`, default `low_variance_primary`) and reports how many
+observations it excluded because they belonged to the other regime -- the
+two regimes cannot be silently pooled by omission.
+
+## Replication
+
+`run_batch.py --replicates-treatment N --replicates-neutral M` (falling
+back to `--replicates` for either when unset) lets the neutral no-context
+baseline be sampled at a different rate than treatment conditions. By
+default `M` equals `N`; setting `M` below `N` is a configuration error the
+runner refuses, since the neutral baseline is reused as the reference point
+for every treatment-vs-neutral delta on that story and should never be
+sampled less than any individual treatment condition. There is no hardcoded
+multiplier -- how much more precisely to estimate neutral is a call made at
+run time, not baked into the code.
+
+Repeated replicate observations of the exact same trial are never reduced
+to a majority vote or filtered as "noise": every valid response is kept as
+its own observation (see `analyze_context.collapse_attempts`, which
+collapses failed *attempts*, never *replicates*). The design goal is enough
+repetition to estimate quantities like P(story X preferred | condition C)
+or a rating's typical spread, not to treat one API call as the model's
+fixed, deterministic answer. Final replication counts are a decision to
+make when choosing what to actually run, not fixed by this document.
+
 ## Human reference ranking
 
 A fixed human preference ranking of the 12-text corpus, derived from human
@@ -170,51 +250,104 @@ ranking. `human_ranking.py` has written `data/human_reference.json`
 alignment" below) -- no code change was needed for this, since it was
 already written to gracefully use the reference once it exists.
 
-## Rankings and human alignment
+## Four distinct questions, not one "ranking" analysis
 
-The question "which model + context setup best matches the fixed human
-preference ranking?" needs a ranking **per context condition**, not one
-ranking per model averaged across every condition the benchmark happened to
-try -- averaging across conditions is exactly what would hide the effect
-this benchmark exists to measure.
+`analyze_context.py` deliberately keeps four questions separate rather than
+collapsing them into a single ranking result:
 
-- **Primary analysis: per-condition single-text rankings.**
-  `analyze_context.rank_from_single_text_by_condition` builds one story
-  ranking for every `(model, dimension, value)` combination seen in
-  `context_single` results, including the `neutral` no-context baseline as
-  its own condition. For every such ranking, if `data/human_reference.json`
-  exists, `analyze_context.py` computes:
-  - **Spearman rank correlation** against the human reference (pure Python,
-    no scipy dependency -- a few lines for two full, tie-free rankings of
-    the same item set).
-  - **Pairwise agreement** against the raw judgments in
-    `data/human_pairwise.jsonl`, which works even before a complete
-    reference ranking exists (it only needs the specific pairs already
-    judged).
+|            | A. Effect of context (this study's main question)              | B. Resemblance to the human reference |
+|------------|-------------------------------------------------------------|----------------------------------------|
+| Single-text | Does context move the SAME story's score relative to its own neutral baseline? -- `analyze_treatment_vs_neutral` | Does the (possibly tied) score ordering under one condition resemble the human ordering? -- `rank_from_single_text_by_condition` + Kendall tau-b / tie-aware Spearman |
+| Pairwise    | Does assigning context to a story change its probability of being preferred? -- `analyze_directional_pairwise_effects` | Do direct model pairwise choices resemble the human's direct pairwise judgments? -- `analyze_pairwise_vs_human_reference` |
 
-  Written to `results/context_analysis/human_comparison.csv`
-  (`model, dimension, value, ranking_source, spearman_vs_human,
-  pairwise_agreement, pairwise_agreement_n`) and
-  `single_text_rankings_by_condition.csv`. This is the analysis meant to
-  answer the question above -- not the diagnostics below.
+### Single-text A: treatment vs. neutral baseline
 
-- **Diagnostics only, clearly labelled as such, never the headline result:**
-  - A pooled single-text ranking (`single_text_pooled_diagnostic`): mean
-    `overall_quality` per story, averaged across every `context_single`
-    condition. Useful as a rough sanity check; hides exactly the
-    per-condition distinction the benchmark is testing for.
-  - A pooled pairwise ranking (`pairwise_pooled_diagnostic`): a
-    Copeland/win-rate estimate from `overall_quality` judgments, pooled
-    across every contrast and both forward/flipped assignments. As noted
-    above, `context_pairwise` trials don't represent any single context
-    condition to begin with, so this is not, and must not be presented as,
-    a ranking "under" a particular context -- it is a rough baseline at
-    best. (The optional same-context pairwise family, if ever run, would be
-    needed for a true per-condition pairwise ranking -- see above.)
+For every story and treatment condition:
 
-  Both estimators are explicitly documented in `analyze_context.py` as
-  simple, transparent, but not-the-only-possible ranking methods (e.g. the
-  pairwise estimator ignores strength of opponent).
+```
+delta = treatment_rating - neutral_baseline_mean(model, story)
+```
+
+computed for all five rating dimensions, including `overall_quality`. The
+neutral baseline is a **reference point**, not ground truth and not assumed
+unbiased -- see "Sampling regime" and "Replication" above for how it's
+estimated. Reported at three levels (never only the most-aggregated one):
+individual treatment observation, story x treatment condition (averaged
+across that story's replicates), and aggregated model x dimension x value
+(averaged across every story). CSVs: `treatment_vs_neutral_observations.csv`,
+`..._by_story_condition.csv`, `..._by_model_dimension_value.csv`.
+
+### Single-text B: tie-aware ranking vs. the human reference
+
+`rank_from_single_text_by_condition` builds one score dict per
+`(model, dimension, value)` -- including the neutral baseline as its own
+condition -- and **never** breaks a tie via story ID, filename, insertion
+order, or any other arbitrary field: `tied_groups()` reports the actual tie
+groups and their shared rank position. Against `data/human_reference.json`:
+
+- **Kendall's tau-b (PRIMARY)** -- correctly excludes tied pairs from the
+  concordant/discordant count on either side, rather than forcing an
+  arbitrary order (which the tie-free tau-a formula would require).
+- **Tie-aware Spearman correlation (SECONDARY)** -- Pearson correlation of
+  each side's *average* ranks, the standard tie-corrected formula; never the
+  tie-free shortcut.
+- A separate **concordant / discordant / model_tied** count against the raw
+  judgments in `data/human_pairwise.jsonl` -- a model tie is reported as
+  `model_tied`, never silently converted into a fabricated win or loss.
+
+Written to `results/context_analysis/human_comparison.csv` and
+`single_text_rankings_by_condition.csv`. A pooled ranking across all
+conditions (`single_text_pooled_diagnostic`) is also computed but is
+explicitly a **diagnostic only**: it hides exactly the per-condition
+distinction the benchmark exists to measure (averaging can even wash out a
+real, opposite-signed effect into an apparent null -- see the offline
+verification in the implementation notes).
+
+### Pairwise A: directional context-sensitivity effect (PRIMARY)
+
+For each `(model, contrast, story_1, story_2, category)`,
+`analyze_directional_pairwise_effects` estimates, pooling over the
+counterbalanced display position and over replicates:
+
+```
+P(story_1 preferred | story_1 receives contrast value "a")
+  - P(story_1 preferred | story_1 receives contrast value "b")
+```
+
+The sign says which direction: positive means story_1 is favored more when
+it carries value "a". This is never collapsed into a single
+`changed: true/false` -- two blocks with opposite-signed effects (story_1
+favored under "a" in one, under "b" in the other) both show
+`changed: true` under the old raw-choice comparison, but only the
+directional estimate tells them apart. CSVs:
+`pairwise_directional_effects.csv` (per story pair) and
+`..._by_contrast.csv` (aggregated across story pairs per contrast/category
+-- read this aggregate cautiously, since it can average opposite-signed
+per-pair effects back down toward zero, same as any aggregate).
+
+A **secondary** diagnostic, `analyze_pairwise_changed_diagnostic`,
+reproduces the original "did the raw A/B/tie choice change between forward
+and flipped" comparison, restricted to one fixed display position so it
+doesn't conflate position with context assignment. It preserves chosen
+story IDs but is not the primary result.
+
+### Pairwise B: direct comparison against human pairwise judgments
+
+`analyze_pairwise_vs_human_reference` never builds a derived ranking for
+this: for every `context_pairwise` observation whose two displayed stories
+exactly match a known judgment in `data/human_pairwise.jsonl`, it checks
+whether the model's `overall_quality` choice agrees (`concordant`),
+disagrees (`discordant`), or was a tie (`model_tied`) -- directly, in story
+identity, pair by pair.
+
+### Diagnostics, clearly labelled, never the headline result
+
+A pooled single-text ranking and a pooled pairwise Copeland ranking (both
+tie-aware in the same way as above) are still computed as rough sanity
+checks, written to `*_pooled_diagnostic.csv` files. As before, pooled
+pairwise rankings additionally can't be read as a ranking "under" any one
+context condition (see "Four-cell counterbalanced pairwise block" above;
+the optional same-context family would be needed for that).
 
 ## Budget constraints
 

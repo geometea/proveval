@@ -5,8 +5,18 @@ Usage:
     python3 run_batch.py --type single --limit 10            # first 10 single trials
     python3 run_batch.py --replicates 2 --limit 3 --dry-run  # show selection only
 
+    # v0.2 context_single: sample the neutral baseline more than treatment
+    python3 run_batch.py --trials-file data/context_trials.jsonl --type context_single \
+        --replicates-treatment 3 --replicates-neutral 6 --dry-run
+
 Reuses the same API-call and validation logic as run_trial.py.
 Trial order is shuffled with a fixed seed so runs are reproducible.
+
+Every v0.2 context trial type's result row records which sampling regime
+produced it (--sampling-regime; see run_trial.SAMPLING_REGIMES) so the
+primary low-variance regime and the secondary provider-default regime can
+never be silently pooled by analysis code -- v0.1 trial types are
+unaffected and never carry this field, regardless of the flag's default.
 """
 
 import argparse
@@ -19,16 +29,45 @@ from run_trial import (
     CONTEXT_TRIAL_TYPES,
     DEFAULT_MODEL,
     RESULTS_FILE,
+    SAMPLING_REGIMES,
     TRIALS_FILE,
     call_claude,
     load_trials,
     parse_and_validate,
     resolve_model,
+    resolve_sampling_params,
     save_result,
     trial_metadata,
 )
 
 RANDOM_SEED = 42
+
+
+def is_neutral_single_trial(trial):
+    """The v0.2 no-context baseline (context_trials.build_context_single_trials
+    adds one per story via context_packets.neutral_condition) -- the only
+    trial kind --replicates-neutral applies to."""
+    return trial["type"] == "context_single" and trial.get("condition_id") == "neutral"
+
+
+def resolve_replicate_counts(replicates, replicates_treatment, replicates_neutral):
+    """Treatment replicate count defaults to --replicates; neutral defaults to
+    the treatment count (never fewer) and can be set higher, since the same
+    neutral estimate is reused as a baseline for every treatment comparison
+    on that story. Raises ValueError if neutral is explicitly set below the
+    treatment count -- that would under-sample the one condition every
+    treatment-vs-neutral delta depends on.
+    """
+    treatment = replicates_treatment if replicates_treatment is not None else replicates
+    neutral = replicates_neutral if replicates_neutral is not None else treatment
+    if neutral < treatment:
+        raise ValueError(
+            f"--replicates-neutral ({neutral}) is less than the treatment replicate "
+            f"count ({treatment}). The neutral baseline is reused across every "
+            f"treatment comparison for a story, so it should never be sampled less "
+            f"than each individual treatment condition."
+        )
+    return treatment, neutral
 
 
 def select_trials(trials, only_type, id_prefix, conditions, contrasts, limit):
@@ -59,11 +98,19 @@ def select_trials(trials, only_type, id_prefix, conditions, contrasts, limit):
     return trials
 
 
-def build_observations(trials, replicates):
-    """Expand each trial into one observation per replicate_id (1..replicates)."""
+def build_observations(trials, replicates_treatment, replicates_neutral):
+    """Expand each trial into one observation per replicate_id (1..N).
+
+    The neutral no-context baseline (see is_neutral_single_trial) uses
+    replicates_neutral; every other trial uses replicates_treatment. This
+    lets neutral be sampled more precisely than any individual treatment
+    condition without inflating the cost of every treatment cell to match --
+    see resolve_replicate_counts for the >= treatment default/floor.
+    """
     observations = []
     for trial in trials:
-        for replicate_id in range(1, replicates + 1):
+        n = replicates_neutral if is_neutral_single_trial(trial) else replicates_treatment
+        for replicate_id in range(1, n + 1):
             observations.append((trial, replicate_id))
     return observations
 
@@ -99,7 +146,7 @@ def next_attempt_id(records):
     return max(r.get("attempt_id", 1) for r in records) + 1
 
 
-def run_one(trial, replicate_id, model, attempt_id, results_file):
+def run_one(trial, replicate_id, model, attempt_id, results_file, sampling_regime):
     """Call the API for one trial, validate it, save a result row, and return a status word.
 
     Always saves a new row, even on failure, so a failed call can still be diagnosed
@@ -107,9 +154,10 @@ def run_one(trial, replicate_id, model, attempt_id, results_file):
     """
     timestamp = datetime.now(timezone.utc).isoformat()
     trial_meta = trial_metadata(trial) if trial["type"] in CONTEXT_TRIAL_TYPES else None
+    sampling_params = resolve_sampling_params(trial["type"], sampling_regime)
 
     try:
-        api_result = call_claude(trial["prompt"], model)
+        api_result = call_claude(trial["prompt"], model, sampling_params)
     except Exception as e:
         print(f"Error calling the API for {trial['trial_id']} (replicate {replicate_id}): {e}")
         result = {
@@ -127,6 +175,9 @@ def run_one(trial, replicate_id, model, attempt_id, results_file):
         }
         if trial_meta is not None:
             result["trial_meta"] = trial_meta
+        if sampling_params is not None:
+            result["sampling_regime"] = sampling_regime
+            result["sampling_params"] = sampling_params
         save_result(result, results_file)
         return "error"
 
@@ -148,6 +199,9 @@ def run_one(trial, replicate_id, model, attempt_id, results_file):
     }
     if trial_meta is not None:
         result["trial_meta"] = trial_meta
+    if sampling_params is not None:
+        result["sampling_regime"] = sampling_regime
+        result["sampling_params"] = sampling_params
     save_result(result, results_file)
     return "invalid" if validation_error else "valid"
 
@@ -186,7 +240,26 @@ def main():
     parser.add_argument("--trials-file", default=TRIALS_FILE, help=f"Trials manifest to read (default: {TRIALS_FILE})")
     parser.add_argument("--results-file", default=RESULTS_FILE, help=f"Results file to append to (default: {RESULTS_FILE})")
     parser.add_argument("--model", help="Override the model (default: $ANTHROPIC_MODEL, else claude-sonnet-5)")
-    parser.add_argument("--replicates", type=int, default=1, help="How many times to run each trial")
+    parser.add_argument(
+        "--sampling-regime",
+        choices=list(SAMPLING_REGIMES),
+        default="low_variance_primary",
+        help="v0.2 context trial types only (ignored, and not recorded, for v0.1 trial types): "
+        "low_variance_primary (default; temperature=0) or provider_default_secondary",
+    )
+    parser.add_argument("--replicates", type=int, default=1, help="Replicate count for all trials (fallback for --replicates-treatment)")
+    parser.add_argument(
+        "--replicates-treatment",
+        type=int,
+        help="Replicate count for non-neutral trials (default: --replicates). "
+        "Applies to every trial except the context_single neutral baseline.",
+    )
+    parser.add_argument(
+        "--replicates-neutral",
+        type=int,
+        help="Replicate count for the context_single neutral no-context baseline "
+        "(default: same as the treatment count; must be >= it -- see resolve_replicate_counts)",
+    )
     parser.add_argument("--type", help="Only run this trial type (e.g. single, comparison, context_pairwise, ...)")
     parser.add_argument("--id-prefix", help="Only run trials whose trial_id starts with this prefix")
     parser.add_argument(
@@ -216,6 +289,13 @@ def main():
     conditions = set(args.conditions) if args.conditions else None
     contrasts = set(args.contrasts) if args.contrasts else None
 
+    try:
+        replicates_treatment, replicates_neutral = resolve_replicate_counts(
+            args.replicates, args.replicates_treatment, args.replicates_neutral
+        )
+    except ValueError as e:
+        parser.error(str(e))
+
     if args.retry_failed:
         trials_by_id = {t["trial_id"]: t for t in load_trials(args.trials_file)}
         observations = select_failed_observations(
@@ -224,7 +304,7 @@ def main():
     else:
         trials = load_trials(args.trials_file)
         trials = select_trials(trials, args.type, args.id_prefix, conditions, contrasts, args.limit)
-        observations = build_observations(trials, args.replicates)
+        observations = build_observations(trials, replicates_treatment, replicates_neutral)
 
     total = len(observations)
     for i, (trial, replicate_id) in enumerate(observations, start=1):
@@ -248,7 +328,7 @@ def main():
             print(f"{label} — retrying-failed (attempt {attempt_id})")
 
         try:
-            status = run_one(trial, replicate_id, model, attempt_id, args.results_file)
+            status = run_one(trial, replicate_id, model, attempt_id, args.results_file, args.sampling_regime)
             print(f"{label} — {status}")
         except Exception as e:
             print(f"{label} — error: {e}")

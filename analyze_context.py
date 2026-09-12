@@ -6,22 +6,53 @@ attempts, and runs analyses specific to the new trial types (context_single,
 context_pairwise, context_prompt). Completely separate from analyze.py, which
 keeps analyzing the v0.1 pilot pipeline unchanged.
 
+Four distinct questions are answered here, deliberately kept separate rather
+than collapsed into one "ranking" analysis (see FINAL_DESIGN.md):
+
+  Single-text:
+    A. Does context move the score of the SAME story relative to the neutral
+       no-context baseline?              -> analyze_treatment_vs_neutral
+    B. Does the (possibly tied) score ordering under a condition resemble
+       the human reference ordering?      -> rank_from_single_text_by_condition
+                                             + Kendall tau-b / tie-aware Spearman
+
+  Pairwise:
+    A. Does assigning context to a story change its probability of being
+       preferred?                         -> analyze_directional_pairwise_effects
+    B. Do direct model pairwise choices resemble the human reference's
+       direct pairwise judgments?         -> analyze_pairwise_vs_human_reference
+
+The neutral/no-context condition is a REFERENCE BASELINE for measuring
+context sensitivity, not a ground-truth score and not assumed unbiased.
+
+Model rating ties are legitimate and are never broken by story ID, filename,
+alphabetical order, or insertion order -- see average_ranks/kendall_tau_b/
+spearman_tie_aware/tied_groups below.
+
+Every v0.2 result row carries a sampling_regime (see run_trial.SAMPLING_REGIMES).
+This script only ever analyzes one regime at a time (--sampling-regime,
+default "low_variance_primary") so the primary low-variance regime and the
+secondary provider-default regime can never be silently pooled.
+
 Run this file directly: python3 analyze_context.py
 No API calls are made, and ANTHROPIC_API_KEY is never read.
 """
 
+import argparse
 import json
 import os
 import statistics
 from collections import defaultdict
 
 from analyze import load_jsonl, is_successful, attempt_number, write_csv
+from run_trial import SAMPLING_REGIMES
 
 RESULTS_FILE = "results/context_raw.jsonl"
 TRIALS_FILE = "data/context_trials.jsonl"
 HUMAN_REFERENCE_FILE = "data/human_reference.json"
 HUMAN_PAIRWISE_FILE = "data/human_pairwise.jsonl"
 ANALYSIS_DIR = "results/context_analysis"
+DEFAULT_SAMPLING_REGIME = "low_variance_primary"
 
 RATING_FIELDS = ["plot_structure", "prose_style", "characterization", "originality", "overall_quality"]
 
@@ -49,19 +80,21 @@ def get_trial_meta(row, trials_by_id):
 
 # ---------------------------------------------------------------------------
 # Collapsing retries (same semantics as analyze.py: group by
-# (trial_id, model, replicate_id), keep the most recent success)
+# (trial_id, model, replicate_id, sampling_regime), keep the most recent
+# success). sampling_regime is part of the key so a retry under a different
+# regime is never silently merged into the same observation. This collapses
+# ATTEMPTS (retries of the same cell after a parse/validation failure), never
+# REPLICATES -- every replicate_id remains its own observation; repeated
+# identical cells are preserved as separate data points, not reduced to a
+# majority vote (see analyze_directional_pairwise_effects and
+# neutral_baseline_means, which both estimate frequencies/means across them).
 # ---------------------------------------------------------------------------
 
 def collapse_attempts(raw_rows, trials_by_id):
-    """Returns (observations, unresolved, absorbed_failed_attempts, missing_metadata).
-
-    missing_metadata: keys with a successful attempt but no way to recover
-    trial metadata (neither trial_meta on the row nor a matching trials-file
-    entry) -- these are reported, not silently dropped or guessed at.
-    """
+    """Returns (observations, unresolved, absorbed_failed_attempts, missing_metadata)."""
     attempts_by_key = defaultdict(list)
     for row in raw_rows:
-        key = (row["trial_id"], row["model"], row["replicate_id"])
+        key = (row["trial_id"], row["model"], row["replicate_id"], row.get("sampling_regime"))
         attempts_by_key[key].append(row)
 
     observations = {}
@@ -82,17 +115,27 @@ def collapse_attempts(raw_rows, trials_by_id):
             missing_metadata.append(key)
             continue
 
-        trial_id, model, replicate_id = key
+        trial_id, model, replicate_id, sampling_regime = key
         observations[key] = {
             **meta,
             "model": model,
             "replicate_id": replicate_id,
             "attempt_id": attempt_number(row),
             "parsed_response": row["parsed_response"],
+            "sampling_regime": sampling_regime,
+            "sampling_params": row.get("sampling_params"),
         }
         absorbed_failed_attempts += len(attempts) - 1
 
     return observations, unresolved, absorbed_failed_attempts, missing_metadata
+
+
+def filter_by_sampling_regime(observations, regime):
+    """Keep only observations recorded under `regime`. Returns (kept, excluded_count).
+    This is the one place regimes get selected -- nothing downstream ever
+    pools across regimes, since everything after this operates on `kept`."""
+    kept = {k: v for k, v in observations.items() if v.get("sampling_regime") == regime}
+    return kept, len(observations) - len(kept)
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +155,7 @@ def print_counts(counts):
 
 
 def print_inventory(raw_rows, observations, unresolved, absorbed, missing_metadata):
-    print("=== Dataset inventory (context benchmark) ===")
+    print("=== Dataset inventory (context benchmark, all sampling regimes) ===")
     print(f"Raw API attempts: {len(raw_rows)}")
     print(f"Completed observations: {len(observations)}")
     print(f"Unresolved failures: {len(unresolved)}")
@@ -125,6 +168,9 @@ def print_inventory(raw_rows, observations, unresolved, absorbed, missing_metada
 
     print("\nCompleted observations by model:")
     print_counts(count_by(observations.values(), lambda o: o["model"]))
+
+    print("\nCompleted observations by sampling regime:")
+    print_counts(count_by(observations.values(), lambda o: o.get("sampling_regime", "n/a")))
 
     print("\nCompleted observations by dimension:")
     print_counts(count_by(observations.values(), lambda o: o.get("dimension", "n/a")))
@@ -139,29 +185,175 @@ def print_inventory(raw_rows, observations, unresolved, absorbed, missing_metada
 
 
 # ---------------------------------------------------------------------------
-# D. Context effect on pairwise A/B/tie decisions (forward vs flipped)
+# Pure-Python tie-aware rank statistics. None of these ever use story ID,
+# filename, insertion order, or any other arbitrary field to break a tie --
+# order of the `items` argument never affects the result, only the scores/
+# ranks looked up by item identity.
 # ---------------------------------------------------------------------------
 
-def index_pairwise_by_assignment(observations):
-    """Group context_pairwise observations by everything except "assignment"."""
+def average_ranks(values, items):
+    """1-based average rank per item (rank 1 = highest score). Tied items
+    share the mean of the rank positions their group spans."""
+    ordered = sorted(items, key=lambda it: -values[it])
+    ranks = {}
+    i = 0
+    n = len(ordered)
+    while i < n:
+        j = i
+        while j + 1 < n and values[ordered[j + 1]] == values[ordered[i]]:
+            j += 1
+        avg_rank = (i + j) / 2 + 1
+        for k in range(i, j + 1):
+            ranks[ordered[k]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def tied_groups(values, items):
+    """Best-first list of tie groups: [{"rank_position", "story_ids", "score"}, ...].
+    story_ids within one group are sorted alphabetically for STABLE DISPLAY
+    ONLY -- every member of a group shares the same rank_position and score,
+    so this ordering never affects any statistic."""
+    items = list(items)
+    ranks = average_ranks(values, items)
+    by_score = defaultdict(list)
+    for it in items:
+        by_score[values[it]].append(it)
+    groups = []
+    for score in sorted(by_score, reverse=True):
+        members = sorted(by_score[score])
+        groups.append({"rank_position": ranks[members[0]], "story_ids": members, "score": score})
+    return groups
+
+
+def pearson_correlation(xs, ys):
+    n = len(xs)
+    if n == 0:
+        return None
+    mean_x, mean_y = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    if var_x == 0 or var_y == 0:
+        return None
+    return cov / (var_x * var_y) ** 0.5
+
+
+def spearman_tie_aware(values_a, values_b, items):
+    """SECONDARY rank statistic. Correct under ties: Pearson correlation of
+    the two sides' average ranks (the standard tie-corrected formula) --
+    never the tie-free shortcut formula."""
+    items = list(items)
+    if len(items) < 2:
+        return None
+    ranks_a = average_ranks(values_a, items)
+    ranks_b = average_ranks(values_b, items)
+    return pearson_correlation([ranks_a[it] for it in items], [ranks_b[it] for it in items])
+
+
+def kendall_tau_b(values_a, values_b, items):
+    """PRIMARY rank statistic. Kendall's tau-b: a pair tied on either side is
+    excluded from the concordant/discordant count and folded into that
+    side's tie term, rather than forced into an arbitrary order (tau-a would
+    require that). Returns None if undefined (fewer than 2 items, or one
+    side has every pair tied)."""
+    items = list(items)
+    n = len(items)
+    if n < 2:
+        return None
+    concordant = discordant = 0
+    ties_a = ties_b = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            a_diff = values_a[items[i]] - values_a[items[j]]
+            b_diff = values_b[items[i]] - values_b[items[j]]
+            if a_diff == 0 and b_diff == 0:
+                ties_a += 1
+                ties_b += 1
+            elif a_diff == 0:
+                ties_a += 1
+            elif b_diff == 0:
+                ties_b += 1
+            elif (a_diff > 0) == (b_diff > 0):
+                concordant += 1
+            else:
+                discordant += 1
+    n0 = n * (n - 1) / 2
+    denom = ((n0 - ties_a) * (n0 - ties_b)) ** 0.5
+    if denom == 0:
+        return None
+    return (concordant - discordant) / denom
+
+
+def human_reference_scores(ranking):
+    """Turn a best-first human reference list into {item: score} (higher =
+    more preferred), so it can feed the same tie-aware functions above as a
+    possibly-tied model score dict. The human reference itself has no ties."""
+    n = len(ranking)
+    return {story_id: n - i for i, story_id in enumerate(ranking)}
+
+
+def pairwise_diagnostics_from_scores(values, human_pairs):
+    """For every known human judgment (winner, loser) with both stories
+    present in `values`, classify using the model's raw scores: concordant
+    (model score agrees with the human winner), discordant (disagrees), or
+    model_tied (the model gave both stories the exact same score -- there is
+    no strict model preference to compare, and this is never converted into
+    a fabricated win/loss). Returns (concordant, discordant, model_tied, checked).
+    """
+    concordant = discordant = model_tied = 0
+    for winner, loser in human_pairs:
+        if winner not in values or loser not in values:
+            continue
+        if values[winner] == values[loser]:
+            model_tied += 1
+        elif values[winner] > values[loser]:
+            concordant += 1
+        else:
+            discordant += 1
+    return concordant, discordant, model_tied, concordant + discordant + model_tied
+
+
+# ---------------------------------------------------------------------------
+# Pairwise: SECONDARY diagnostic (raw A/B/tie "changed") and PRIMARY
+# directional effect, both operating in story identity.
+# ---------------------------------------------------------------------------
+
+def choice_to_story_id(obs, category):
+    """Map a raw A/B/tie choice to the actual story id that was chosen, or
+    None for a tie. This is what lets every analysis below operate in story
+    identity instead of raw A/B letters."""
+    choice = obs["parsed_response"][category]
+    if choice == "A":
+        return obs["story_a_id"]
+    if choice == "B":
+        return obs["story_b_id"]
+    return None
+
+
+def index_pairwise_by_assignment_fixed_position(observations, position="story1_as_a"):
     index = {}
     for obs in observations.values():
-        if obs["type"] != "context_pairwise":
+        if obs["type"] != "context_pairwise" or obs.get("position") != position:
             continue
-        key = (obs["model"], obs["story_a_id"], obs["story_b_id"], obs["contrast_id"], obs["replicate_id"])
+        key = (obs["model"], obs["story_1_id"], obs["story_2_id"], obs["contrast_id"], obs["replicate_id"])
         index.setdefault(key, {})[obs["assignment"]] = obs
     return index
 
 
-def analyze_pairwise_context_effects(observations):
-    """For each matched forward/flipped pair, per category: did the A/B/tie
-    choice change even though the underlying texts and A/B positions were
-    fixed? A change is evidence of a context effect; no change is consistent
-    with a story-quality-driven judgment (see context_contrasts.py)."""
-    index = index_pairwise_by_assignment(observations)
+def analyze_pairwise_changed_diagnostic(observations, position="story1_as_a"):
+    """SECONDARY diagnostic only -- see analyze_directional_pairwise_effects
+    for the PRIMARY result. Restricted to one fixed display position (default:
+    story_1 shown as Story A) so this reproduces the original "did the raw
+    A/B/tie choice change between forward and flipped" comparison without
+    conflating display position with context assignment (see
+    context_contrasts.build_contrast_block). A bare changed=True/False does
+    NOT say which story or which context was preferred -- chosen story ids
+    are preserved here for that, but the primary answer is the function below.
+    """
+    index = index_pairwise_by_assignment_fixed_position(observations, position)
     rows = []
-
-    for (model, story_a, story_b, contrast_id, replicate_id), pair in index.items():
+    for (model, s1, s2, contrast_id, replicate_id), pair in index.items():
         forward, flipped = pair.get("forward"), pair.get("flipped")
         if forward is None or flipped is None:
             continue
@@ -173,12 +365,17 @@ def analyze_pairwise_context_effects(observations):
                     "model": model,
                     "contrast_id": contrast_id,
                     "dimension": forward["dimension"],
-                    "story_a_id": story_a,
-                    "story_b_id": story_b,
+                    "story_1_id": s1,
+                    "story_2_id": s2,
+                    "position": position,
                     "replicate_id": replicate_id,
                     "category": category,
+                    "story1_context_forward": forward["context_a"]["value"],
+                    "story1_context_flipped": flipped["context_a"]["value"],
                     "forward_choice": forward_choice,
+                    "forward_chosen_story_id": choice_to_story_id(forward, category) or "tie",
                     "flipped_choice": flipped_choice,
+                    "flipped_chosen_story_id": choice_to_story_id(flipped, category) or "tie",
                     "changed": forward_choice != flipped_choice,
                 }
             )
@@ -195,32 +392,128 @@ def summarize_grouped_change_rate(rows, group_key, label):
         print(f"    {key}: n={len(changes)} changed={sum(changes)} ({rate:.1f}%)")
 
 
-def summarize_pairwise_context_effects(rows):
-    print("\n=== Context effect on pairwise A/B/tie decisions (forward vs flipped) ===")
+def summarize_pairwise_changed_diagnostic(rows):
+    print("\n=== SECONDARY diagnostic: raw A/B/tie changed under forward/flipped (position=story1_as_a only) ===")
+    print("(Boolean 'changed' only -- does not say which story/context was preferred. See the PRIMARY")
+    print(" directional-effect analysis below for that.)")
     if not rows:
         print("  No matched forward/flipped pairs found.")
         return
-
     overall_changed = sum(1 for r in rows if r["changed"])
     print(f"  n={len(rows)} matched (category, forward/flipped) comparisons")
-    print(f"  Overall: {overall_changed}/{len(rows)} ({100 * overall_changed / len(rows):.1f}%) changed when context was swapped")
+    print(f"  Overall: {overall_changed}/{len(rows)} ({100 * overall_changed / len(rows):.1f}%) changed")
     print()
     summarize_grouped_change_rate(rows, lambda r: r["model"], "model")
     print()
     summarize_grouped_change_rate(rows, lambda r: r["contrast_id"], "contrast")
     print()
     summarize_grouped_change_rate(rows, lambda r: r["category"], "category")
-    print()
-    summarize_grouped_change_rate(
-        rows, lambda r: " vs ".join(sorted([r["story_a_id"], r["story_b_id"]])), "story pair"
-    )
-    print()
-    summarize_grouped_change_rate(rows, lambda r: r["replicate_id"], "replicate")
+
+
+def analyze_directional_pairwise_effects(observations):
+    """PRIMARY pairwise context-effect analysis, in story identity, pooling
+    over the counterbalanced display position (see
+    context_contrasts.build_contrast_block) and over replicates. For each
+    (model, contrast_id, story_1_id, story_2_id, category), estimates:
+
+        P(story_1 preferred | story_1 receives contrast value "a")
+      - P(story_1 preferred | story_1 receives contrast value "b")
+
+    Positive means story_1 is favored more often when it carries value "a";
+    negative means the opposite. This is directional and never collapses to
+    a single changed=True/False boolean -- two scenarios with opposite signs
+    are never conflated (see offline verification item D).
+    """
+    tallies = defaultdict(lambda: {"story_1_preferred": 0, "story_2_preferred": 0, "tie": 0, "n": 0})
+    for obs in observations.values():
+        if obs["type"] != "context_pairwise":
+            continue
+        for category in RATING_FIELDS:
+            chosen = choice_to_story_id(obs, category)
+            key = (obs["model"], obs["contrast_id"], obs["story_1_id"], obs["story_2_id"], category, obs["assignment"])
+            t = tallies[key]
+            t["n"] += 1
+            if chosen is None:
+                t["tie"] += 1
+            elif chosen == obs["story_1_id"]:
+                t["story_1_preferred"] += 1
+            else:
+                t["story_2_preferred"] += 1
+
+    by_pair = defaultdict(dict)
+    for (model, contrast_id, s1, s2, category, assignment), t in tallies.items():
+        by_pair[(model, contrast_id, s1, s2, category)][assignment] = t
+
+    rows = []
+    for (model, contrast_id, s1, s2, category), by_assignment in by_pair.items():
+        fwd, flp = by_assignment.get("forward"), by_assignment.get("flipped")
+        if fwd is None or flp is None:
+            continue
+        p_a = fwd["story_1_preferred"] / fwd["n"] if fwd["n"] else None
+        p_b = flp["story_1_preferred"] / flp["n"] if flp["n"] else None
+        effect = (p_a - p_b) if None not in (p_a, p_b) else None
+        rows.append(
+            {
+                "model": model,
+                "contrast_id": contrast_id,
+                "story_1_id": s1,
+                "story_2_id": s2,
+                "category": category,
+                "p_story1_preferred_given_value_a": round(p_a, 3) if p_a is not None else "",
+                "n_value_a": fwd["n"],
+                "tie_n_value_a": fwd["tie"],
+                "p_story1_preferred_given_value_b": round(p_b, 3) if p_b is not None else "",
+                "n_value_b": flp["n"],
+                "tie_n_value_b": flp["tie"],
+                "directional_effect_a_minus_b": round(effect, 3) if effect is not None else "",
+            }
+        )
+    return rows
+
+
+def summarize_directional_effects_by_contrast(directional_rows):
+    """Aggregate the per-story-pair directional effect across story pairs,
+    per (model, contrast_id, category) -- the pairwise analogue of the
+    single-text model x dimension x value aggregate."""
+    grouped = defaultdict(list)
+    for row in directional_rows:
+        if row["directional_effect_a_minus_b"] == "":
+            continue
+        key = (row["model"], row["contrast_id"], row["category"])
+        grouped[key].append(row["directional_effect_a_minus_b"])
+    return [
+        {
+            "model": m,
+            "contrast_id": c,
+            "category": cat,
+            "mean_directional_effect": round(statistics.mean(effects), 3),
+            "n_story_pairs": len(effects),
+        }
+        for (m, c, cat), effects in grouped.items()
+    ]
+
+
+def summarize_directional_pairwise_effects(rows, by_contrast_rows):
+    print("\n=== PRIMARY pairwise context-effect analysis: directional, in story identity ===")
+    print('(P(story_1 preferred | value "a") - P(story_1 preferred | value "b"), position counterbalanced,')
+    print(" replicates pooled into the estimate, not discarded)")
+    if not rows:
+        print("  No complete forward+flipped story-pair blocks found.")
+        return
+    print(f"  n={len(rows)} (model, contrast, story pair, category) directional estimates")
+    print("\n  By (model, contrast, category), averaged across story pairs:")
+    for row in sorted(by_contrast_rows, key=lambda r: (r["model"], r["contrast_id"], r["category"])):
+        print(
+            f"    {row['model']} | {row['contrast_id']} | {row['category']}: "
+            f"mean_effect={row['mean_directional_effect']:+.3f} (n_story_pairs={row['n_story_pairs']})"
+        )
 
 
 # ---------------------------------------------------------------------------
 # context_prompt: does a genuinely extraneous prompt-level sentence change
 # the decision, holding story identity/position/story-level-context fixed?
+# (Prompt-scope context is not attributed to either story, so the
+# assignment x position counterbalance above doesn't apply here.)
 # ---------------------------------------------------------------------------
 
 def index_prompt_by_value(observations):
@@ -284,17 +577,212 @@ def summarize_prompt_context_effects(rows):
 
 
 # ---------------------------------------------------------------------------
-# E. Provisional ranking from pairwise overall_quality judgments
+# Pairwise vs human reference: DIRECT comparison in story identity, no
+# derived ranking involved -- for every context_pairwise observation whose
+# two displayed stories exactly match a known human judgment, does the
+# model's choice agree?
 # ---------------------------------------------------------------------------
 
-def compute_pairwise_wins(observations):
-    """Tally wins/losses/ties per story per model, pooling ALL context_pairwise
-    trials' overall_quality choice regardless of which context condition was
-    applied. This deliberately treats context as noise to average over, to
-    get one baseline "how does this model rank the corpus" estimate per model.
-    DIAGNOSTIC ONLY -- see rank_from_pairwise_wins for why this can't be read
-    as a ranking "under" any particular context condition.
+def analyze_pairwise_vs_human_reference(observations, human_pairs, category="overall_quality"):
+    """Restricted to `category` (default overall_quality, the closest
+    analogue to a single human preference judgment). Reports concordant/
+    discordant/model_tied counts -- never converts a model tie into a
+    fabricated win or loss.
     """
+    human_winner_by_pair = {frozenset((w, l)): w for w, l in human_pairs}
+    rows = []
+    tally = defaultdict(lambda: {"concordant": 0, "discordant": 0, "model_tied": 0})
+
+    for obs in observations.values():
+        if obs["type"] != "context_pairwise":
+            continue
+        pair_key = frozenset((obs["story_a_id"], obs["story_b_id"]))
+        human_winner = human_winner_by_pair.get(pair_key)
+        if human_winner is None:
+            continue
+        chosen = choice_to_story_id(obs, category)
+        if chosen is None:
+            outcome = "model_tied"
+        elif chosen == human_winner:
+            outcome = "concordant"
+        else:
+            outcome = "discordant"
+        tally[obs["model"]][outcome] += 1
+        rows.append(
+            {
+                "model": obs["model"],
+                "story_a_id": obs["story_a_id"],
+                "story_b_id": obs["story_b_id"],
+                "contrast_id": obs["contrast_id"],
+                "assignment": obs["assignment"],
+                "position": obs["position"],
+                "replicate_id": obs["replicate_id"],
+                "human_winner": human_winner,
+                "model_choice": obs["parsed_response"][category],
+                "model_chosen_story_id": chosen or "tie",
+                "outcome": outcome,
+            }
+        )
+
+    summary_rows = []
+    for model, counts in tally.items():
+        n = counts["concordant"] + counts["discordant"] + counts["model_tied"]
+        decided = counts["concordant"] + counts["discordant"]
+        summary_rows.append(
+            {
+                "model": model,
+                "concordant": counts["concordant"],
+                "discordant": counts["discordant"],
+                "model_tied": counts["model_tied"],
+                "n": n,
+                "concordant_rate": round(counts["concordant"] / decided, 3) if decided else "",
+            }
+        )
+    return rows, summary_rows
+
+
+def summarize_pairwise_vs_human_reference(summary_rows):
+    print("\n=== Pairwise B: direct model choices vs direct human judgments (no derived ranking) ===")
+    print("(restricted to overall_quality, and to story pairs with a known human judgment)")
+    if not summary_rows:
+        print("  No context_pairwise observations matched a known human judgment.")
+        return
+    for row in sorted(summary_rows, key=lambda r: r["model"]):
+        rate_text = f"{row['concordant_rate']:.3f}" if row["concordant_rate"] != "" else "unavailable"
+        print(
+            f"  {row['model']}: concordant={row['concordant']} discordant={row['discordant']} "
+            f"model_tied={row['model_tied']} (n={row['n']}, concordant_rate={rate_text})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Single-text A: treatment vs neutral baseline deltas
+# ---------------------------------------------------------------------------
+
+def neutral_baseline_means(observations):
+    """Per (model, story_id): mean rating for each RATING_FIELDS category,
+    from the neutral no-context context_single trial's replicate(s). A
+    REFERENCE BASELINE for computing deltas -- not a ground-truth score."""
+    sums = defaultdict(lambda: defaultdict(list))
+    for obs in observations.values():
+        if obs["type"] != "context_single" or obs["dimension"] != "neutral":
+            continue
+        key = (obs["model"], obs["story_id"])
+        for field in RATING_FIELDS:
+            sums[key][field].append(obs["parsed_response"][field])
+    return {key: {field: statistics.mean(vals) for field, vals in fields.items()} for key, fields in sums.items()}
+
+
+def analyze_treatment_vs_neutral(observations):
+    """Observation-level delta = treatment rating - neutral baseline mean,
+    holding story/model fixed, for every context_single treatment
+    observation and every rating category. Answers: holding the prose
+    fixed, how does adding context change the rating relative to the same
+    model's no-context baseline?"""
+    baselines = neutral_baseline_means(observations)
+    rows = []
+    for obs in observations.values():
+        if obs["type"] != "context_single" or obs["dimension"] == "neutral":
+            continue
+        baseline = baselines.get((obs["model"], obs["story_id"]))
+        if baseline is None:
+            continue
+        for field in RATING_FIELDS:
+            rows.append(
+                {
+                    "model": obs["model"],
+                    "story_id": obs["story_id"],
+                    "dimension": obs["dimension"],
+                    "value": obs["value"],
+                    "replicate_id": obs["replicate_id"],
+                    "category": field,
+                    "treatment_rating": obs["parsed_response"][field],
+                    "neutral_baseline_mean": round(baseline[field], 3),
+                    "delta": round(obs["parsed_response"][field] - baseline[field], 3),
+                }
+            )
+    return rows
+
+
+def summarize_delta_by_story_condition(delta_rows):
+    """story x treatment condition: mean delta across replicates."""
+    grouped = defaultdict(list)
+    for row in delta_rows:
+        key = (row["model"], row["story_id"], row["dimension"], row["value"], row["category"])
+        grouped[key].append(row["delta"])
+    return [
+        {"model": m, "story_id": s, "dimension": d, "value": v, "category": c, "mean_delta": round(statistics.mean(deltas), 3), "n": len(deltas)}
+        for (m, s, d, v, c), deltas in grouped.items()
+    ]
+
+
+def summarize_delta_by_model_dimension_value(delta_rows):
+    """aggregated model x dimension x value: mean delta across all stories/replicates."""
+    grouped = defaultdict(list)
+    for row in delta_rows:
+        key = (row["model"], row["dimension"], row["value"], row["category"])
+        grouped[key].append(row["delta"])
+    return [
+        {"model": m, "dimension": d, "value": v, "category": c, "mean_delta": round(statistics.mean(deltas), 3), "n": len(deltas)}
+        for (m, d, v, c), deltas in grouped.items()
+    ]
+
+
+def print_treatment_vs_neutral(by_story_condition_rows, by_model_dim_value_rows):
+    print("\n=== Single-text A: treatment vs NEUTRAL BASELINE deltas ===")
+    print("(neutral is a reference baseline for measuring context sensitivity, not a ground-truth score)")
+    if not by_model_dim_value_rows:
+        print("  No context_single treatment observations with a matching neutral baseline found.")
+        return
+    print("\n  Aggregated by (model, dimension, value), averaged across stories/replicates, overall_quality only shown here:")
+    for row in sorted(by_model_dim_value_rows, key=lambda r: (r["model"], r["dimension"], r["value"], r["category"])):
+        if row["category"] != "overall_quality":
+            continue
+        print(f"    {row['model']} | {row['dimension']}={row['value']}: mean_delta={row['mean_delta']:+.3f} (n={row['n']})")
+
+
+# ---------------------------------------------------------------------------
+# Single-text B: rankings (tie-aware) and comparison against the human
+# reference. Scores are always kept as {story_id: (mean, n)} dicts -- never
+# pre-sorted with an arbitrary tie-break -- until presentation time, where
+# tied_groups() reports rank_position/tie_group_size without breaking ties.
+# ---------------------------------------------------------------------------
+
+def rank_from_single_text_by_condition(observations):
+    """PRIMARY human-alignment ranking: one score dict per (model, dimension,
+    value), including the neutral baseline as its own condition. Returns
+    {(model, dimension, value): {story_id: (mean_score, n)}}."""
+    scores = defaultdict(lambda: defaultdict(list))
+    for obs in observations.values():
+        if obs["type"] != "context_single":
+            continue
+        key = (obs["model"], obs["dimension"], obs["value"])
+        scores[key][obs["story_id"]].append(obs["parsed_response"]["overall_quality"])
+    return {
+        key: {story_id: (statistics.mean(vals), len(vals)) for story_id, vals in by_story.items()}
+        for key, by_story in scores.items()
+    }
+
+
+def rank_from_single_text(observations):
+    """DIAGNOSTIC ONLY: per model, pooling every context_single condition
+    together. Returns {model: {story_id: (mean_score, n)}}."""
+    scores = defaultdict(lambda: defaultdict(list))
+    for obs in observations.values():
+        if obs["type"] != "context_single":
+            continue
+        scores[obs["model"]][obs["story_id"]].append(obs["parsed_response"]["overall_quality"])
+    return {
+        model: {story_id: (statistics.mean(vals), len(vals)) for story_id, vals in by_story.items()}
+        for model, by_story in scores.items()
+    }
+
+
+def compute_pairwise_wins(observations):
+    """DIAGNOSTIC ONLY: tally wins/losses/ties per story per model, pooling
+    ALL context_pairwise observations regardless of contrast/assignment/
+    position. See rank_from_pairwise_wins for why this isn't a per-condition
+    ranking."""
     records = defaultdict(lambda: defaultdict(lambda: {"wins": 0, "losses": 0, "ties": 0}))
     for obs in observations.values():
         if obs["type"] != "context_pairwise":
@@ -315,95 +803,20 @@ def compute_pairwise_wins(observations):
 
 
 def rank_from_pairwise_wins(tally_by_story):
-    """Copeland score (wins - losses) as the primary sort key, win_rate as a
-    tiebreaker. This is ONE simple, transparent ranking estimator -- not the
-    only possible method (e.g. it ignores strength of opponent).
-
-    DIAGNOSTIC ONLY, not a per-condition ranking: it pools every
-    context_pairwise observation regardless of contrast/assignment. The
-    forward/flipped contrast trials are built to measure *causal context
-    sensitivity* (see analyze_pairwise_context_effects above) -- each
-    observation only ever pits two *different* claimed context values against
-    each other, so there is no single context condition this pooled ranking
-    can honestly be said to be "under". Do not present it as a per-condition
-    human-alignment result; use it only as a rough sanity-check baseline. A
-    true per-condition pairwise ranking would need the OPTIONAL same-context
-    trial family (context_trials.build_context_pairwise_same_trials), which
-    is not part of any required run -- see FINAL_DESIGN.md.
+    """DIAGNOSTIC ONLY. Returns {story_id: (copeland, win_rate, games)} --
+    Copeland score (wins - losses) is the scalar used for ranking/rank
+    statistics; win_rate/games are informational only. Pools every
+    context_pairwise observation regardless of context condition, so this
+    can't be read as a ranking "under" any particular context -- see
+    analyze_directional_pairwise_effects for the primary pairwise result.
     """
-    rows = []
-    for story_id, tally in tally_by_story.items():
-        games = tally["wins"] + tally["losses"] + tally["ties"]
-        win_rate = (tally["wins"] + 0.5 * tally["ties"]) / games if games else 0.0
-        copeland = tally["wins"] - tally["losses"]
-        rows.append((story_id, copeland, win_rate, games))
-    rows.sort(key=lambda r: (-r[1], -r[2], r[0]))
-    return rows
+    return {
+        story_id: (tally["wins"] - tally["losses"], (tally["wins"] + 0.5 * tally["ties"]) / max(1, tally["wins"] + tally["losses"] + tally["ties"]), tally["wins"] + tally["losses"] + tally["ties"])
+        for story_id, tally in tally_by_story.items()
+    }
 
-
-# ---------------------------------------------------------------------------
-# F. Rankings from single-text overall_quality scores
-# ---------------------------------------------------------------------------
-
-def rank_from_single_text(observations):
-    """DIAGNOSTIC ONLY: per model, mean overall_quality across ALL
-    context_single trials for each story, pooling every dimension/value
-    condition (including the neutral baseline) together. This answers "how
-    does this model rank the corpus on average, across every context this
-    benchmark happened to try" -- a rough sanity check, not a per-condition
-    human-alignment result. Use rank_from_single_text_by_condition for that.
-    """
-    scores = defaultdict(lambda: defaultdict(list))
-    for obs in observations.values():
-        if obs["type"] != "context_single":
-            continue
-        scores[obs["model"]][obs["story_id"]].append(obs["parsed_response"]["overall_quality"])
-
-    rankings = {}
-    for model, by_story in scores.items():
-        rows = [(story_id, statistics.mean(values), len(values)) for story_id, values in by_story.items()]
-        rows.sort(key=lambda r: (-r[1], r[0]))
-        rankings[model] = rows
-    return rankings
-
-
-def rank_from_single_text_by_condition(observations):
-    """PRIMARY human-alignment ranking: one story ranking per
-    (model, dimension, value), built from mean overall_quality across
-    context_single trials -- kept separate rather than pooled across
-    conditions. This includes the neutral baseline as its own condition
-    (dimension="neutral", value="neutral"; see context_packets.neutral_condition
-    and context_trials.build_context_single_trials).
-
-    This is what can actually answer "which model + context setup best
-    matches the fixed human preference ranking?" -- a pooled ranking cannot,
-    since it averages away exactly the context distinction the benchmark
-    exists to measure.
-
-    Returns {(model, dimension, value): [(story_id, mean_score, n), ...]}.
-    """
-    scores = defaultdict(lambda: defaultdict(list))
-    for obs in observations.values():
-        if obs["type"] != "context_single":
-            continue
-        key = (obs["model"], obs["dimension"], obs["value"])
-        scores[key][obs["story_id"]].append(obs["parsed_response"]["overall_quality"])
-
-    rankings = {}
-    for key, by_story in scores.items():
-        rows = [(story_id, statistics.mean(values), len(values)) for story_id, values in by_story.items()]
-        rows.sort(key=lambda r: (-r[1], r[0]))
-        rankings[key] = rows
-    return rankings
-
-
-# ---------------------------------------------------------------------------
-# G/H. Comparison against the human reference ranking
-# ---------------------------------------------------------------------------
 
 def load_human_reference(path=HUMAN_REFERENCE_FILE):
-    """Returns the ranking (best-first list of story ids), or None if the
-    file doesn't exist -- i.e. no complete/unique human ranking yet."""
     if not os.path.exists(path):
         return None
     with open(path, "r") as f:
@@ -423,179 +836,268 @@ def load_human_pairwise(path=HUMAN_PAIRWISE_FILE):
     return pairs
 
 
-def spearman_correlation(ranking_a, ranking_b):
-    """Pure-Python Spearman rank correlation between two full orderings of the
-    same item set (best-first lists). None if the item sets don't match."""
-    if set(ranking_a) != set(ranking_b):
-        return None
-    rank_a = {item: i for i, item in enumerate(ranking_a)}
-    rank_b = {item: i for i, item in enumerate(ranking_b)}
-    n = len(ranking_a)
-    d_squared_sum = sum((rank_a[item] - rank_b[item]) ** 2 for item in ranking_a)
-    return 1 - (6 * d_squared_sum) / (n * (n**2 - 1))
+def human_comparison_row(model, dimension, value, ranking_source, scores_dict, human_reference, human_pairs):
+    """scores_dict: {story_id: (mean_score, n)} or {story_id: (scalar, ..., ...)}
+    where the FIRST tuple element is always the scalar used for ranking."""
+    values = {sid: v[0] for sid, v in scores_dict.items()}
+    items = list(values.keys())
+
+    tau = spearman = None
+    n_common = 0
+    if human_reference is not None:
+        common = [it for it in items if it in human_reference]
+        n_common = len(common)
+        if n_common >= 2:
+            human_scores = human_reference_scores(human_reference)
+            tau = kendall_tau_b(values, human_scores, common)
+            spearman = spearman_tie_aware(values, human_scores, common)
+
+    concordant, discordant, model_tied, checked = pairwise_diagnostics_from_scores(values, human_pairs)
+    decided = concordant + discordant
+    return {
+        "model": model,
+        "dimension": dimension,
+        "value": value,
+        "ranking_source": ranking_source,
+        "n_common_with_human_reference": n_common,
+        "kendall_tau_b": round(tau, 3) if tau is not None else "",
+        "spearman_vs_human": round(spearman, 3) if spearman is not None else "",
+        "pairwise_concordant": concordant,
+        "pairwise_discordant": discordant,
+        "pairwise_model_tied": model_tied,
+        "pairwise_concordant_rate": round(concordant / decided, 3) if decided else "",
+        "pairwise_checked_n": checked,
+    }
 
 
-def pairwise_agreement_with_human(ranking, human_pairs):
-    """Fraction of the known human winner/loser judgments a ranking agrees
-    with (ranking places winner ahead of loser). Works even with an
-    incomplete human_pairwise.jsonl -- unlike Spearman, it doesn't need a
-    full reference ranking. Returns (agreement_rate_or_None, num_checked)."""
-    if not human_pairs:
-        return None, 0
-    rank_index = {item: i for i, item in enumerate(ranking)}
-    checked = 0
-    agreements = 0
-    for winner, loser in human_pairs:
-        if winner not in rank_index or loser not in rank_index:
-            continue
-        checked += 1
-        if rank_index[winner] < rank_index[loser]:
-            agreements += 1
-    if checked == 0:
-        return None, 0
-    return agreements / checked, checked
+def ranking_csv_rows(scores_with_n, extra_fields, score_field_name="mean_overall_quality"):
+    """scores_with_n: {story_id: (score, n)}. rank_position/tie_group_size
+    come from tied_groups() -- ties share the identical rank_position, never
+    broken by story ID or any other arbitrary field. Row order (sorted by
+    story_id) is for stable display only."""
+    values = {sid: v[0] for sid, v in scores_with_n.items()}
+    items = list(scores_with_n.keys())
+    rank_by_story, group_size_by_story = {}, {}
+    for g in tied_groups(values, items):
+        for sid in g["story_ids"]:
+            rank_by_story[sid] = g["rank_position"]
+            group_size_by_story[sid] = len(g["story_ids"])
+    rows = []
+    for sid in sorted(items):
+        score, n = scores_with_n[sid]
+        rows.append(
+            {
+                **extra_fields,
+                "story_id": sid,
+                score_field_name: round(score, 3),
+                "n": n,
+                "rank_position": rank_by_story[sid],
+                "tie_group_size": group_size_by_story[sid],
+            }
+        )
+    return rows
+
+
+def print_ranking_with_ties(scores_with_n, indent="    "):
+    values = {sid: v[0] for sid, v in scores_with_n.items()}
+    for g in tied_groups(values, list(scores_with_n.keys())):
+        ids = ", ".join(g["story_ids"])
+        tie_note = f"  [tied group of {len(g['story_ids'])}]" if len(g["story_ids"]) > 1 else ""
+        print(f"{indent}rank {g['rank_position']}: {ids}  (score={g['score']:.2f}){tie_note}")
 
 
 def main():
-    if not os.path.exists(RESULTS_FILE):
-        print(f"No results file found at {RESULTS_FILE}. Nothing to analyze.")
+    parser = argparse.ArgumentParser(description="Offline analysis for the v0.2 context benchmark.")
+    parser.add_argument("--results-file", default=RESULTS_FILE, help=f"Results file to analyze (default: {RESULTS_FILE})")
+    parser.add_argument("--trials-file", default=TRIALS_FILE, help=f"Trials manifest for metadata fallback (default: {TRIALS_FILE})")
+    parser.add_argument(
+        "--sampling-regime",
+        choices=list(SAMPLING_REGIMES),
+        default=DEFAULT_SAMPLING_REGIME,
+        help="Only observations recorded under this regime are analyzed (default: low_variance_primary). "
+        "The primary and secondary regimes are never pooled automatically.",
+    )
+    args = parser.parse_args()
+
+    if not os.path.exists(args.results_file):
+        print(f"No results file found at {args.results_file}. Nothing to analyze.")
         return
 
-    raw_rows = load_jsonl(RESULTS_FILE)
-    trials_by_id = load_trials_by_id(TRIALS_FILE)
-    observations, unresolved, absorbed, missing_metadata = collapse_attempts(raw_rows, trials_by_id)
+    raw_rows = load_jsonl(args.results_file)
+    trials_by_id = load_trials_by_id(args.trials_file)
+    all_observations, unresolved, absorbed, missing_metadata = collapse_attempts(raw_rows, trials_by_id)
+    observations, excluded_by_regime = filter_by_sampling_regime(all_observations, args.sampling_regime)
 
-    print_inventory(raw_rows, observations, unresolved, absorbed, missing_metadata)
+    print_inventory(raw_rows, all_observations, unresolved, absorbed, missing_metadata)
+    print(f"\nSampling regime selected for this analysis run: {args.sampling_regime}")
+    print(f"  Observations analyzed under this regime: {len(observations)}")
+    if excluded_by_regime:
+        print(
+            f"  Excluded {excluded_by_regime} observation(s) recorded under a different sampling regime "
+            f"(pass --sampling-regime to analyze them instead; regimes are never pooled automatically)."
+        )
 
-    pairwise_effect_rows = analyze_pairwise_context_effects(observations)
-    summarize_pairwise_context_effects(pairwise_effect_rows)
+    # --- Pairwise A: directional context-sensitivity effect (PRIMARY) + changed diagnostic (SECONDARY) ---
+    changed_rows = analyze_pairwise_changed_diagnostic(observations)
+    summarize_pairwise_changed_diagnostic(changed_rows)
 
+    directional_rows = analyze_directional_pairwise_effects(observations)
+    directional_by_contrast_rows = summarize_directional_effects_by_contrast(directional_rows)
+    summarize_directional_pairwise_effects(directional_rows, directional_by_contrast_rows)
+
+    # --- context_prompt: extraneous prompt-level sentence effect ---
     prompt_effect_rows = analyze_prompt_context_effects(observations)
     summarize_prompt_context_effects(prompt_effect_rows)
 
-    human_reference = load_human_reference()
+    # --- Pairwise B: direct pairwise choices vs direct human judgments ---
     human_pairs = load_human_pairwise()
+    pairwise_vs_human_rows, pairwise_vs_human_summary_rows = analyze_pairwise_vs_human_reference(observations, human_pairs)
+    summarize_pairwise_vs_human_reference(pairwise_vs_human_summary_rows)
 
-    def human_comparison_row(model, dimension, value, ranking_source, ranking):
-        spearman = spearman_correlation(ranking, human_reference) if human_reference is not None else None
-        agreement, checked = pairwise_agreement_with_human(ranking, human_pairs)
-        return {
-            "model": model,
-            "dimension": dimension,
-            "value": value,
-            "ranking_source": ranking_source,
-            "spearman_vs_human": round(spearman, 3) if spearman is not None else "",
-            "pairwise_agreement": round(agreement, 3) if agreement is not None else "",
-            "pairwise_agreement_n": checked,
-        }, spearman, agreement, checked
+    # --- Single-text A: treatment vs neutral baseline deltas ---
+    delta_obs_rows = analyze_treatment_vs_neutral(observations)
+    delta_by_story_condition_rows = summarize_delta_by_story_condition(delta_obs_rows)
+    delta_by_model_dim_value_rows = summarize_delta_by_model_dimension_value(delta_obs_rows)
+    print_treatment_vs_neutral(delta_by_story_condition_rows, delta_by_model_dim_value_rows)
 
-    human_comparison_rows = []
+    # --- Single-text B: tie-aware rankings vs human reference (PRIMARY), pooled diagnostics (SECONDARY) ---
+    human_reference = load_human_reference()
 
-    # --- PRIMARY: single-text ranking vs human reference, kept separate per
-    # (model, dimension, value) -- this is what actually answers "which model
-    # + context setup best matches the human preference ranking?" ---
     single_by_condition = rank_from_single_text_by_condition(observations)
     single_by_condition_rows = []
-    print("\n=== F1. PRIMARY human-alignment analysis: single-text ranking per (model, dimension, value) ===")
-    print("(includes the neutral no-context baseline as its own condition; NOT pooled across conditions)")
+    human_comparison_rows = []
+    print("\n=== Single-text B PRIMARY: tie-aware ranking per (model, dimension, value) vs human reference ===")
+    print("(includes the neutral baseline as its own condition; ties are never broken artificially)")
     if not single_by_condition:
         print("  No context_single observations found.")
-    for (model, dimension, value), ranked in sorted(single_by_condition.items(), key=lambda kv: str(kv[0])):
-        ranking = [row[0] for row in ranked]
+    for (model, dimension, value), scores in sorted(single_by_condition.items(), key=lambda kv: str(kv[0])):
         print(f"  Model: {model}  dimension={dimension}  value={value}")
-        for i, (story_id, mean_score, n) in enumerate(ranked, start=1):
-            print(f"    {i}. {story_id}  (mean_overall_quality={mean_score:.2f}, n={n})")
-            single_by_condition_rows.append(
-                {
-                    "model": model, "dimension": dimension, "value": value,
-                    "rank": i, "story_id": story_id,
-                    "mean_overall_quality": round(mean_score, 3), "n": n,
-                }
-            )
-        row, spearman, agreement, checked = human_comparison_row(
-            model, dimension, value, "single_text_per_condition", ranking
-        )
+        print_ranking_with_ties(scores)
+        single_by_condition_rows.extend(ranking_csv_rows(scores, {"model": model, "dimension": dimension, "value": value}))
+        row = human_comparison_row(model, dimension, value, "single_text_per_condition", scores, human_reference, human_pairs)
         human_comparison_rows.append(row)
-        spearman_text = f"{spearman:.3f}" if spearman is not None else "unavailable"
-        agreement_text = f"{agreement:.2f} ({checked} known pair(s))" if agreement is not None else "unavailable"
-        print(f"    vs human reference: Spearman={spearman_text}  pairwise_agreement={agreement_text}")
+        tau_text = row["kendall_tau_b"] if row["kendall_tau_b"] != "" else "unavailable"
+        spearman_text = row["spearman_vs_human"] if row["spearman_vs_human"] != "" else "unavailable"
+        print(f"    vs human reference (n_common={row['n_common_with_human_reference']}): Kendall tau-b={tau_text}  Spearman(tie-aware)={spearman_text}")
 
-    # --- DIAGNOSTIC ONLY below: pooled rankings, not per-condition results ---
-    print("\n=== F2. Diagnostic only: single-text ranking pooled across ALL conditions ===")
+    print("\n=== Single-text B diagnostic only: pooled ranking across ALL conditions ===")
     print("(averages over every context_single trial regardless of dimension/value; a rough sanity check, NOT the main result)")
     single_pooled_by_model = rank_from_single_text(observations)
     single_ranking_rows = []
-    for model, ranked in sorted(single_pooled_by_model.items()):
-        ranking = [row[0] for row in ranked]
+    for model, scores in sorted(single_pooled_by_model.items()):
         print(f"  Model: {model}")
-        for i, (story_id, mean_score, n) in enumerate(ranked, start=1):
-            print(f"    {i}. {story_id}  (mean_overall_quality={mean_score:.2f}, n={n})")
-            single_ranking_rows.append(
-                {"model": model, "rank": i, "story_id": story_id, "mean_overall_quality": round(mean_score, 3), "n": n}
-            )
-        row, spearman, agreement, checked = human_comparison_row(
-            model, "ALL", "ALL", "single_text_pooled_diagnostic", ranking
-        )
-        human_comparison_rows.append(row)
+        print_ranking_with_ties(scores)
+        single_ranking_rows.extend(ranking_csv_rows(scores, {"model": model}))
+        human_comparison_rows.append(human_comparison_row(model, "ALL", "ALL", "single_text_pooled_diagnostic", scores, human_reference, human_pairs))
 
-    print("\n=== E. Diagnostic only: pooled pairwise (overall_quality) ranking ===")
-    print("(pools all context_pairwise trials/contrasts/forward+flipped; these trials measure causal")
-    print(" context SENSITIVITY, not a ranking under any one context condition -- see")
-    print(" rank_from_pairwise_wins docstring. Not the main human-alignment result.)")
+    print("\n=== Pairwise diagnostic only: pooled Copeland ranking (all contrasts/assignments/positions) ===")
+    print("(not a ranking under any one context condition -- see rank_from_pairwise_wins docstring)")
     pairwise_wins = compute_pairwise_wins(observations)
     pairwise_ranking_rows = []
     for model, tally_by_story in sorted(pairwise_wins.items()):
-        ranked = rank_from_pairwise_wins(tally_by_story)
-        ranking = [row[0] for row in ranked]
+        scores = rank_from_pairwise_wins(tally_by_story)  # {story_id: (copeland, win_rate, games)}
         print(f"  Model: {model}")
-        for i, (story_id, copeland, win_rate, games) in enumerate(ranked, start=1):
-            print(f"    {i}. {story_id}  (copeland={copeland}, win_rate={win_rate:.2f}, games={games})")
+        for g in tied_groups({sid: v[0] for sid, v in scores.items()}, list(scores.keys())):
+            ids = ", ".join(g["story_ids"])
+            print(f"    rank {g['rank_position']}: {ids}  (copeland={g['score']})")
+        for sid in sorted(scores):
+            copeland, win_rate, games = scores[sid]
+            groups = tied_groups({s: v[0] for s, v in scores.items()}, list(scores.keys()))
+            rank_by_story = {s: g["rank_position"] for g in groups for s in g["story_ids"]}
+            size_by_story = {s: len(g["story_ids"]) for g in groups for s in g["story_ids"]}
             pairwise_ranking_rows.append(
-                {"model": model, "rank": i, "story_id": story_id, "copeland": copeland, "win_rate": round(win_rate, 3), "games": games}
+                {
+                    "model": model, "story_id": sid, "copeland": copeland, "win_rate": round(win_rate, 3), "games": games,
+                    "rank_position": rank_by_story[sid], "tie_group_size": size_by_story[sid],
+                }
             )
-        row, spearman, agreement, checked = human_comparison_row(
-            model, "ALL", "ALL", "pairwise_pooled_diagnostic", ranking
+        scores_for_comparison = {sid: (v[0], v[2]) for sid, v in scores.items()}  # (copeland, games) as (score, n)
+        human_comparison_rows.append(
+            human_comparison_row(model, "ALL", "ALL", "pairwise_pooled_diagnostic", scores_for_comparison, human_reference, human_pairs)
         )
-        human_comparison_rows.append(row)
 
-    print("\n=== G/H. Comparison against human reference: availability ===")
+    print("\n=== Comparison against human reference: availability ===")
     if human_reference is None:
         print("  data/human_reference.json does not exist yet (run human_ranking.py once enough")
-        print("  pairwise judgments are collected). Spearman correlation is unavailable for now.")
+        print("  pairwise judgments are collected). Kendall tau-b / Spearman are unavailable for now.")
     if not human_pairs:
-        print("  data/human_pairwise.jsonl has no judgments yet. Pairwise agreement is unavailable.")
+        print("  data/human_pairwise.jsonl has no judgments yet. Pairwise concordance diagnostics are unavailable.")
     print(f"  Full model/dimension/value breakdown written to {ANALYSIS_DIR}/human_comparison.csv")
 
     os.makedirs(ANALYSIS_DIR, exist_ok=True)
 
     write_csv(
-        pairwise_effect_rows,
-        ["model", "contrast_id", "dimension", "story_a_id", "story_b_id", "replicate_id", "category", "forward_choice", "flipped_choice", "changed"],
-        os.path.join(ANALYSIS_DIR, "pairwise_context_effects.csv"),
+        changed_rows,
+        ["model", "contrast_id", "dimension", "story_1_id", "story_2_id", "position", "replicate_id", "category",
+         "story1_context_forward", "story1_context_flipped", "forward_choice", "forward_chosen_story_id",
+         "flipped_choice", "flipped_chosen_story_id", "changed"],
+        os.path.join(ANALYSIS_DIR, "pairwise_changed_diagnostic.csv"),
+    )
+    write_csv(
+        directional_rows,
+        ["model", "contrast_id", "story_1_id", "story_2_id", "category", "p_story1_preferred_given_value_a",
+         "n_value_a", "tie_n_value_a", "p_story1_preferred_given_value_b", "n_value_b", "tie_n_value_b",
+         "directional_effect_a_minus_b"],
+        os.path.join(ANALYSIS_DIR, "pairwise_directional_effects.csv"),
+    )
+    write_csv(
+        directional_by_contrast_rows,
+        ["model", "contrast_id", "category", "mean_directional_effect", "n_story_pairs"],
+        os.path.join(ANALYSIS_DIR, "pairwise_directional_effects_by_contrast.csv"),
     )
     write_csv(
         prompt_effect_rows,
-        ["model", "contrast_id", "story_a_id", "story_b_id", "replicate_id", "category", "baseline_value", "treatment_value", "baseline_choice", "treatment_choice", "changed"],
+        ["model", "contrast_id", "story_a_id", "story_b_id", "replicate_id", "category", "baseline_value",
+         "treatment_value", "baseline_choice", "treatment_choice", "changed"],
         os.path.join(ANALYSIS_DIR, "prompt_context_effects.csv"),
     )
     write_csv(
-        pairwise_ranking_rows,
-        ["model", "rank", "story_id", "copeland", "win_rate", "games"],
-        os.path.join(ANALYSIS_DIR, "pairwise_rankings_pooled_diagnostic.csv"),
+        pairwise_vs_human_rows,
+        ["model", "story_a_id", "story_b_id", "contrast_id", "assignment", "position", "replicate_id",
+         "human_winner", "model_choice", "model_chosen_story_id", "outcome"],
+        os.path.join(ANALYSIS_DIR, "pairwise_vs_human_reference_observations.csv"),
     )
     write_csv(
-        single_ranking_rows,
-        ["model", "rank", "story_id", "mean_overall_quality", "n"],
-        os.path.join(ANALYSIS_DIR, "single_text_rankings_pooled_diagnostic.csv"),
+        pairwise_vs_human_summary_rows,
+        ["model", "concordant", "discordant", "model_tied", "n", "concordant_rate"],
+        os.path.join(ANALYSIS_DIR, "pairwise_vs_human_reference_summary.csv"),
+    )
+    write_csv(
+        delta_obs_rows,
+        ["model", "story_id", "dimension", "value", "replicate_id", "category", "treatment_rating",
+         "neutral_baseline_mean", "delta"],
+        os.path.join(ANALYSIS_DIR, "treatment_vs_neutral_observations.csv"),
+    )
+    write_csv(
+        delta_by_story_condition_rows,
+        ["model", "story_id", "dimension", "value", "category", "mean_delta", "n"],
+        os.path.join(ANALYSIS_DIR, "treatment_vs_neutral_by_story_condition.csv"),
+    )
+    write_csv(
+        delta_by_model_dim_value_rows,
+        ["model", "dimension", "value", "category", "mean_delta", "n"],
+        os.path.join(ANALYSIS_DIR, "treatment_vs_neutral_by_model_dimension_value.csv"),
     )
     write_csv(
         single_by_condition_rows,
-        ["model", "dimension", "value", "rank", "story_id", "mean_overall_quality", "n"],
+        ["model", "dimension", "value", "story_id", "mean_overall_quality", "n", "rank_position", "tie_group_size"],
         os.path.join(ANALYSIS_DIR, "single_text_rankings_by_condition.csv"),
     )
     write_csv(
+        single_ranking_rows,
+        ["model", "story_id", "mean_overall_quality", "n", "rank_position", "tie_group_size"],
+        os.path.join(ANALYSIS_DIR, "single_text_rankings_pooled_diagnostic.csv"),
+    )
+    write_csv(
+        pairwise_ranking_rows,
+        ["model", "story_id", "copeland", "win_rate", "games", "rank_position", "tie_group_size"],
+        os.path.join(ANALYSIS_DIR, "pairwise_rankings_pooled_diagnostic.csv"),
+    )
+    write_csv(
         human_comparison_rows,
-        ["model", "dimension", "value", "ranking_source", "spearman_vs_human", "pairwise_agreement", "pairwise_agreement_n"],
+        ["model", "dimension", "value", "ranking_source", "n_common_with_human_reference", "kendall_tau_b",
+         "spearman_vs_human", "pairwise_concordant", "pairwise_discordant", "pairwise_model_tied",
+         "pairwise_concordant_rate", "pairwise_checked_n"],
         os.path.join(ANALYSIS_DIR, "human_comparison.csv"),
     )
 

@@ -119,16 +119,26 @@ This design went through three bug fixes before landing on its current shape:
    on these two stories? Story A {clause}, while Story B {clause}. I'm trying
    to make up my mind."* The story blocks that follow carry no context at
    all — just the two texts, labeled Story A / Story B.
+4. **Display position confounded with story identity.** The above (a
+   "forward" trial and a "flipped" trial per contrast x story pair) held
+   `story_1` fixed as Story A in both trials, varying only which contrast
+   value each story carried. That isolates context sensitivity from story
+   identity, but leaves display position perfectly confounded with story
+   identity (`story_1` is *always* shown in position A) — it can't tell a
+   context-assignment effect apart from a raw "being shown first" effect.
+   Fix: `context_contrasts.build_contrast_block()` crosses context
+   assignment with display position into a 4-cell block (see "Trial
+   manifest" below) so the two are separable.
 
-Through all of this, `story_1` is always Story A and `story_2` is always
-Story B, in both the forward and flipped trial — position never moves, only
-the attribution does. So if the model's preference tracks the underlying
-stories, the **same A/B position** should keep winning across the
-forward/flipped pair. If the preference instead flips when the attribution is
-swapped, that's evidence the context, not the prose, is driving the choice.
-This is the same swap logic as the self_vs_ai/ai_vs_self and
+Through all of this, `story_1`/`story_2` are the pair's fixed identities,
+and every cell records both which story received which context value AND
+which story was displayed in which position — see
+`analyze_context.choice_to_story_id`, which maps a raw A/B/tie choice back
+to the actual story id so analysis operates in story identity, never raw
+A/B letters. This is the same swap logic as the self_vs_ai/ai_vs_self and
 ai_vs_journal/journal_vs_ai conditions already analyzed in `analyze.py`,
-generalized to the new dimensions and to this A/B/tie prompt format.
+generalized to the new dimensions, this A/B/tie prompt format, and full
+position counterbalancing.
 
 ### Dependent dimensions can't be contrasted across two stories
 
@@ -142,27 +152,36 @@ does not include `writer_status` contrasts for this reason. `writer_status`
 is still fully testable, just single-story only (see below), where each API
 call only ever claims one identity for one story.
 
-## Single-story numeric rating still works
+## Single-story numeric rating: v0.2's own 1.0-10.0 decimal scale
 
 `prompts.build_prompt(text, context, instruction)` already accepts an
-arbitrary context string, so a `context_packets.render_packet()` result plugs
-straight into the existing single-story 1-5 rating pipeline with **no changes
-to `prompts.py`**. `context_single_prompts.py` demonstrates this: it builds
-one single-story rating prompt per single-variable condition, using
-`prompts.py`'s existing `rating` task unchanged. This is the numeric-score
-path the original pilot used, still available for context-packet signals.
+arbitrary context string and an arbitrary instruction, so it's reused
+unmodified for v0.2 -- but v0.2 supplies its own task instruction
+(`data/context_tasks.jsonl`, `context_rating`), not the v0.1 pilot's
+`data/tasks.jsonl` `rating` task. The v0.2 scale is 1.0-10.0 with at most
+one decimal place (e.g. 7.3), anchored by five verbal bands (very poor /
+weak / mixed-average / good / excellent) so the extra resolution over the
+pilot's integer 1-5 scale means something. The point is more resolution,
+**not** eliminating ties -- exact ties are explicitly called out as
+legitimate in the task instruction, and nothing downstream ever breaks one
+artificially (see `analyze_context.py`'s tie-aware ranking statistics).
+Validated separately from the v0.1 scale by
+`run_trial.validate_context_single_response`
+(`is_valid_context_rating`/`has_at_most_one_decimal_place`), so the pilot's
+own integer validator is untouched. `context_single_prompts.py` demonstrates
+the resulting prompt, one per single-variable condition.
 
 ## Trial manifest
 
 `context_trials.py` combines everything above into
 `data/context_trials.jsonl` (regenerate with `python3 context_trials.py`):
 276 `context_single` trials (12 stories × (22 single-variable conditions + 1
-neutral no-context baseline)), 1716 `context_pairwise` trials (66 story pairs
-× 13 story-scope contrasts × 2 directions), and 132 `context_prompt` trials
-(66 pairs × 1 prompt-scope contrast × 2 values) -- 2124 total. Every trial
-carries explicit structured metadata (story ids, `dimension`, `contrast_id`,
-`assignment`, etc.) rather than requiring anything to be parsed back out of
-`trial_id`.
+neutral no-context baseline)), 3432 `context_pairwise` trials (66 story pairs
+× 13 story-scope contrasts × 4 cells -- see the 4th bug fix above), and 132
+`context_prompt` trials (66 pairs × 1 prompt-scope contrast × 2 values) --
+3840 total. Every trial carries explicit structured metadata (story ids,
+`dimension`, `contrast_id`, `assignment`, `position`, `block_id`, etc.)
+rather than requiring anything to be parsed back out of `trial_id`.
 
 `context_trials.build_context_pairwise_same_trials()` additionally generates
 an **optional** family (1254 trials: 66 pairs × 19 non-dependent
@@ -178,32 +197,37 @@ required run, and no results exist for it.
 **Wired up:**
 
 - `run_trial.py` / `run_batch.py` accept `--trials-file data/context_trials.jsonl`
-  and validate all three new trial types' responses (`context_single` reuses
-  the existing 1-5 schema; `context_pairwise`/`context_prompt` validate the
-  A/B/tie schema above, normalizing "characterisation" to "characterization").
-  `--results-file` keeps benchmark results out of the pilot's
-  `results/raw.jsonl`. `--model` and `--contrast` were added alongside the
-  existing `--type`/`--condition`/`--id-prefix`/`--replicates`/
-  `--retry-failed`/`--dry-run`, none of which changed behavior for the v0.1
-  pilot's own trials file.
+  and validate all trial types' responses (`context_single` validates v0.2's
+  own 1.0-10.0 decimal schema, separately from the v0.1 pilot's integer 1-5
+  schema; `context_pairwise`/`context_prompt`/`context_pairwise_same`
+  validate the A/B/tie schema above, normalizing "characterisation" to
+  "characterization"). `--results-file` keeps benchmark results out of the
+  pilot's `results/raw.jsonl`. `--model`, `--contrast`, `--sampling-regime`
+  (recorded on every v0.2 result row; ignored and unrecorded for v0.1 trial
+  types), and `--replicates-treatment`/`--replicates-neutral` (independent
+  replicate counts, neutral never configurable below the treatment count)
+  were added alongside the existing `--type`/`--condition`/`--id-prefix`/
+  `--replicates`/`--retry-failed`/`--dry-run`, none of which changed
+  behavior for the v0.1 pilot's own trials file.
 - `analyze_context.py` runs completely offline against a results file,
-  collapses retries, summarizes forward/flipped and prompt-level context
-  effects, and computes rankings. The **primary** human-alignment analysis
-  keeps single-text rankings separate per `(model, dimension, value)`
-  (including the neutral baseline) and compares each one against
-  `data/human_reference.json` (once it exists) via pure-Python Spearman
-  correlation plus pairwise agreement against `data/human_pairwise.jsonl`.
-  A pooled single-text ranking and a pooled pairwise Copeland/win-rate
-  ranking are also computed but clearly labelled **diagnostic only** — see
-  "Rankings and human alignment" in `FINAL_DESIGN.md` for why pooling across
-  conditions would hide the effect this benchmark measures. Writes CSVs to
-  `results/context_analysis/`.
+  collapses retry *attempts* (never replicates), and only ever analyzes one
+  `--sampling-regime` at a time. It keeps four questions distinct rather
+  than collapsing them into a "ranking" -- treatment-vs-neutral-baseline
+  deltas, a tie-aware ranking-vs-human-reference comparison (Kendall tau-b
+  primary, tie-aware Spearman secondary, never an artificial tie-break), a
+  directional pairwise context-sensitivity effect in story identity (not a
+  boolean), and a direct pairwise-choices-vs-human-judgments comparison --
+  see "Four distinct questions" in `FINAL_DESIGN.md`. Pooled single-text and
+  pairwise rankings are also computed but clearly labelled **diagnostic
+  only**. Writes CSVs to `results/context_analysis/`.
 
 **Not done:** no benchmark API calls have actually been made. The trial
-count above (2124, plus 1254 optional/never-run) is deliberately generated
+count above (3840, plus 1254 optional/never-run) is deliberately generated
 in full since generation is free, but running any of it is a separate,
 deliberate step -- see the "Budget constraints" section of
 `FINAL_DESIGN.md` for how `run_batch.py`'s filters are meant to be used to
 select a slice worth paying for. The optional same-context pairwise family
 is additionally excluded from `data/context_trials.jsonl` itself, not just
-from what gets run, so it can't be picked up by accident.
+from what gets run, so it can't be picked up by accident. The
+`provider_default_secondary` sampling regime is supported end-to-end but
+has likewise never been run.

@@ -49,16 +49,52 @@ def get_api_key():
     return api_key
 
 
-def call_claude(prompt, model):
-    """Send the prompt as a single user message and return the reply text."""
+# Two named v0.2 sampling regimes (see resolve_sampling_params). The primary
+# regime pins temperature=0 for the lowest-variance inference settings the
+# API supports for this request type -- NOT an assumption that this is
+# literally deterministic (repeated replicates still matter; see
+# run_batch.py's --replicates* flags), just the cleanest setting for
+# measuring a causal/context-sensitivity effect. The secondary regime is
+# provider defaults, for a later robustness check under more naturalistic
+# usage -- supported here, but never run by anything in this repo.
+SAMPLING_REGIMES = {
+    "low_variance_primary": {"temperature": 0},
+    "provider_default_secondary": {},
+}
+
+
+def resolve_sampling_params(trial_type, regime_name):
+    """Only v0.2 context trial types carry an explicit sampling regime. v0.1
+    trial types ("single", "comparison", "comparison_control") return None,
+    meaning: no extra API parameter is sent and no sampling metadata is
+    added to the saved row, regardless of --sampling-regime -- so the
+    completed v0.1 pilot stays reproducible exactly as before, independent
+    of this flag's default.
+    """
+    if trial_type not in CONTEXT_TRIAL_TYPES:
+        return None
+    return SAMPLING_REGIMES[regime_name]
+
+
+def call_claude(prompt, model, sampling_params=None):
+    """Send the prompt as a single user message and return the reply text.
+
+    sampling_params (e.g. {"temperature": 0}) are passed through to the API
+    verbatim when truthy; None or {} (both mean "no override") send nothing
+    extra, so the v0.1 pilot's original call shape is unchanged when this is
+    omitted.
+    """
     import anthropic  # imported here so --dry-run works without the package installed
 
     client = anthropic.Anthropic(api_key=get_api_key())
-    response = client.messages.create(
+    create_kwargs = dict(
         model=model,
         max_tokens=4096,  # required by the API; not a sampling parameter
         messages=[{"role": "user", "content": prompt}],
     )
+    if sampling_params:
+        create_kwargs.update(sampling_params)
+    response = client.messages.create(**create_kwargs)
 
     text_blocks = [block.text for block in response.content if block.type == "text"]
     if not text_blocks:
@@ -85,9 +121,49 @@ def is_valid_ratings(ratings):
 
 
 def validate_single_response(parsed):
-    """Return an error string, or None if a single-story response is valid."""
+    """Return an error string, or None if a single-story response is valid.
+
+    This is the v0.1 pilot's original integer 1-5 schema, unchanged and used
+    only for trial_type "single" -- see validate_context_single_response for
+    v0.2's separate 1.0-10.0 decimal schema.
+    """
     if not is_valid_ratings(parsed):
         return "Response must contain exactly the 5 rating fields, each an integer 1-5"
+    return None
+
+
+# v0.2 single-text rating scale: 1.0-10.0, at most one decimal place (see
+# data/context_tasks.jsonl). A distinct schema from the v0.1 pilot's integer
+# 1-5 scale above -- kept as a separate function/task file rather than
+# changed in place, so re-running the completed v0.1 pilot still reproduces
+# its original integer-scale results exactly.
+def has_at_most_one_decimal_place(value):
+    scaled = value * 10
+    return abs(scaled - round(scaled)) < 1e-6
+
+
+def is_valid_context_rating(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    if not (1.0 <= value <= 10.0):
+        return False
+    return has_at_most_one_decimal_place(value)
+
+
+def is_valid_context_ratings(ratings):
+    """Check that ratings has exactly the 5 rating fields, each 1.0-10.0 with <=1 decimal place."""
+    if not isinstance(ratings, dict) or set(ratings.keys()) != set(RATING_FIELDS):
+        return False
+    return all(is_valid_context_rating(ratings[field]) for field in RATING_FIELDS)
+
+
+def validate_context_single_response(parsed):
+    """Return an error string, or None if a v0.2 context_single response is valid."""
+    if not is_valid_context_ratings(parsed):
+        return (
+            "Response must contain exactly the 5 rating fields, each a number "
+            "from 1.0 to 10.0 with at most one decimal place"
+        )
     return None
 
 
@@ -163,9 +239,11 @@ def parse_and_validate(response_text, trial_type):
     is None and validation_error explains why. response_text is unwrapped from a
     Markdown code fence first, if the model added one.
 
-    Dispatch by trial_type, preserving the exact old behavior for the two
-    original types:
-      "single" / "context_single"        -> 1-5 ratings (unchanged schema)
+    Dispatch by trial_type, preserving the exact old behavior for the
+    original v0.1 types:
+      "single"          -> integer 1-5 ratings (unchanged v0.1 schema)
+      "context_single"  -> v0.2's own 1.0-10.0 decimal ratings (a distinct
+        schema -- see validate_context_single_response)
       "context_pairwise" / "context_prompt" / "context_pairwise_same"
         -> A/B/tie per category (new; parsed_response is normalized to use
         "characterization"). "context_pairwise_same" is the OPTIONAL,
@@ -180,8 +258,12 @@ def parse_and_validate(response_text, trial_type):
     except json.JSONDecodeError:
         return None, "Response is not valid JSON"
 
-    if trial_type in ("single", "context_single"):
+    if trial_type == "single":
         error = validate_single_response(parsed)
+        return (None, error) if error else (parsed, None)
+
+    if trial_type == "context_single":
+        error = validate_context_single_response(parsed)
         return (None, error) if error else (parsed, None)
 
     if trial_type in ("context_pairwise", "context_prompt", "context_pairwise_same"):
@@ -229,6 +311,13 @@ def main():
     parser.add_argument("--trials-file", default=TRIALS_FILE, help=f"Trials manifest to read (default: {TRIALS_FILE})")
     parser.add_argument("--results-file", default=RESULTS_FILE, help=f"Results file to append to (default: {RESULTS_FILE})")
     parser.add_argument("--model", help="Override the model (default: $ANTHROPIC_MODEL, else claude-sonnet-5)")
+    parser.add_argument(
+        "--sampling-regime",
+        choices=list(SAMPLING_REGIMES),
+        default="low_variance_primary",
+        help="v0.2 context trial types only (ignored, and not recorded, for v0.1 trial types): "
+        "low_variance_primary (default; temperature=0) or provider_default_secondary",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the trial without calling the API")
     args = parser.parse_args()
 
@@ -240,13 +329,17 @@ def main():
         print(f"No trial found with trial_id: {args.trial_id}")
         return
 
+    sampling_params = resolve_sampling_params(trial["type"], args.sampling_regime)
+
     if args.dry_run:
         print(f"Model: {model}")
+        if sampling_params is not None:
+            print(f"Sampling regime: {args.sampling_regime}  (params: {sampling_params})")
         print("Trial:")
         print(json.dumps(trial, indent=2))
         return
 
-    api_result = call_claude(trial["prompt"], model)
+    api_result = call_claude(trial["prompt"], model, sampling_params)
     response_text = api_result["response_text"]
     parsed_response, validation_error = parse_and_validate(response_text, trial["type"])
 
@@ -265,6 +358,9 @@ def main():
     }
     if trial["type"] in CONTEXT_TRIAL_TYPES:
         result["trial_meta"] = trial_metadata(trial)
+    if sampling_params is not None:
+        result["sampling_regime"] = args.sampling_regime
+        result["sampling_params"] = sampling_params
 
     save_result(result, args.results_file)
     print(f"Saved result for {trial['trial_id']} to {args.results_file}")

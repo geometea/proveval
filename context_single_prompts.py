@@ -13,18 +13,18 @@ happen here, and nothing is written to disk.
 
 import prompts
 from context_packets import load_dimensions, single_variable_conditions
+from context_trials import CONTEXT_TASKS_FILE
 
 
 def single_variable_rating_examples(dimensions, story):
     """One single-story rating prompt per single-variable condition, for one story.
 
-    Each prompt is directly comparable to prompts.py's existing "neutral"
-    single-story trials (context = ""), just with a context_packets-driven
-    signal instead of one of the hand-written conditions in
-    data/conditions.jsonl.
+    Uses v0.2's own 1.0-10.0 decimal rating task (data/context_tasks.jsonl),
+    not the v0.1 pilot's integer 1-5 task -- see
+    run_trial.validate_context_single_response.
     """
-    tasks = prompts.load_items(prompts.TASKS_FILE)
-    rating_task = next(t for t in tasks if t["id"] == "rating")
+    tasks = prompts.load_items(CONTEXT_TASKS_FILE)
+    rating_task = next(t for t in tasks if t["id"] == "context_rating")
     text = prompts.load_story(story["path"])
 
     examples = []

@@ -1,21 +1,28 @@
-"""Generate forward/flipped A-B trials from explicit context contrasts.
+"""Generate the 4-cell counterbalanced pairwise block from explicit context contrasts.
 
 A contrast names two specific values of one dimension to pit against each other
 (e.g. provenance "ai_claude" vs "human_unknown"), defined in
-data/context_contrasts.jsonl -- not hardcoded here. story_1 is always Story A
-and story_2 is always Story B, in both trials; only the contextual attribution
-changes between them:
+data/context_contrasts.jsonl -- not hardcoded here. For a story pair
+{story_1, story_2}, build_contrast_block() crosses BOTH:
 
-- a forward trial: story_1 (Story A) gets value "a", story_2 (Story B) gets value "b"
-- a flipped trial: story_1 (Story A) gets value "b", story_2 (Story B) gets value "a"
+- "assignment": which contrast value each story is attributed
+  ("forward": story_1 gets value "a", story_2 gets value "b"; "flipped": the
+  reverse), and
+- "position": which story is DISPLAYED as Story A ("story1_as_a" or
+  "story2_as_a")
 
-Both stories always carry some context (never nothing) in both trials -- the
+into 4 cells sharing one block_id. An earlier version held position fixed
+(story_1 was always Story A) and only varied assignment -- that isolates
+context sensitivity from story identity, but leaves display position fully
+confounded with story identity, so it can't separate a context-assignment
+effect from a raw display-position effect. Crossing both factors makes them
+separable: cells 1/2 share one context assignment and differ only in
+position; cells 3/4 share the other assignment and also differ only in
+position.
+
+Both stories always carry some context (never nothing) in every cell -- the
 control comes from swapping which value each story gets, not from comparing
-against an empty baseline. Since story identity and A/B position never move,
-if the model's choice is really about the underlying stories, the same A/B
-position should keep winning across the forward/flipped pair. If the
-preference instead changes when the contexts are swapped, that's evidence the
-context is doing the work, not the prose.
+against an empty baseline.
 
 The contextual attribution is woven into a single deterministic opening
 sentence (each contrast supplies its own "a_clause"/"b_clause" wording, hand
@@ -28,8 +35,8 @@ format) rather than duplicating it. Does not modify prompts.py, comparisons.py,
 make_trials.py, run_trial.py, run_batch.py, analyze.py, or data/trials.jsonl,
 and makes no API calls.
 
-Run this file directly to print every forward/flipped prompt pair in full,
-plus a summary table of each contrast's intro sentences.
+Run this file directly to print every cell's prompt in full, plus a summary
+table of each contrast's per-cell intro sentences.
 """
 
 import json
@@ -103,15 +110,39 @@ def intro_sentence(first_clause, second_clause):
     )
 
 
-def build_contrast_trials(dimensions, contrast, story_1, story_2):
-    """Build the forward and flipped trial for one contrast, across two different stories.
+def build_contrast_block(dimensions, contrast, story_1, story_2):
+    """Build the full 4-cell counterbalanced block for one contrast, across two
+    different stories: story_1 and story_2 are the pair's fixed identities,
+    crossed with BOTH of:
 
-    story_1 is always Story A and story_2 is always Story B in both trials --
-    only which clause ("a_clause" or "b_clause") is attributed to which story
-    changes between forward and flipped.
+      - "assignment": which contrast value each story is attributed --
+        "forward" (story_1 gets value "a", story_2 gets value "b") or
+        "flipped" (story_1 gets value "b", story_2 gets value "a");
+      - "position": which story is DISPLAYED as Story A -- "story1_as_a" or
+        "story2_as_a".
+
+    Earlier versions of this function held position fixed (story_1 was
+    always Story A) and only varied assignment. That isolates context
+    sensitivity from story identity, but leaves display position fully
+    confounded with story identity (story_1 is always shown in position A),
+    so it can't separate a context-assignment effect from a raw
+    display-position effect. Crossing both factors gives 4 cells instead of
+    2, sharing one block_id, so the two effects are separable:
+
+        cell 1: assignment=forward, position=story1_as_a -> A=story_1(a), B=story_2(b)
+        cell 2: assignment=forward, position=story2_as_a -> A=story_2(b), B=story_1(a)
+        cell 3: assignment=flipped, position=story1_as_a -> A=story_1(b), B=story_2(a)
+        cell 4: assignment=flipped, position=story2_as_a -> A=story_2(a), B=story_1(b)
+
+    Cells 1/2 share one context assignment (story_1=a, story_2=b) and differ
+    only in display position; cells 3/4 share the other assignment and also
+    differ only in position. Every cell carries story_1_id/story_2_id (the
+    pair's fixed identities, for grouping a block regardless of display
+    position) alongside story_a_id/story_b_id (which story is actually shown
+    in which position for this cell).
     """
     if story_1["id"] == story_2["id"]:
-        raise ValueError("build_contrast_trials requires two different stories, not the same story twice")
+        raise ValueError("build_contrast_block requires two different stories, not the same story twice")
 
     assert_no_shared_identity_contradiction(dimensions, contrast)
     assert_values_are_registered(dimensions, contrast)
@@ -119,30 +150,42 @@ def build_contrast_trials(dimensions, contrast, story_1, story_2):
     text_1 = load_story(story_1["path"])
     text_2 = load_story(story_2["path"])
     pair_id = f"{story_1['id']}_vs_{story_2['id']}"
+    block_id = f"block__{contrast['id']}__{pair_id}"
     a_clause, b_clause = contrast["a_clause"], contrast["b_clause"]
 
-    forward_intro = intro_sentence(a_clause, b_clause)
-    flipped_intro = intro_sentence(b_clause, a_clause)
+    # assignment -> (story_1's value/clause, story_2's value/clause)
+    assignments = {
+        "forward": ((contrast["a"], a_clause), (contrast["b"], b_clause)),
+        "flipped": ((contrast["b"], b_clause), (contrast["a"], a_clause)),
+    }
+    stories = {"story1_as_a": (story_1, story_2, text_1, text_2), "story2_as_a": (story_2, story_1, text_2, text_1)}
 
-    forward = {
-        "trial_id": f"contrast__{contrast['id']}__{pair_id}__forward",
-        "contrast_id": contrast["id"],
-        "dimension": contrast["dimension"],
-        "story_a_id": story_1["id"],
-        "story_b_id": story_2["id"],
-        "intro": forward_intro,
-        "prompt": build_prompt(forward_intro, text_1, text_2),
-    }
-    flipped = {
-        "trial_id": f"contrast__{contrast['id']}__{pair_id}__flipped",
-        "contrast_id": contrast["id"],
-        "dimension": contrast["dimension"],
-        "story_a_id": story_1["id"],
-        "story_b_id": story_2["id"],
-        "intro": flipped_intro,
-        "prompt": build_prompt(flipped_intro, text_1, text_2),
-    }
-    return forward, flipped
+    cells = []
+    for assignment, (context_1, context_2) in assignments.items():
+        for position, (story_a, story_b, text_a, text_b) in stories.items():
+            context_by_id = {story_1["id"]: context_1, story_2["id"]: context_2}
+            value_a, clause_a = context_by_id[story_a["id"]]
+            value_b, clause_b = context_by_id[story_b["id"]]
+            intro = intro_sentence(clause_a, clause_b)
+            cells.append(
+                {
+                    "trial_id": f"{block_id}__{assignment}__{position}",
+                    "block_id": block_id,
+                    "contrast_id": contrast["id"],
+                    "dimension": contrast["dimension"],
+                    "story_1_id": story_1["id"],
+                    "story_2_id": story_2["id"],
+                    "story_a_id": story_a["id"],
+                    "story_b_id": story_b["id"],
+                    "assignment": assignment,
+                    "position": position,
+                    "context_a": {"value": value_a, "clause": clause_a},
+                    "context_b": {"value": value_b, "clause": clause_b},
+                    "intro": intro,
+                    "prompt": build_prompt(intro, text_a, text_b),
+                }
+            )
+    return cells
 
 
 def main():
@@ -153,27 +196,23 @@ def main():
 
     all_trials = []
     for contrast in contrasts:
-        forward, flipped = build_contrast_trials(dimensions, contrast, story_1, story_2)
-        all_trials.append(forward)
-        all_trials.append(flipped)
+        all_trials.extend(build_contrast_block(dimensions, contrast, story_1, story_2))
 
     print(
-        f"{len(contrasts)} contrasts x 2 (forward/flipped) = {len(all_trials)} prompts "
-        f"({story_1['id']} = Story A, {story_2['id']} = Story B, always)\n"
+        f"{len(contrasts)} contrasts x 4 (assignment x position) = {len(all_trials)} prompts "
+        f"({story_1['id']} = story_1, {story_2['id']} = story_2)\n"
     )
 
     for trial in all_trials:
-        print(f"=== {trial['trial_id']} ===")
+        print(f"=== {trial['trial_id']} (assignment={trial['assignment']}, position={trial['position']}) ===")
         print(trial["prompt"])
         print()
 
-    print("Summary: contrast_id | forward intro | flipped intro\n")
+    print("Summary: contrast_id | cell -> intro\n")
     for contrast in contrasts:
-        forward_intro = intro_sentence(contrast["a_clause"], contrast["b_clause"])
-        flipped_intro = intro_sentence(contrast["b_clause"], contrast["a_clause"])
         print(f"{contrast['id']}")
-        print(f"  forward: {forward_intro}")
-        print(f"  flipped: {flipped_intro}")
+        for cell in build_contrast_block(dimensions, contrast, story_1, story_2):
+            print(f"  {cell['assignment']}/{cell['position']}: {cell['intro']}")
         print()
 
 
