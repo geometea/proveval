@@ -16,21 +16,29 @@ from datetime import datetime, timezone
 from random import Random
 
 from run_trial import (
+    CONTEXT_TRIAL_TYPES,
     DEFAULT_MODEL,
     RESULTS_FILE,
     TRIALS_FILE,
     call_claude,
     load_trials,
     parse_and_validate,
+    resolve_model,
     save_result,
+    trial_metadata,
 )
 
 RANDOM_SEED = 42
 
 
-def select_trials(trials, only_type, id_prefix, conditions, limit):
-    """Filter by type, trial_id prefix, and condition_id (each if given), shuffle
-    with a fixed seed, then cut to limit."""
+def select_trials(trials, only_type, id_prefix, conditions, contrasts, limit):
+    """Filter by type, trial_id prefix, condition_id, and contrast_id (each if
+    given), shuffle with a fixed seed, then cut to limit.
+
+    condition_id (old single/comparison trials, and context_single) and
+    contrast_id (context_pairwise/context_prompt) are read with .get() since
+    not every trial type has both fields.
+    """
     if only_type:
         trials = [t for t in trials if t["type"] == only_type]
 
@@ -38,7 +46,10 @@ def select_trials(trials, only_type, id_prefix, conditions, limit):
         trials = [t for t in trials if t["trial_id"].startswith(id_prefix)]
 
     if conditions:
-        trials = [t for t in trials if t["condition_id"] in conditions]
+        trials = [t for t in trials if t.get("condition_id") in conditions]
+
+    if contrasts:
+        trials = [t for t in trials if t.get("contrast_id") in contrasts]
 
     trials = list(trials)
     Random(RANDOM_SEED).shuffle(trials)
@@ -88,57 +99,60 @@ def next_attempt_id(records):
     return max(r.get("attempt_id", 1) for r in records) + 1
 
 
-def run_one(trial, replicate_id, model, attempt_id):
+def run_one(trial, replicate_id, model, attempt_id, results_file):
     """Call the API for one trial, validate it, save a result row, and return a status word.
 
     Always saves a new row, even on failure, so a failed call can still be diagnosed
     later; existing rows (from earlier attempts) are never modified or removed.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
+    trial_meta = trial_metadata(trial) if trial["type"] in CONTEXT_TRIAL_TYPES else None
 
     try:
         api_result = call_claude(trial["prompt"], model)
     except Exception as e:
         print(f"Error calling the API for {trial['trial_id']} (replicate {replicate_id}): {e}")
-        save_result(
-            {
-                "trial_id": trial["trial_id"],
-                "model": model,
-                "replicate_id": replicate_id,
-                "attempt_id": attempt_id,
-                "timestamp": timestamp,
-                "stop_reason": None,
-                "input_tokens": None,
-                "output_tokens": None,
-                "response_text": None,
-                "parsed_response": None,
-                "validation_error": f"API call failed: {e}",
-            }
-        )
-        return "error"
-
-    response_text = api_result["response_text"]
-    parsed_response, validation_error = parse_and_validate(response_text, trial["type"])
-
-    save_result(
-        {
+        result = {
             "trial_id": trial["trial_id"],
             "model": model,
             "replicate_id": replicate_id,
             "attempt_id": attempt_id,
             "timestamp": timestamp,
-            "stop_reason": api_result["stop_reason"],
-            "input_tokens": api_result["input_tokens"],
-            "output_tokens": api_result["output_tokens"],
-            "response_text": response_text,
-            "parsed_response": parsed_response,
-            "validation_error": validation_error,
+            "stop_reason": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "response_text": None,
+            "parsed_response": None,
+            "validation_error": f"API call failed: {e}",
         }
-    )
+        if trial_meta is not None:
+            result["trial_meta"] = trial_meta
+        save_result(result, results_file)
+        return "error"
+
+    response_text = api_result["response_text"]
+    parsed_response, validation_error = parse_and_validate(response_text, trial["type"])
+
+    result = {
+        "trial_id": trial["trial_id"],
+        "model": model,
+        "replicate_id": replicate_id,
+        "attempt_id": attempt_id,
+        "timestamp": timestamp,
+        "stop_reason": api_result["stop_reason"],
+        "input_tokens": api_result["input_tokens"],
+        "output_tokens": api_result["output_tokens"],
+        "response_text": response_text,
+        "parsed_response": parsed_response,
+        "validation_error": validation_error,
+    }
+    if trial_meta is not None:
+        result["trial_meta"] = trial_meta
+    save_result(result, results_file)
     return "invalid" if validation_error else "valid"
 
 
-def select_failed_observations(existing_results, trials_by_id, model, only_type, id_prefix, conditions, limit):
+def select_failed_observations(existing_results, trials_by_id, model, only_type, id_prefix, conditions, contrasts, limit):
     """Find (trial, replicate_id) pairs that have failed attempts and no successful one.
 
     Only observations for the current model are considered, since a different
@@ -150,12 +164,14 @@ def select_failed_observations(existing_results, trials_by_id, model, only_type,
             continue
         trial = trials_by_id.get(trial_id)
         if trial is None:
-            continue  # trial no longer exists in data/trials.jsonl
+            continue  # trial no longer exists in the trials file
         if only_type and trial["type"] != only_type:
             continue
         if id_prefix and not trial_id.startswith(id_prefix):
             continue
-        if conditions and trial["condition_id"] not in conditions:
+        if conditions and trial.get("condition_id") not in conditions:
+            continue
+        if contrasts and trial.get("contrast_id") not in contrasts:
             continue
         candidates.append((trial, replicate_id))
 
@@ -167,14 +183,23 @@ def select_failed_observations(existing_results, trials_by_id, model, only_type,
 
 def main():
     parser = argparse.ArgumentParser(description="Run many trials through the Claude API.")
+    parser.add_argument("--trials-file", default=TRIALS_FILE, help=f"Trials manifest to read (default: {TRIALS_FILE})")
+    parser.add_argument("--results-file", default=RESULTS_FILE, help=f"Results file to append to (default: {RESULTS_FILE})")
+    parser.add_argument("--model", help="Override the model (default: $ANTHROPIC_MODEL, else claude-sonnet-5)")
     parser.add_argument("--replicates", type=int, default=1, help="How many times to run each trial")
-    parser.add_argument("--type", choices=["single", "comparison"], help="Only run this trial type")
+    parser.add_argument("--type", help="Only run this trial type (e.g. single, comparison, context_pairwise, ...)")
     parser.add_argument("--id-prefix", help="Only run trials whose trial_id starts with this prefix")
     parser.add_argument(
         "--condition",
         action="append",
         dest="conditions",
         help="Only run trials with this condition_id (repeatable to allow several)",
+    )
+    parser.add_argument(
+        "--contrast",
+        action="append",
+        dest="contrasts",
+        help="Only run trials with this contrast_id (repeatable; for context_pairwise/context_prompt trials)",
     )
     parser.add_argument("--limit", type=int, help="Only run the first N selected trials (for testing)")
     parser.add_argument(
@@ -185,19 +210,20 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Show what would run without calling the API")
     args = parser.parse_args()
 
-    model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
-    existing_results = load_existing_results(RESULTS_FILE)
+    model = resolve_model(args.model)
+    existing_results = load_existing_results(args.results_file)
 
     conditions = set(args.conditions) if args.conditions else None
+    contrasts = set(args.contrasts) if args.contrasts else None
 
     if args.retry_failed:
-        trials_by_id = {t["trial_id"]: t for t in load_trials(TRIALS_FILE)}
+        trials_by_id = {t["trial_id"]: t for t in load_trials(args.trials_file)}
         observations = select_failed_observations(
-            existing_results, trials_by_id, model, args.type, args.id_prefix, conditions, args.limit
+            existing_results, trials_by_id, model, args.type, args.id_prefix, conditions, contrasts, args.limit
         )
     else:
-        trials = load_trials(TRIALS_FILE)
-        trials = select_trials(trials, args.type, args.id_prefix, conditions, args.limit)
+        trials = load_trials(args.trials_file)
+        trials = select_trials(trials, args.type, args.id_prefix, conditions, contrasts, args.limit)
         observations = build_observations(trials, args.replicates)
 
     total = len(observations)
@@ -222,7 +248,7 @@ def main():
             print(f"{label} — retrying-failed (attempt {attempt_id})")
 
         try:
-            status = run_one(trial, replicate_id, model, attempt_id)
+            status = run_one(trial, replicate_id, model, attempt_id, args.results_file)
             print(f"{label} — {status}")
         except Exception as e:
             print(f"{label} — error: {e}")

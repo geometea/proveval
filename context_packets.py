@@ -17,8 +17,10 @@ import json
 DIMENSIONS_FILE = "data/context_dimensions.jsonl"
 
 # The order pieces are joined into one natural paragraph when a packet has more
-# than one dimension set.
-DIMENSION_ORDER = ["provenance", "writer_status", "editing_status", "reception"]
+# than one dimension set. Deliberately excludes "prompt_context": that
+# dimension has scope "prompt" (it's not attributed to any one story), and is
+# handled separately by context_trials.py rather than through render_packet.
+DIMENSION_ORDER = ["provenance", "writer_status", "source_venue", "editing_status", "reception", "user_opinion"]
 
 
 def load_dimensions(path=DIMENSIONS_FILE):
@@ -31,6 +33,17 @@ def load_dimensions(path=DIMENSIONS_FILE):
                 dim = json.loads(line)
                 dimensions[dim["dimension"]] = dim
     return dimensions
+
+
+def dimensions_with_scope(dimensions, scope):
+    """Return {dimension_id: dimension_dict} filtered to a given "scope" value.
+
+    "story" dimensions (provenance, writer_status, source_venue,
+    editing_status, reception, user_opinion) are attributed to one story.
+    "prompt" dimensions (currently just prompt_context) apply to the whole
+    request and aren't attached to either story -- see context_trials.py.
+    """
+    return {dim_id: dim for dim_id, dim in dimensions.items() if dim.get("scope") == scope}
 
 
 def value_text(dimensions, dimension_id, value_id, packet):

@@ -1,9 +1,13 @@
 # Context Packets
 
-An exploratory extension to expand the space of context variables we can test,
-without committing to any particular judge-optimization goal yet. This is
-additive: it does not modify `prompts.py`, `comparisons.py`, `make_trials.py`,
-`run_trial.py`, `run_batch.py`, `analyze.py`, or `data/trials.jsonl`.
+An extension to expand the space of context variables the benchmark can
+test. It is additive to the v0.1 pilot: it does not modify `prompts.py`,
+`comparisons.py`, `make_trials.py`, or `data/trials.jsonl`, and the pilot's
+default `results/raw.jsonl` / `analyze.py` path is untouched. `run_trial.py`
+and `run_batch.py` did gain new (backward-compatible) response validation and
+`--trials-file`/`--results-file`/`--model` flags so they can run this
+extension's trials too -- see "What's wired up" at the end of this document
+for exactly what that does and doesn't mean is true yet.
 
 ## Data model
 
@@ -23,21 +27,38 @@ or `known_other`. That's encoded as `depends_on` / `applies_when`, and its
 `context_packets.render_packet()` checks the dependency and resolves the
 pronoun automatically.
 
-Current dimensions:
+Every dimension also has a `scope`: `"story"` (attributed to one story --
+everything below except the last) or `"prompt"` (applies to the whole
+request, attributed to neither story). Current dimensions:
 
-- **provenance** — `self`, `known_other`, `human_unknown`, `ai_claude`,
-  `ai_chatgpt`, `ai_gemini_edited`, `ai_assisted`, `ai_llm_generic`
-- **writer_status** (depends on provenance being `self`/`known_other`) —
-  `published`, `first_time`, `hobby`
-- **editing_status** — `first_draft`, `edited`
-- **reception** — `unseen`, `lukewarm`, `negative`, `loved`
+- **provenance** (story) — `self`, `known_other`, `human_unknown`,
+  `ai_claude`, `ai_chatgpt`, `ai_gemini_edited`, `ai_assisted`,
+  `ai_llm_generic`
+- **writer_status** (story; depends on provenance being `self`/`known_other`)
+  — `published`, `first_time`, `hobby`
+- **source_venue** (story) — `literary_journal`, `friend_sent`,
+  `random_online`
+- **editing_status** (story) — `first_draft`, `edited`
+- **reception** (story) — `unseen`, `lukewarm`, `negative`, `loved`
+- **user_opinion** (story) — `liked`, `disliked`. Intentionally
+  sycophancy-adjacent: tests whether the evaluator's judgment shifts toward
+  the user's own stated reaction rather than the text.
+- **prompt_context** (prompt) — `none`, `weather_mention`: a single,
+  deliberately minimal, genuinely extraneous aside (disconnected from the
+  prose and from either claimed author). Structured so more prompt-level
+  contrasts can be added to `data/context_prompt_contrasts.jsonl` without
+  any code changes. Deliberately **not** run through `render_packet()`/
+  `DIMENSION_ORDER` like the story-scope dimensions above -- see
+  `context_trials.build_context_prompt_trials()`, which appends its phrase
+  directly to the shared intro instead.
 
-Rendering joins whichever dimensions are present, in a fixed order
-(`provenance → writer_status → editing_status → reception`), into one
-paragraph — e.g. `{"provenance": "self", "writer_status": "published"}` renders
-as `"I wrote this. I am a published author."` A packet can set as few or as
-many dimensions as needed; an empty packet renders as `""` (no context
-sentence at all).
+Rendering joins whichever *story-scope* dimensions are present, in a fixed
+order (`provenance → writer_status → source_venue → editing_status →
+reception → user_opinion`), into one paragraph — e.g.
+`{"provenance": "self", "writer_status": "published"}` renders as `"I wrote
+this. I am a published author."` A packet can set as few or as many
+dimensions as needed; an empty packet renders as `""` (no context sentence at
+all).
 
 ## Isolating variables
 
@@ -127,12 +148,39 @@ one single-story rating prompt per single-variable condition, using
 `prompts.py`'s existing `rating` task unchanged. This is the numeric-score
 path the original pilot used, still available for context-packet signals.
 
-## Status
+## Trial manifest
 
-This only builds and prints example prompts (`python3 context_packets.py`,
-`python3 context_contrasts.py`, `python3 context_single_prompts.py`) — it
-does not call the API, does not touch `data/items.jsonl` or
-`data/trials.jsonl`, and does not run through `run_batch.py` or `analyze.py`.
-Wiring it into an actual batch run (its own results file, its own analysis
-for the A/B/tie flip outcomes and for the numeric ratings) is a follow-up
-step, not done here.
+`context_trials.py` combines everything above into
+`data/context_trials.jsonl` (regenerate with `python3 context_trials.py`):
+264 `context_single` trials (12 stories × 22 single-variable conditions), 1716
+`context_pairwise` trials (66 story pairs × 13 story-scope contrasts × 2
+directions), and 132 `context_prompt` trials (66 pairs × 1 prompt-scope
+contrast × 2 values). Every trial carries explicit structured metadata
+(story ids, `dimension`, `contrast_id`, `assignment`, etc.) rather than
+requiring anything to be parsed back out of `trial_id`.
+
+## What's wired up (and what isn't)
+
+**Wired up:**
+
+- `run_trial.py` / `run_batch.py` accept `--trials-file data/context_trials.jsonl`
+  and validate all three new trial types' responses (`context_single` reuses
+  the existing 1-5 schema; `context_pairwise`/`context_prompt` validate the
+  A/B/tie schema above, normalizing "characterisation" to "characterization").
+  `--results-file` keeps benchmark results out of the pilot's
+  `results/raw.jsonl`. `--model` and `--contrast` were added alongside the
+  existing `--type`/`--condition`/`--id-prefix`/`--replicates`/
+  `--retry-failed`/`--dry-run`, none of which changed behavior for the v0.1
+  pilot's own trials file.
+- `analyze_context.py` runs completely offline against a results file,
+  collapses retries, summarizes forward/flipped and prompt-level context
+  effects, computes two provisional rankings, and compares them against
+  `data/human_reference.json` (once it exists) via pure-Python Spearman
+  correlation plus pairwise agreement against `data/human_pairwise.jsonl`.
+  Writes CSVs to `results/context_analysis/`.
+
+**Not done:** no benchmark API calls have actually been made. The trial
+count above (2112) is deliberately generated in full since generation is
+free, but running any of it is a separate, deliberate step -- see the
+"Budget constraints" section of `FINAL_DESIGN.md` for how `run_batch.py`'s
+filters are meant to be used to select a slice worth paying for.

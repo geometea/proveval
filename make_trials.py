@@ -1,7 +1,14 @@
-"""Generate all trials (single-story and comparative) and save them.
+"""Generate all v0.1 pilot trials (single-story and comparative) and save them.
 
 Run this file directly to write data/trials.jsonl.
 No model API calls happen here yet.
+
+data/items.jsonl now registers all 12 corpus stories (for the newer
+context-benchmark pipeline in context_trials.py), but the v0.1 pilot was run
+against only the original 4. To keep this script reproducing the exact same
+108-trial pilot set regardless of how many stories get registered later,
+it filters down to PILOT_STORY_IDS explicitly rather than using every
+registered story.
 """
 
 import json
@@ -12,10 +19,21 @@ import comparisons
 
 TRIALS_FILE = "data/trials.jsonl"
 
+# The 4 stories the v0.1 pilot actually ran against (see PILOT_RESULTS.md).
+# Fixed on purpose: data/items.jsonl now holds all 12 corpus stories for the
+# newer context-benchmark pipeline, but this script must keep producing the
+# same pilot trial set no matter how many stories get registered there.
+PILOT_STORY_IDS = ["gilbert", "dunnest_smoke", "prophet", "santa"]
+
+
+def pilot_items(items):
+    """Filter a loaded items list down to the fixed v0.1 pilot subset."""
+    return [item for item in items if item["id"] in PILOT_STORY_IDS]
+
 
 def build_single_trials():
     """One trial per story x condition x task, using prompts.py's builder."""
-    items = prompts.load_items(prompts.ITEMS_FILE)
+    items = pilot_items(prompts.load_items(prompts.ITEMS_FILE))
     conditions = prompts.load_items(prompts.CONDITIONS_FILE)
     tasks = prompts.load_items(prompts.TASKS_FILE)
 
@@ -41,7 +59,7 @@ def build_single_trials():
 
 def build_comparison_trials():
     """One trial per ordered story pair x comparison condition, using comparisons.py's builder."""
-    items = comparisons.load_items(comparisons.ITEMS_FILE)
+    items = pilot_items(comparisons.load_items(comparisons.ITEMS_FILE))
     conditions = comparisons.load_items(comparisons.CONDITIONS_FILE)
 
     trials = []
@@ -68,7 +86,7 @@ def build_comparison_trials():
 
 def build_comparison_control_trials():
     """One control trial per story x comparison condition, story compared against itself."""
-    items = comparisons.load_items(comparisons.ITEMS_FILE)
+    items = pilot_items(comparisons.load_items(comparisons.ITEMS_FILE))
     conditions = comparisons.load_items(comparisons.CONDITIONS_FILE)
 
     trials = []
