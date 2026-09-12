@@ -110,7 +110,7 @@ def intro_sentence(first_clause, second_clause):
     )
 
 
-def build_contrast_block(dimensions, contrast, story_1, story_2):
+def build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regime):
     """Build the full 4-cell counterbalanced block for one contrast, across two
     different stories: story_1 and story_2 are the pair's fixed identities,
     crossed with BOTH of:
@@ -120,6 +120,13 @@ def build_contrast_block(dimensions, contrast, story_1, story_2):
         "flipped" (story_1 gets value "b", story_2 gets value "a");
       - "position": which story is DISPLAYED as Story A -- "story1_as_a" or
         "story2_as_a".
+
+    evaluation_regime ("naturalistic" or "text_only_invariance", see
+    context_comparisons.INSTRUCTION_TEMPLATES) is a third, independent
+    factor: it selects which evaluation instruction is used, but never
+    changes the contextual framing/intro sentence itself, so the same
+    contextual manipulation can be compared under both regimes. It's baked
+    into block_id/trial_id so the two regimes' cells never collide.
 
     Earlier versions of this function held position fixed (story_1 was
     always Story A) and only varied assignment. That isolates context
@@ -150,7 +157,7 @@ def build_contrast_block(dimensions, contrast, story_1, story_2):
     text_1 = load_story(story_1["path"])
     text_2 = load_story(story_2["path"])
     pair_id = f"{story_1['id']}_vs_{story_2['id']}"
-    block_id = f"block__{contrast['id']}__{pair_id}"
+    block_id = f"block__{contrast['id']}__{pair_id}__{evaluation_regime}"
     a_clause, b_clause = contrast["a_clause"], contrast["b_clause"]
 
     # assignment -> (story_1's value/clause, story_2's value/clause)
@@ -179,10 +186,11 @@ def build_contrast_block(dimensions, contrast, story_1, story_2):
                     "story_b_id": story_b["id"],
                     "assignment": assignment,
                     "position": position,
+                    "evaluation_regime": evaluation_regime,
                     "context_a": {"value": value_a, "clause": clause_a},
                     "context_b": {"value": value_b, "clause": clause_b},
                     "intro": intro,
-                    "prompt": build_prompt(intro, text_a, text_b),
+                    "prompt": build_prompt(intro, text_a, text_b, evaluation_regime),
                 }
             )
     return cells
@@ -193,14 +201,15 @@ def main():
     contrasts = load_contrasts()
     items = load_items()
     story_1, story_2 = items[0], items[1]  # a fixed, distinct pair keeps the example small
+    evaluation_regime = "naturalistic"  # preview one regime; see context_trials.py for both
 
     all_trials = []
     for contrast in contrasts:
-        all_trials.extend(build_contrast_block(dimensions, contrast, story_1, story_2))
+        all_trials.extend(build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regime))
 
     print(
         f"{len(contrasts)} contrasts x 4 (assignment x position) = {len(all_trials)} prompts "
-        f"({story_1['id']} = story_1, {story_2['id']} = story_2)\n"
+        f"({story_1['id']} = story_1, {story_2['id']} = story_2, evaluation_regime={evaluation_regime})\n"
     )
 
     for trial in all_trials:
@@ -211,7 +220,7 @@ def main():
     print("Summary: contrast_id | cell -> intro\n")
     for contrast in contrasts:
         print(f"{contrast['id']}")
-        for cell in build_contrast_block(dimensions, contrast, story_1, story_2):
+        for cell in build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regime):
             print(f"  {cell['assignment']}/{cell['position']}: {cell['intro']}")
         print()
 

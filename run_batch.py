@@ -70,13 +70,15 @@ def resolve_replicate_counts(replicates, replicates_treatment, replicates_neutra
     return treatment, neutral
 
 
-def select_trials(trials, only_type, id_prefix, conditions, contrasts, limit):
-    """Filter by type, trial_id prefix, condition_id, and contrast_id (each if
-    given), shuffle with a fixed seed, then cut to limit.
+def select_trials(trials, only_type, id_prefix, conditions, contrasts, evaluation_regimes, limit):
+    """Filter by type, trial_id prefix, condition_id, contrast_id, and
+    evaluation_regime (each if given), shuffle with a fixed seed, then cut
+    to limit.
 
-    condition_id (old single/comparison trials, and context_single) and
-    contrast_id (context_pairwise/context_prompt) are read with .get() since
-    not every trial type has both fields.
+    condition_id (old single/comparison trials, and context_single),
+    contrast_id (context_pairwise/context_prompt), and evaluation_regime
+    (all v0.2 context trial types) are read with .get() since not every
+    trial type has all of these fields.
     """
     if only_type:
         trials = [t for t in trials if t["type"] == only_type]
@@ -89,6 +91,9 @@ def select_trials(trials, only_type, id_prefix, conditions, contrasts, limit):
 
     if contrasts:
         trials = [t for t in trials if t.get("contrast_id") in contrasts]
+
+    if evaluation_regimes:
+        trials = [t for t in trials if t.get("evaluation_regime") in evaluation_regimes]
 
     trials = list(trials)
     Random(RANDOM_SEED).shuffle(trials)
@@ -206,7 +211,7 @@ def run_one(trial, replicate_id, model, attempt_id, results_file, sampling_regim
     return "invalid" if validation_error else "valid"
 
 
-def select_failed_observations(existing_results, trials_by_id, model, only_type, id_prefix, conditions, contrasts, limit):
+def select_failed_observations(existing_results, trials_by_id, model, only_type, id_prefix, conditions, contrasts, evaluation_regimes, limit):
     """Find (trial, replicate_id) pairs that have failed attempts and no successful one.
 
     Only observations for the current model are considered, since a different
@@ -226,6 +231,8 @@ def select_failed_observations(existing_results, trials_by_id, model, only_type,
         if conditions and trial.get("condition_id") not in conditions:
             continue
         if contrasts and trial.get("contrast_id") not in contrasts:
+            continue
+        if evaluation_regimes and trial.get("evaluation_regime") not in evaluation_regimes:
             continue
         candidates.append((trial, replicate_id))
 
@@ -274,6 +281,14 @@ def main():
         dest="contrasts",
         help="Only run trials with this contrast_id (repeatable; for context_pairwise/context_prompt trials)",
     )
+    parser.add_argument(
+        "--evaluation-regime",
+        action="append",
+        dest="evaluation_regimes",
+        choices=["naturalistic", "text_only_invariance"],
+        help="Only run trials with this evaluation_regime (repeatable; all v0.2 context trial types have one -- "
+        "see context_trials.EVALUATION_REGIMES). Independent of --sampling-regime.",
+    )
     parser.add_argument("--limit", type=int, help="Only run the first N selected trials (for testing)")
     parser.add_argument(
         "--retry-failed",
@@ -288,6 +303,7 @@ def main():
 
     conditions = set(args.conditions) if args.conditions else None
     contrasts = set(args.contrasts) if args.contrasts else None
+    evaluation_regimes = set(args.evaluation_regimes) if args.evaluation_regimes else None
 
     try:
         replicates_treatment, replicates_neutral = resolve_replicate_counts(
@@ -299,11 +315,11 @@ def main():
     if args.retry_failed:
         trials_by_id = {t["trial_id"]: t for t in load_trials(args.trials_file)}
         observations = select_failed_observations(
-            existing_results, trials_by_id, model, args.type, args.id_prefix, conditions, contrasts, args.limit
+            existing_results, trials_by_id, model, args.type, args.id_prefix, conditions, contrasts, evaluation_regimes, args.limit
         )
     else:
         trials = load_trials(args.trials_file)
-        trials = select_trials(trials, args.type, args.id_prefix, conditions, contrasts, args.limit)
+        trials = select_trials(trials, args.type, args.id_prefix, conditions, contrasts, evaluation_regimes, args.limit)
         observations = build_observations(trials, replicates_treatment, replicates_neutral)
 
     total = len(observations)

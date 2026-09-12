@@ -25,13 +25,17 @@ preference ranking better than others.
   an explicit treatment-vs-neutral-baseline delta analysis; made the neutral
   baseline's replicate count independently configurable; added named,
   recorded sampling regimes (a primary low-variance regime and a supported-
-  but-not-run provider-default secondary); and replaced the 2-cell
+  but-not-run provider-default secondary); replaced the 2-cell
   forward/flipped pairwise design with a 4-cell block that counterbalances
   context assignment against display position, with a directional
-  (not just boolean) effect estimate. The full trial generator, response
-  validators, batch runner, and offline analysis all exist and are
-  exercised with dry-runs and synthetic fixtures — see `CONTEXT_PACKETS.md`
-  for exactly what's built. No benchmark API calls have been made yet.
+  (not just boolean) effect estimate; and added a second, independent
+  `evaluation_regime` factor (`naturalistic` vs. `text_only_invariance`) so
+  ordinary context sensitivity and explicit-instruction invariance can be
+  compared directly for the same contextual cue — see "Two questions" in
+  `FINAL_DESIGN.md`. The full trial generator, response validators, batch
+  runner, and offline analysis all exist and are exercised with dry-runs and
+  synthetic fixtures — see `CONTEXT_PACKETS.md` for exactly what's built.
+  No benchmark API calls have been made yet.
 - **Human reference ranking: complete.** 31 pairwise judgments are recorded
   in `data/human_pairwise.jsonl`, with no contradictions or cycles, and they
   uniquely determine a full ranking of all 12 corpus stories.
@@ -89,28 +93,36 @@ See `EXPERIMENT.md` for the original v0.1 design write-up.
 - `data/context_tasks.jsonl` — v0.2's own single-text rating task: a
   1.0-10.0 decimal scale (one decimal place, e.g. 7.3) with five verbal
   anchor bands, separate from the v0.1 pilot's coarser integer 1-5 task in
-  `data/tasks.jsonl`.
+  `data/tasks.jsonl`. Two variants, one per `evaluation_regime`
+  (`context_rating_naturalistic` / `context_rating_text_only_invariance`),
+  identical except for the evaluation instruction — see "Two questions" in
+  `FINAL_DESIGN.md`.
 - `context_packets.py` — loads dimensions, renders a packet into one natural
   paragraph, generates single-variable example conditions plus the explicit
   `neutral_condition()` no-context baseline.
 - `context_comparisons.py` — the natural "help me choose between these two
   stories" A/B/tie prompt template (shared by the pairwise builders below).
+  Two variants, one per `evaluation_regime`, differing only in one added
+  evaluation-rule sentence for `text_only_invariance`.
 - `context_contrasts.py` — `build_contrast_block()` builds the full 4-cell
   counterbalanced block from `data/context_contrasts.jsonl` for a story
   pair: context assignment (which story gets which value) crossed with
   display position (which story is shown as Story A), so the two effects
-  are separable rather than confounded.
+  are separable rather than confounded. `evaluation_regime` is a third,
+  independent factor crossed with every block.
 - `context_single_prompts.py` — drives the single-story rating pipeline
   (`prompts.py`, unmodified) with context-packet signals, using v0.2's own
   decimal task.
 - `context_trials.py` — the manifest generator: combines the above into
-  `data/context_trials.jsonl` (3840 trials: 276 `context_single` — 12
-  stories × (22 single-variable conditions + 1 neutral no-context baseline)
-  — 3432 `context_pairwise` (66 pairs × 13 contrasts × 4 cells), 132
-  `context_prompt`), each trial carrying explicit structured metadata rather
-  than requiring trial_id parsing. Also generates an OPTIONAL, never-run
-  same-context pairwise family (1254 trials, both stories sharing one
-  claimed context value) to a separate gitignored file,
+  `data/context_trials.jsonl` (7680 trials — every family generated once per
+  `evaluation_regime`: 552 `context_single` — 12 stories × (22
+  single-variable conditions + 1 neutral no-context baseline) × 2 regimes —
+  6864 `context_pairwise` (66 pairs × 13 contrasts × 4 cells × 2 regimes),
+  264 `context_prompt`), each trial carrying explicit structured metadata
+  (including `evaluation_regime`) rather than requiring trial_id parsing.
+  Also generates an OPTIONAL, never-run same-context pairwise family (1254
+  trials, naturalistic only, both stories sharing one claimed context value)
+  to a separate gitignored file,
   `data/context_trials_optional_same_context.jsonl` — not part of the
   required manifest or any planned run.
 - `run_trial.py` / `run_batch.py` — accept `--trials-file`, `--results-file`,
@@ -120,11 +132,13 @@ See `EXPERIMENT.md` for the original v0.1 design write-up.
   ignored/unrecorded for v0.1 trial types. `run_batch.py` also accepts
   `--replicates-treatment`/`--replicates-neutral` (independent replicate
   counts for treatment vs. the neutral baseline; neutral defaults to, and
-  can never be configured below, the treatment count). Response validation
-  accepts the v0.2 1.0-10.0 decimal single-text schema, the A/B/tie
-  pairwise-context schema, and the original v0.1 integer 1-5 and
-  story_a/story_b/preference schemas — all fully backward compatible.
-  `--dry-run` never calls the API in either script.
+  can never be configured below, the treatment count) and
+  `--evaluation-regime` (filter to `naturalistic` and/or
+  `text_only_invariance`; repeatable). Response validation accepts the v0.2
+  1.0-10.0 decimal single-text schema, the A/B/tie pairwise-context schema,
+  and the original v0.1 integer 1-5 and story_a/story_b/preference schemas —
+  all fully backward compatible. `--dry-run` never calls the API in either
+  script.
 - `data/human_pairwise.jsonl` — known human pairwise judgments (winner,
   loser); 31 judgments, all actually made (never invented).
 - `human_ranking.py` — checks those judgments for cycles/contradictions and
@@ -143,8 +157,12 @@ See `EXPERIMENT.md` for the original v0.1 design write-up.
   model_tied counts — never an artificial tie-break); a directional pairwise
   context-sensitivity effect in story identity (not just a boolean
   "changed"); and a direct pairwise-choices-vs-human-judgments comparison.
-  Pooled single-text and pairwise rankings are still computed but clearly
-  labelled **diagnostic only**. Writes CSVs to `results/context_analysis/`.
+  Every one of the four is also stratified by `evaluation_regime`
+  (`naturalistic` / `text_only_invariance` are never pooled), with a
+  descriptive naturalistic-vs-invariance "attenuation" comparison for the
+  two directional/delta analyses. Pooled single-text and pairwise rankings
+  are still computed but clearly labelled **diagnostic only**. Writes CSVs
+  to `results/context_analysis/`.
 - `results/context_raw.jsonl` — suggested results path for the benchmark
   (via `--results-file`); not committed, and never the same file as the
   pilot's `results/raw.jsonl`.
@@ -174,13 +192,20 @@ python3 analyze.py                      # analyze results/raw.jsonl
 python3 context_packets.py              # preview single-variable example conditions
 python3 context_contrasts.py            # preview the 4-cell counterbalanced story-scope prompts
 python3 context_single_prompts.py       # preview single-story context prompts (1.0-10.0 decimal scale)
-python3 context_trials.py               # regenerate data/context_trials.jsonl (3840 trials)
+python3 context_trials.py               # regenerate data/context_trials.jsonl (7680 trials, both evaluation regimes)
                                          # + optional never-run same-context family (separate file)
 
-# dry-run against the new manifest, writing to a separate results file
+# dry-run against the new manifest, restricted to one evaluation_regime
 python3 run_batch.py --trials-file data/context_trials.jsonl \
     --results-file results/context_raw.jsonl \
-    --type context_pairwise --contrast provenance_claude_vs_human --limit 10 --dry-run
+    --type context_pairwise --contrast provenance_claude_vs_human \
+    --evaluation-regime naturalistic --limit 10 --dry-run
+
+# the same slice under the text-only-invariance instruction, for comparison
+python3 run_batch.py --trials-file data/context_trials.jsonl \
+    --results-file results/context_raw.jsonl \
+    --type context_pairwise --contrast provenance_claude_vs_human \
+    --evaluation-regime text_only_invariance --limit 10 --dry-run
 
 # sample the neutral no-context baseline more precisely than each treatment condition
 python3 run_batch.py --trials-file data/context_trials.jsonl \
@@ -194,8 +219,9 @@ python3 run_batch.py --trials-file data/context_trials.jsonl \
     --results-file results/context_raw.jsonl \
     --type context_pairwise --contrast provenance_claude_vs_human --limit 10
 
-python3 analyze_context.py              # analyze results/context_raw.jsonl (low_variance_primary by default)
-python3 analyze_context.py --sampling-regime provider_default_secondary  # analyze the other regime explicitly
+python3 analyze_context.py              # analyze results/context_raw.jsonl (low_variance_primary by default;
+                                         # both evaluation regimes present are stratified, never pooled)
+python3 analyze_context.py --sampling-regime provider_default_secondary  # analyze the other sampling regime explicitly
 
 # --- human reference ranking ---
 python3 human_ranking.py                # report + write data/human_reference.json once complete

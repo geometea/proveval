@@ -18,6 +18,12 @@ parse trial_id to recover it -- see item 2/6 of the design):
                      nothing to attribute to a specific story), so it has its
                      own small builder below instead.
 
+Every trial in all three families also carries an explicit evaluation_regime
+("naturalistic" or "text_only_invariance", see EVALUATION_REGIMES) --
+independent of the contextual manipulation itself and of run_trial's
+sampling_regime. The combined manifest holds both regimes; run_batch.py's
+--evaluation-regime filter selects a slice.
+
 This is a separate manifest from data/trials.jsonl on purpose: the v0.1 pilot
 pipeline (prompts.py, comparisons.py, make_trials.py) is untouched, and
 running this file never modifies data/trials.jsonl or any pilot result.
@@ -75,11 +81,9 @@ def load_prompt_contrasts(path=PROMPT_CONTRASTS_FILE):
 
 
 def story_pairs(items):
-    """Deterministic unordered pairs, alphabetical by id.
-
-    This fixes which story is story_1 (always Story A) and which is story_2
-    (always Story B) reproducibly across runs -- see
-    context_contrasts.build_contrast_trials for why position is held fixed.
+    """Deterministic unordered pairs, alphabetical by id -- fixes each pair's
+    story_1/story_2 identity reproducibly across runs. Which one is actually
+    displayed as Story A varies by cell -- see context_contrasts.build_contrast_block.
     """
     return list(combinations(sorted(items, key=lambda item: item["id"]), 2))
 
@@ -90,13 +94,29 @@ def story_pairs(items):
 
 CONTEXT_TASKS_FILE = "data/context_tasks.jsonl"
 
+# The two evaluation regimes -- see FINAL_DESIGN.md's "Two questions:
+# naturalistic sensitivity vs. text-only invariance". Independent of
+# sampling_regime (run_trial.SAMPLING_REGIMES): evaluation_regime changes
+# the evaluation INSTRUCTION given to the model; sampling_regime changes API
+# sampling parameters. Both are recorded explicitly on every v0.2 trial/result.
+EVALUATION_REGIMES = ("naturalistic", "text_only_invariance")
 
-def build_context_single_trials(dimensions, items):
+# data/context_tasks.jsonl task id per evaluation_regime.
+CONTEXT_RATING_TASK_IDS = {
+    "naturalistic": "context_rating_naturalistic",
+    "text_only_invariance": "context_rating_text_only_invariance",
+}
+
+
+def build_context_single_trials(dimensions, items, evaluation_regime):
     # v0.2 uses its own 1.0-10.0 decimal rating task (data/context_tasks.jsonl),
     # not the v0.1 pilot's integer 1-5 "rating" task in data/tasks.jsonl --
-    # see run_trial.validate_context_single_response.
+    # see run_trial.validate_context_single_response. A separate task exists
+    # per evaluation_regime (see CONTEXT_RATING_TASK_IDS); only the
+    # evaluation instruction differs, not the rating scale or task fields.
     tasks = prompts.load_items(CONTEXT_TASKS_FILE)
-    rating_task = next(t for t in tasks if t["id"] == "context_rating")
+    task_id = CONTEXT_RATING_TASK_IDS[evaluation_regime]
+    rating_task = next(t for t in tasks if t["id"] == task_id)
 
     # neutral_condition() first: one no-context baseline per story, so v0.2
     # has its own clean single-text baseline (dimension="neutral",
@@ -110,13 +130,14 @@ def build_context_single_trials(dimensions, items):
             prompt = prompts.build_prompt(text, condition["context_text"], rating_task["instruction"])
             trials.append(
                 {
-                    "trial_id": f"context_single__{item['id']}__{condition['condition_id']}",
+                    "trial_id": f"context_single__{item['id']}__{condition['condition_id']}__{evaluation_regime}",
                     "type": "context_single",
                     "story_id": item["id"],
                     "dimension": condition["dimension"],
                     "value": condition["value"],
                     "condition_id": condition["condition_id"],
                     "context_text": condition["context_text"],
+                    "evaluation_regime": evaluation_regime,
                     "prompt": prompt,
                 }
             )
@@ -129,13 +150,13 @@ def build_context_single_trials(dimensions, items):
 # context_contrasts.build_contrast_block)
 # ---------------------------------------------------------------------------
 
-def build_context_pairwise_trials(dimensions, items):
+def build_context_pairwise_trials(dimensions, items, evaluation_regime):
     contrasts = load_contrasts()
     trials = []
 
     for story_1, story_2 in story_pairs(items):
         for contrast in contrasts:
-            for cell in build_contrast_block(dimensions, contrast, story_1, story_2):
+            for cell in build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regime):
                 trials.append({**cell, "type": "context_pairwise"})
     return trials
 
@@ -145,7 +166,7 @@ def build_context_pairwise_trials(dimensions, items):
 # prompt-level sentence present or absent
 # ---------------------------------------------------------------------------
 
-def build_context_prompt_trials(dimensions, items):
+def build_context_prompt_trials(dimensions, items, evaluation_regime):
     prompt_dims = dimensions_with_scope(dimensions, "prompt")
     contrasts = load_prompt_contrasts()
     trials = []
@@ -159,10 +180,10 @@ def build_context_prompt_trials(dimensions, items):
             for value_id in (contrast["a"], contrast["b"]):
                 extra_sentence = dim["values"][value_id]
                 intro = f"{NEUTRAL_PAIRWISE_INTRO} {extra_sentence}".strip() if extra_sentence else NEUTRAL_PAIRWISE_INTRO
-                prompt = context_comparisons.build_prompt(intro, text_1, text_2)
+                prompt = context_comparisons.build_prompt(intro, text_1, text_2, evaluation_regime)
                 trials.append(
                     {
-                        "trial_id": f"context_prompt__{contrast['id']}__{story_1['id']}_vs_{story_2['id']}__{value_id}",
+                        "trial_id": f"context_prompt__{contrast['id']}__{story_1['id']}_vs_{story_2['id']}__{value_id}__{evaluation_regime}",
                         "type": "context_prompt",
                         "story_a_id": story_1["id"],
                         "story_b_id": story_2["id"],
@@ -170,6 +191,7 @@ def build_context_prompt_trials(dimensions, items):
                         "dimension": contrast["dimension"],
                         "value": value_id,
                         "prompt_context_text": extra_sentence,
+                        "evaluation_regime": evaluation_regime,
                         "prompt": prompt,
                     }
                 )
@@ -205,6 +227,9 @@ def build_context_pairwise_same_trials(dimensions, items):
     - Skips dependent dimensions (currently just writer_status): resolving
       their pronoun would need a provenance carrier threaded through, which
       isn't worth the complexity for a family that is never run by default.
+    - Hardcodes evaluation_regime="naturalistic" (see EVALUATION_REGIMES):
+      generating both regimes for a family that's never run isn't worth the
+      complexity either; revisit if this family is ever promoted to required.
 
     Writes to OPTIONAL_SAME_CONTEXT_TRIALS_FILE, a separate file from
     CONTEXT_TRIALS_FILE, so it is never picked up by a run against the
@@ -226,7 +251,7 @@ def build_context_pairwise_same_trials(dimensions, items):
                     f"Hi! Can you give me some feedback on these two stories? "
                     f"{phrase} That's true of both of them. I'm trying to make up my mind."
                 )
-                prompt = context_comparisons.build_prompt(intro, text_1, text_2)
+                prompt = context_comparisons.build_prompt(intro, text_1, text_2, "naturalistic")
                 trials.append(
                     {
                         "trial_id": f"context_pairwise_same__{dimension_id}__{value_id}__{story_1['id']}_vs_{story_2['id']}",
@@ -235,6 +260,7 @@ def build_context_pairwise_same_trials(dimensions, items):
                         "story_b_id": story_2["id"],
                         "dimension": dimension_id,
                         "value": value_id,
+                        "evaluation_regime": "naturalistic",
                         "prompt": prompt,
                     }
                 )
@@ -245,9 +271,14 @@ def main():
     dimensions = load_dimensions()
     items = load_items()
 
-    single_trials = build_context_single_trials(dimensions, items)
-    pairwise_trials = build_context_pairwise_trials(dimensions, items)
-    prompt_trials = build_context_prompt_trials(dimensions, items)
+    # One combined manifest, both evaluation regimes, every trial carrying
+    # evaluation_regime explicitly -- see EVALUATION_REGIMES. run_batch.py's
+    # --evaluation-regime filter selects a slice; nothing pools them silently.
+    single_trials, pairwise_trials, prompt_trials = [], [], []
+    for regime in EVALUATION_REGIMES:
+        single_trials += build_context_single_trials(dimensions, items, regime)
+        pairwise_trials += build_context_pairwise_trials(dimensions, items, regime)
+        prompt_trials += build_context_prompt_trials(dimensions, items, regime)
     all_trials = single_trials + pairwise_trials + prompt_trials
 
     with open(CONTEXT_TRIALS_FILE, "w") as f:
@@ -255,10 +286,13 @@ def main():
             f.write(json.dumps(trial) + "\n")
 
     trial_ids = [t["trial_id"] for t in all_trials]
-    print(f"Total context trials: {len(all_trials)}")
-    print(f"  context_single:   {len(single_trials)} (includes 1 neutral baseline per story)")
+    print(f"Total context trials: {len(all_trials)} (evaluation regimes: {', '.join(EVALUATION_REGIMES)})")
+    print(f"  context_single:   {len(single_trials)} (includes 1 neutral baseline per story, per regime)")
     print(f"  context_pairwise: {len(pairwise_trials)}")
     print(f"  context_prompt:   {len(prompt_trials)}")
+    for regime in EVALUATION_REGIMES:
+        n = sum(1 for t in all_trials if t["evaluation_regime"] == regime)
+        print(f"    {regime}: {n}")
     print(f"All trial IDs unique: {len(trial_ids) == len(set(trial_ids))}")
 
     # Optional, separate file -- not part of the required manifest above and

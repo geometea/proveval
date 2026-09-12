@@ -13,18 +13,19 @@ happen here, and nothing is written to disk.
 
 import prompts
 from context_packets import load_dimensions, single_variable_conditions
-from context_trials import CONTEXT_TASKS_FILE
+from context_trials import CONTEXT_TASKS_FILE, CONTEXT_RATING_TASK_IDS
 
 
-def single_variable_rating_examples(dimensions, story):
+def single_variable_rating_examples(dimensions, story, evaluation_regime="naturalistic"):
     """One single-story rating prompt per single-variable condition, for one story.
 
     Uses v0.2's own 1.0-10.0 decimal rating task (data/context_tasks.jsonl),
     not the v0.1 pilot's integer 1-5 task -- see
-    run_trial.validate_context_single_response.
+    run_trial.validate_context_single_response. evaluation_regime selects
+    which of the two task variants (naturalistic / text_only_invariance).
     """
     tasks = prompts.load_items(CONTEXT_TASKS_FILE)
-    rating_task = next(t for t in tasks if t["id"] == "context_rating")
+    rating_task = next(t for t in tasks if t["id"] == CONTEXT_RATING_TASK_IDS[evaluation_regime])
     text = prompts.load_story(story["path"])
 
     examples = []
@@ -32,9 +33,10 @@ def single_variable_rating_examples(dimensions, story):
         prompt = prompts.build_prompt(text, condition["context_text"], rating_task["instruction"])
         examples.append(
             {
-                "trial_id": f"context_single__{story['id']}__{condition['condition_id']}",
+                "trial_id": f"context_single__{story['id']}__{condition['condition_id']}__{evaluation_regime}",
                 "dimension": condition["dimension"],
                 "value": condition["value"],
+                "evaluation_regime": evaluation_regime,
                 "note": condition["note"],
                 "prompt": prompt,
             }

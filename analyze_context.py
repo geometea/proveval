@@ -6,6 +6,20 @@ attempts, and runs analyses specific to the new trial types (context_single,
 context_pairwise, context_prompt). Completely separate from analyze.py, which
 keeps analyzing the v0.1 pilot pipeline unchanged.
 
+Two independent factors are recorded on every v0.2 trial/result and must
+never be silently pooled:
+
+- sampling_regime (run_trial.SAMPLING_REGIMES): API sampling settings.
+  Selected once per analysis run via --sampling-regime (default
+  low_variance_primary); the excluded regime's count is reported.
+- evaluation_regime (context_trials.EVALUATION_REGIMES): "naturalistic"
+  (ordinary evaluation framing) or "text_only_invariance" (explicitly
+  instructed to judge only the prose). This is the substantive research
+  variable, so unlike sampling_regime it is NOT filtered down to one value --
+  every analysis below stratifies by it and reports both regimes side by
+  side, so naturalistic context sensitivity and invariance-instructed
+  effects can be compared directly rather than averaged together.
+
 Four distinct questions are answered here, deliberately kept separate rather
 than collapsed into one "ranking" analysis (see FINAL_DESIGN.md):
 
@@ -22,17 +36,20 @@ than collapsed into one "ranking" analysis (see FINAL_DESIGN.md):
     B. Do direct model pairwise choices resemble the human reference's
        direct pairwise judgments?         -> analyze_pairwise_vs_human_reference
 
+Each of A/A above is additionally compared across evaluation_regime
+(compare_single_text_regimes / compare_pairwise_regimes) with a purely
+descriptive "attenuation" label -- not a new statistical model.
+
 The neutral/no-context condition is a REFERENCE BASELINE for measuring
-context sensitivity, not a ground-truth score and not assumed unbiased.
+context sensitivity, not a ground-truth score and not assumed unbiased. A
+naturalistic context effect is not automatically "bias"; an effect that
+survives text_only_invariance instructions is described as an invariance
+effect, never automatically as bias/sycophancy/irrationality (see
+FINAL_DESIGN.md's terminology section).
 
 Model rating ties are legitimate and are never broken by story ID, filename,
 alphabetical order, or insertion order -- see average_ranks/kendall_tau_b/
 spearman_tie_aware/tied_groups below.
-
-Every v0.2 result row carries a sampling_regime (see run_trial.SAMPLING_REGIMES).
-This script only ever analyzes one regime at a time (--sampling-regime,
-default "low_variance_primary") so the primary low-variance regime and the
-secondary provider-default regime can never be silently pooled.
 
 Run this file directly: python3 analyze_context.py
 No API calls are made, and ANTHROPIC_API_KEY is never read.
@@ -82,12 +99,15 @@ def get_trial_meta(row, trials_by_id):
 # Collapsing retries (same semantics as analyze.py: group by
 # (trial_id, model, replicate_id, sampling_regime), keep the most recent
 # success). sampling_regime is part of the key so a retry under a different
-# regime is never silently merged into the same observation. This collapses
-# ATTEMPTS (retries of the same cell after a parse/validation failure), never
-# REPLICATES -- every replicate_id remains its own observation; repeated
-# identical cells are preserved as separate data points, not reduced to a
-# majority vote (see analyze_directional_pairwise_effects and
-# neutral_baseline_means, which both estimate frequencies/means across them).
+# regime is never silently merged into the same observation; evaluation_regime
+# doesn't need to be, since it's already baked into a distinct trial_id (see
+# context_trials.py), so a naturalistic and an invariance trial can never
+# collide here. This collapses ATTEMPTS (retries of the same cell after a
+# parse/validation failure), never REPLICATES -- every replicate_id remains
+# its own observation; repeated identical cells are preserved as separate
+# data points, not reduced to a majority vote (see
+# analyze_directional_pairwise_effects and neutral_baseline_means, which both
+# estimate frequencies/means across them).
 # ---------------------------------------------------------------------------
 
 def collapse_attempts(raw_rows, trials_by_id):
@@ -132,8 +152,11 @@ def collapse_attempts(raw_rows, trials_by_id):
 
 def filter_by_sampling_regime(observations, regime):
     """Keep only observations recorded under `regime`. Returns (kept, excluded_count).
-    This is the one place regimes get selected -- nothing downstream ever
-    pools across regimes, since everything after this operates on `kept`."""
+    This is the one place sampling regimes get selected -- nothing downstream
+    ever pools across sampling regimes, since everything after this operates
+    on `kept`. evaluation_regime is NOT filtered here: it's the substantive
+    variable under study, so it stays as a live stratification key in every
+    analysis below instead (see module docstring)."""
     kept = {k: v for k, v in observations.items() if v.get("sampling_regime") == regime}
     return kept, len(observations) - len(kept)
 
@@ -171,6 +194,9 @@ def print_inventory(raw_rows, observations, unresolved, absorbed, missing_metada
 
     print("\nCompleted observations by sampling regime:")
     print_counts(count_by(observations.values(), lambda o: o.get("sampling_regime", "n/a")))
+
+    print("\nCompleted observations by evaluation regime:")
+    print_counts(count_by(observations.values(), lambda o: o.get("evaluation_regime", "n/a")))
 
     print("\nCompleted observations by dimension:")
     print_counts(count_by(observations.values(), lambda o: o.get("dimension", "n/a")))
@@ -315,8 +341,31 @@ def pairwise_diagnostics_from_scores(values, human_pairs):
 
 
 # ---------------------------------------------------------------------------
+# Descriptive-only naturalistic-vs-invariance comparison. No new statistical
+# model: a plain magnitude/sign comparison, used only to label an effect as
+# attenuated/amplified/reversed/unchanged under text-only instructions.
+# ---------------------------------------------------------------------------
+
+def describe_attenuation(naturalistic_effect, invariance_effect):
+    """Purely descriptive label comparing an invariance-regime effect to the
+    same effect under naturalistic framing. Not a significance test."""
+    if naturalistic_effect == 0:
+        return "no_naturalistic_effect" if invariance_effect == 0 else "invariance_effect_only"
+    same_sign = (naturalistic_effect > 0) == (invariance_effect > 0)
+    if invariance_effect != 0 and not same_sign:
+        return "reversed"
+    ratio = abs(invariance_effect) / abs(naturalistic_effect)
+    if ratio < 0.5:
+        return "attenuated"
+    if ratio > 1.5:
+        return "amplified"
+    return "unchanged"
+
+
+# ---------------------------------------------------------------------------
 # Pairwise: SECONDARY diagnostic (raw A/B/tie "changed") and PRIMARY
-# directional effect, both operating in story identity.
+# directional effect, both operating in story identity, both stratified by
+# evaluation_regime.
 # ---------------------------------------------------------------------------
 
 def choice_to_story_id(obs, category):
@@ -336,7 +385,7 @@ def index_pairwise_by_assignment_fixed_position(observations, position="story1_a
     for obs in observations.values():
         if obs["type"] != "context_pairwise" or obs.get("position") != position:
             continue
-        key = (obs["model"], obs["story_1_id"], obs["story_2_id"], obs["contrast_id"], obs["replicate_id"])
+        key = (obs["model"], obs["evaluation_regime"], obs["story_1_id"], obs["story_2_id"], obs["contrast_id"], obs["replicate_id"])
         index.setdefault(key, {})[obs["assignment"]] = obs
     return index
 
@@ -350,10 +399,12 @@ def analyze_pairwise_changed_diagnostic(observations, position="story1_as_a"):
     context_contrasts.build_contrast_block). A bare changed=True/False does
     NOT say which story or which context was preferred -- chosen story ids
     are preserved here for that, but the primary answer is the function below.
+    Stratified by evaluation_regime -- naturalistic and text_only_invariance
+    cells are never compared against each other here.
     """
     index = index_pairwise_by_assignment_fixed_position(observations, position)
     rows = []
-    for (model, s1, s2, contrast_id, replicate_id), pair in index.items():
+    for (model, evaluation_regime, s1, s2, contrast_id, replicate_id), pair in index.items():
         forward, flipped = pair.get("forward"), pair.get("flipped")
         if forward is None or flipped is None:
             continue
@@ -363,6 +414,7 @@ def analyze_pairwise_changed_diagnostic(observations, position="story1_as_a"):
             rows.append(
                 {
                     "model": model,
+                    "evaluation_regime": evaluation_regime,
                     "contrast_id": contrast_id,
                     "dimension": forward["dimension"],
                     "story_1_id": s1,
@@ -405,6 +457,8 @@ def summarize_pairwise_changed_diagnostic(rows):
     print()
     summarize_grouped_change_rate(rows, lambda r: r["model"], "model")
     print()
+    summarize_grouped_change_rate(rows, lambda r: r["evaluation_regime"], "evaluation regime")
+    print()
     summarize_grouped_change_rate(rows, lambda r: r["contrast_id"], "contrast")
     print()
     summarize_grouped_change_rate(rows, lambda r: r["category"], "category")
@@ -413,8 +467,10 @@ def summarize_pairwise_changed_diagnostic(rows):
 def analyze_directional_pairwise_effects(observations):
     """PRIMARY pairwise context-effect analysis, in story identity, pooling
     over the counterbalanced display position (see
-    context_contrasts.build_contrast_block) and over replicates. For each
-    (model, contrast_id, story_1_id, story_2_id, category), estimates:
+    context_contrasts.build_contrast_block) and over replicates, stratified
+    by evaluation_regime. For each
+    (model, evaluation_regime, contrast_id, story_1_id, story_2_id, category),
+    estimates:
 
         P(story_1 preferred | story_1 receives contrast value "a")
       - P(story_1 preferred | story_1 receives contrast value "b")
@@ -422,7 +478,8 @@ def analyze_directional_pairwise_effects(observations):
     Positive means story_1 is favored more often when it carries value "a";
     negative means the opposite. This is directional and never collapses to
     a single changed=True/False boolean -- two scenarios with opposite signs
-    are never conflated (see offline verification item D).
+    are never conflated (see offline verification item D). Naturalistic and
+    text_only_invariance observations are never pooled into one estimate.
     """
     tallies = defaultdict(lambda: {"story_1_preferred": 0, "story_2_preferred": 0, "tie": 0, "n": 0})
     for obs in observations.values():
@@ -430,7 +487,7 @@ def analyze_directional_pairwise_effects(observations):
             continue
         for category in RATING_FIELDS:
             chosen = choice_to_story_id(obs, category)
-            key = (obs["model"], obs["contrast_id"], obs["story_1_id"], obs["story_2_id"], category, obs["assignment"])
+            key = (obs["model"], obs["evaluation_regime"], obs["contrast_id"], obs["story_1_id"], obs["story_2_id"], category, obs["assignment"])
             t = tallies[key]
             t["n"] += 1
             if chosen is None:
@@ -441,11 +498,11 @@ def analyze_directional_pairwise_effects(observations):
                 t["story_2_preferred"] += 1
 
     by_pair = defaultdict(dict)
-    for (model, contrast_id, s1, s2, category, assignment), t in tallies.items():
-        by_pair[(model, contrast_id, s1, s2, category)][assignment] = t
+    for (model, evaluation_regime, contrast_id, s1, s2, category, assignment), t in tallies.items():
+        by_pair[(model, evaluation_regime, contrast_id, s1, s2, category)][assignment] = t
 
     rows = []
-    for (model, contrast_id, s1, s2, category), by_assignment in by_pair.items():
+    for (model, evaluation_regime, contrast_id, s1, s2, category), by_assignment in by_pair.items():
         fwd, flp = by_assignment.get("forward"), by_assignment.get("flipped")
         if fwd is None or flp is None:
             continue
@@ -455,6 +512,7 @@ def analyze_directional_pairwise_effects(observations):
         rows.append(
             {
                 "model": model,
+                "evaluation_regime": evaluation_regime,
                 "contrast_id": contrast_id,
                 "story_1_id": s1,
                 "story_2_id": s2,
@@ -473,47 +531,77 @@ def analyze_directional_pairwise_effects(observations):
 
 def summarize_directional_effects_by_contrast(directional_rows):
     """Aggregate the per-story-pair directional effect across story pairs,
-    per (model, contrast_id, category) -- the pairwise analogue of the
-    single-text model x dimension x value aggregate."""
+    per (model, evaluation_regime, contrast_id, category) -- the pairwise
+    analogue of the single-text model x dimension x value aggregate."""
     grouped = defaultdict(list)
     for row in directional_rows:
         if row["directional_effect_a_minus_b"] == "":
             continue
-        key = (row["model"], row["contrast_id"], row["category"])
+        key = (row["model"], row["evaluation_regime"], row["contrast_id"], row["category"])
         grouped[key].append(row["directional_effect_a_minus_b"])
     return [
         {
             "model": m,
+            "evaluation_regime": er,
             "contrast_id": c,
             "category": cat,
             "mean_directional_effect": round(statistics.mean(effects), 3),
             "n_story_pairs": len(effects),
         }
-        for (m, c, cat), effects in grouped.items()
+        for (m, er, c, cat), effects in grouped.items()
     ]
 
 
 def summarize_directional_pairwise_effects(rows, by_contrast_rows):
     print("\n=== PRIMARY pairwise context-effect analysis: directional, in story identity ===")
     print('(P(story_1 preferred | value "a") - P(story_1 preferred | value "b"), position counterbalanced,')
-    print(" replicates pooled into the estimate, not discarded)")
+    print(" replicates pooled into the estimate, not discarded; stratified by evaluation_regime)")
     if not rows:
         print("  No complete forward+flipped story-pair blocks found.")
         return
-    print(f"  n={len(rows)} (model, contrast, story pair, category) directional estimates")
-    print("\n  By (model, contrast, category), averaged across story pairs:")
-    for row in sorted(by_contrast_rows, key=lambda r: (r["model"], r["contrast_id"], r["category"])):
+    print(f"  n={len(rows)} (model, evaluation_regime, contrast, story pair, category) directional estimates")
+    print("\n  By (model, evaluation_regime, contrast, category), averaged across story pairs:")
+    for row in sorted(by_contrast_rows, key=lambda r: (r["model"], r["evaluation_regime"], r["contrast_id"], r["category"])):
         print(
-            f"    {row['model']} | {row['contrast_id']} | {row['category']}: "
+            f"    {row['model']} | {row['evaluation_regime']} | {row['contrast_id']} | {row['category']}: "
             f"mean_effect={row['mean_directional_effect']:+.3f} (n_story_pairs={row['n_story_pairs']})"
         )
+
+
+def compare_pairwise_regimes(directional_by_contrast_rows):
+    """For each (model, contrast_id, category) present under BOTH evaluation
+    regimes, report the naturalistic effect, the text_only_invariance
+    effect, and a descriptive attenuation label. Rows missing one regime are
+    skipped (nothing to compare)."""
+    by_key = defaultdict(dict)
+    for row in directional_by_contrast_rows:
+        key = (row["model"], row["contrast_id"], row["category"])
+        by_key[key][row["evaluation_regime"]] = row["mean_directional_effect"]
+
+    rows = []
+    for (model, contrast_id, category), by_regime in by_key.items():
+        if "naturalistic" not in by_regime or "text_only_invariance" not in by_regime:
+            continue
+        nat, inv = by_regime["naturalistic"], by_regime["text_only_invariance"]
+        rows.append(
+            {
+                "model": model,
+                "contrast_id": contrast_id,
+                "category": category,
+                "effect_naturalistic": nat,
+                "effect_text_only_invariance": inv,
+                "attenuation": describe_attenuation(nat, inv),
+            }
+        )
+    return rows
 
 
 # ---------------------------------------------------------------------------
 # context_prompt: does a genuinely extraneous prompt-level sentence change
 # the decision, holding story identity/position/story-level-context fixed?
 # (Prompt-scope context is not attributed to either story, so the
-# assignment x position counterbalance above doesn't apply here.)
+# assignment x position counterbalance above doesn't apply here.) Stratified
+# by evaluation_regime like everything else.
 # ---------------------------------------------------------------------------
 
 def index_prompt_by_value(observations):
@@ -521,7 +609,7 @@ def index_prompt_by_value(observations):
     for obs in observations.values():
         if obs["type"] != "context_prompt":
             continue
-        key = (obs["model"], obs["story_a_id"], obs["story_b_id"], obs["contrast_id"], obs["replicate_id"])
+        key = (obs["model"], obs["evaluation_regime"], obs["story_a_id"], obs["story_b_id"], obs["contrast_id"], obs["replicate_id"])
         index.setdefault(key, {})[obs["value"]] = obs
     return index
 
@@ -530,7 +618,7 @@ def analyze_prompt_context_effects(observations):
     index = index_prompt_by_value(observations)
     rows = []
 
-    for (model, story_a, story_b, contrast_id, replicate_id), values in index.items():
+    for (model, evaluation_regime, story_a, story_b, contrast_id, replicate_id), values in index.items():
         if len(values) < 2:
             continue
         baseline_id = next((v for v, obs in values.items() if not obs.get("prompt_context_text")), sorted(values)[0])
@@ -544,6 +632,7 @@ def analyze_prompt_context_effects(observations):
                 rows.append(
                     {
                         "model": model,
+                        "evaluation_regime": evaluation_regime,
                         "contrast_id": contrast_id,
                         "story_a_id": story_a,
                         "story_b_id": story_b,
@@ -571,6 +660,8 @@ def summarize_prompt_context_effects(rows):
     print()
     summarize_grouped_change_rate(rows, lambda r: r["model"], "model")
     print()
+    summarize_grouped_change_rate(rows, lambda r: r["evaluation_regime"], "evaluation regime")
+    print()
     summarize_grouped_change_rate(rows, lambda r: r["contrast_id"], "contrast")
     print()
     summarize_grouped_change_rate(rows, lambda r: r["category"], "category")
@@ -580,14 +671,14 @@ def summarize_prompt_context_effects(rows):
 # Pairwise vs human reference: DIRECT comparison in story identity, no
 # derived ranking involved -- for every context_pairwise observation whose
 # two displayed stories exactly match a known human judgment, does the
-# model's choice agree?
+# model's choice agree? Stratified by evaluation_regime.
 # ---------------------------------------------------------------------------
 
 def analyze_pairwise_vs_human_reference(observations, human_pairs, category="overall_quality"):
     """Restricted to `category` (default overall_quality, the closest
     analogue to a single human preference judgment). Reports concordant/
     discordant/model_tied counts -- never converts a model tie into a
-    fabricated win or loss.
+    fabricated win or loss. Stratified by (model, evaluation_regime).
     """
     human_winner_by_pair = {frozenset((w, l)): w for w, l in human_pairs}
     rows = []
@@ -607,10 +698,11 @@ def analyze_pairwise_vs_human_reference(observations, human_pairs, category="ove
             outcome = "concordant"
         else:
             outcome = "discordant"
-        tally[obs["model"]][outcome] += 1
+        tally[(obs["model"], obs["evaluation_regime"])][outcome] += 1
         rows.append(
             {
                 "model": obs["model"],
+                "evaluation_regime": obs["evaluation_regime"],
                 "story_a_id": obs["story_a_id"],
                 "story_b_id": obs["story_b_id"],
                 "contrast_id": obs["contrast_id"],
@@ -625,12 +717,13 @@ def analyze_pairwise_vs_human_reference(observations, human_pairs, category="ove
         )
 
     summary_rows = []
-    for model, counts in tally.items():
+    for (model, evaluation_regime), counts in tally.items():
         n = counts["concordant"] + counts["discordant"] + counts["model_tied"]
         decided = counts["concordant"] + counts["discordant"]
         summary_rows.append(
             {
                 "model": model,
+                "evaluation_regime": evaluation_regime,
                 "concordant": counts["concordant"],
                 "discordant": counts["discordant"],
                 "model_tied": counts["model_tied"],
@@ -647,27 +740,32 @@ def summarize_pairwise_vs_human_reference(summary_rows):
     if not summary_rows:
         print("  No context_pairwise observations matched a known human judgment.")
         return
-    for row in sorted(summary_rows, key=lambda r: r["model"]):
+    for row in sorted(summary_rows, key=lambda r: (r["model"], r["evaluation_regime"])):
         rate_text = f"{row['concordant_rate']:.3f}" if row["concordant_rate"] != "" else "unavailable"
         print(
-            f"  {row['model']}: concordant={row['concordant']} discordant={row['discordant']} "
+            f"  {row['model']} | {row['evaluation_regime']}: concordant={row['concordant']} discordant={row['discordant']} "
             f"model_tied={row['model_tied']} (n={row['n']}, concordant_rate={rate_text})"
         )
 
 
 # ---------------------------------------------------------------------------
-# Single-text A: treatment vs neutral baseline deltas
+# Single-text A: treatment vs neutral baseline deltas, stratified by
+# evaluation_regime -- a naturalistic treatment observation is only ever
+# compared against the naturalistic neutral baseline for that story, never
+# against the text_only_invariance baseline.
 # ---------------------------------------------------------------------------
 
 def neutral_baseline_means(observations):
-    """Per (model, story_id): mean rating for each RATING_FIELDS category,
-    from the neutral no-context context_single trial's replicate(s). A
-    REFERENCE BASELINE for computing deltas -- not a ground-truth score."""
+    """Per (model, story_id, evaluation_regime): mean rating for each
+    RATING_FIELDS category, from the neutral no-context context_single
+    trial's replicate(s). A REFERENCE BASELINE for computing deltas -- not a
+    ground-truth score. Keyed by evaluation_regime so a naturalistic
+    treatment is never compared against an invariance-regime baseline."""
     sums = defaultdict(lambda: defaultdict(list))
     for obs in observations.values():
         if obs["type"] != "context_single" or obs["dimension"] != "neutral":
             continue
-        key = (obs["model"], obs["story_id"])
+        key = (obs["model"], obs["story_id"], obs["evaluation_regime"])
         for field in RATING_FIELDS:
             sums[key][field].append(obs["parsed_response"][field])
     return {key: {field: statistics.mean(vals) for field, vals in fields.items()} for key, fields in sums.items()}
@@ -675,22 +773,23 @@ def neutral_baseline_means(observations):
 
 def analyze_treatment_vs_neutral(observations):
     """Observation-level delta = treatment rating - neutral baseline mean,
-    holding story/model fixed, for every context_single treatment
-    observation and every rating category. Answers: holding the prose
-    fixed, how does adding context change the rating relative to the same
-    model's no-context baseline?"""
+    holding story/model/evaluation_regime fixed, for every context_single
+    treatment observation and every rating category. Answers: holding the
+    prose fixed, how does adding context change the rating relative to the
+    same model's no-context baseline, under this evaluation regime?"""
     baselines = neutral_baseline_means(observations)
     rows = []
     for obs in observations.values():
         if obs["type"] != "context_single" or obs["dimension"] == "neutral":
             continue
-        baseline = baselines.get((obs["model"], obs["story_id"]))
+        baseline = baselines.get((obs["model"], obs["story_id"], obs["evaluation_regime"]))
         if baseline is None:
             continue
         for field in RATING_FIELDS:
             rows.append(
                 {
                     "model": obs["model"],
+                    "evaluation_regime": obs["evaluation_regime"],
                     "story_id": obs["story_id"],
                     "dimension": obs["dimension"],
                     "value": obs["value"],
@@ -705,40 +804,84 @@ def analyze_treatment_vs_neutral(observations):
 
 
 def summarize_delta_by_story_condition(delta_rows):
-    """story x treatment condition: mean delta across replicates."""
+    """story x treatment condition x evaluation_regime: mean delta across replicates."""
     grouped = defaultdict(list)
     for row in delta_rows:
-        key = (row["model"], row["story_id"], row["dimension"], row["value"], row["category"])
+        key = (row["model"], row["evaluation_regime"], row["story_id"], row["dimension"], row["value"], row["category"])
         grouped[key].append(row["delta"])
     return [
-        {"model": m, "story_id": s, "dimension": d, "value": v, "category": c, "mean_delta": round(statistics.mean(deltas), 3), "n": len(deltas)}
-        for (m, s, d, v, c), deltas in grouped.items()
+        {"model": m, "evaluation_regime": er, "story_id": s, "dimension": d, "value": v, "category": c,
+         "mean_delta": round(statistics.mean(deltas), 3), "n": len(deltas)}
+        for (m, er, s, d, v, c), deltas in grouped.items()
     ]
 
 
 def summarize_delta_by_model_dimension_value(delta_rows):
-    """aggregated model x dimension x value: mean delta across all stories/replicates."""
+    """aggregated model x evaluation_regime x dimension x value: mean delta across all stories/replicates."""
     grouped = defaultdict(list)
     for row in delta_rows:
-        key = (row["model"], row["dimension"], row["value"], row["category"])
+        key = (row["model"], row["evaluation_regime"], row["dimension"], row["value"], row["category"])
         grouped[key].append(row["delta"])
     return [
-        {"model": m, "dimension": d, "value": v, "category": c, "mean_delta": round(statistics.mean(deltas), 3), "n": len(deltas)}
-        for (m, d, v, c), deltas in grouped.items()
+        {"model": m, "evaluation_regime": er, "dimension": d, "value": v, "category": c,
+         "mean_delta": round(statistics.mean(deltas), 3), "n": len(deltas)}
+        for (m, er, d, v, c), deltas in grouped.items()
     ]
 
 
-def print_treatment_vs_neutral(by_story_condition_rows, by_model_dim_value_rows):
+def compare_single_text_regimes(by_model_dim_value_rows):
+    """For each (model, dimension, value, category) present under BOTH
+    evaluation regimes, report delta_naturalistic, delta_text_only_invariance,
+    and a descriptive attenuation label. Rows missing one regime are skipped."""
+    by_key = defaultdict(dict)
+    for row in by_model_dim_value_rows:
+        key = (row["model"], row["dimension"], row["value"], row["category"])
+        by_key[key][row["evaluation_regime"]] = row["mean_delta"]
+
+    rows = []
+    for (model, dimension, value, category), by_regime in by_key.items():
+        if "naturalistic" not in by_regime or "text_only_invariance" not in by_regime:
+            continue
+        nat, inv = by_regime["naturalistic"], by_regime["text_only_invariance"]
+        rows.append(
+            {
+                "model": model,
+                "dimension": dimension,
+                "value": value,
+                "category": category,
+                "delta_naturalistic": nat,
+                "delta_text_only_invariance": inv,
+                "attenuation": describe_attenuation(nat, inv),
+            }
+        )
+    return rows
+
+
+def print_treatment_vs_neutral(by_model_dim_value_rows, regime_comparison_rows):
     print("\n=== Single-text A: treatment vs NEUTRAL BASELINE deltas ===")
-    print("(neutral is a reference baseline for measuring context sensitivity, not a ground-truth score)")
+    print("(neutral is a reference baseline for measuring context sensitivity, not a ground-truth score;")
+    print(" stratified by evaluation_regime -- naturalistic and text_only_invariance are never pooled)")
     if not by_model_dim_value_rows:
         print("  No context_single treatment observations with a matching neutral baseline found.")
         return
-    print("\n  Aggregated by (model, dimension, value), averaged across stories/replicates, overall_quality only shown here:")
-    for row in sorted(by_model_dim_value_rows, key=lambda r: (r["model"], r["dimension"], r["value"], r["category"])):
+    print("\n  By (model, evaluation_regime, dimension, value), averaged across stories/replicates, overall_quality only:")
+    for row in sorted(by_model_dim_value_rows, key=lambda r: (r["model"], r["evaluation_regime"], r["dimension"], r["value"])):
         if row["category"] != "overall_quality":
             continue
-        print(f"    {row['model']} | {row['dimension']}={row['value']}: mean_delta={row['mean_delta']:+.3f} (n={row['n']})")
+        print(
+            f"    {row['model']} | {row['evaluation_regime']} | {row['dimension']}={row['value']}: "
+            f"mean_delta={row['mean_delta']:+.3f} (n={row['n']})"
+        )
+    if regime_comparison_rows:
+        print("\n  Naturalistic vs. text_only_invariance (descriptive attenuation, overall_quality only):")
+        for row in sorted(regime_comparison_rows, key=lambda r: (r["model"], r["dimension"], r["value"])):
+            if row["category"] != "overall_quality":
+                continue
+            print(
+                f"    {row['model']} | {row['dimension']}={row['value']}: "
+                f"naturalistic={row['delta_naturalistic']:+.3f}  invariance={row['delta_text_only_invariance']:+.3f}  "
+                f"({row['attenuation']})"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -746,17 +889,19 @@ def print_treatment_vs_neutral(by_story_condition_rows, by_model_dim_value_rows)
 # reference. Scores are always kept as {story_id: (mean, n)} dicts -- never
 # pre-sorted with an arbitrary tie-break -- until presentation time, where
 # tied_groups() reports rank_position/tie_group_size without breaking ties.
+# Stratified by evaluation_regime throughout.
 # ---------------------------------------------------------------------------
 
 def rank_from_single_text_by_condition(observations):
-    """PRIMARY human-alignment ranking: one score dict per (model, dimension,
-    value), including the neutral baseline as its own condition. Returns
-    {(model, dimension, value): {story_id: (mean_score, n)}}."""
+    """PRIMARY human-alignment ranking: one score dict per
+    (model, evaluation_regime, dimension, value), including the neutral
+    baseline as its own condition. Returns
+    {(model, evaluation_regime, dimension, value): {story_id: (mean_score, n)}}."""
     scores = defaultdict(lambda: defaultdict(list))
     for obs in observations.values():
         if obs["type"] != "context_single":
             continue
-        key = (obs["model"], obs["dimension"], obs["value"])
+        key = (obs["model"], obs["evaluation_regime"], obs["dimension"], obs["value"])
         scores[key][obs["story_id"]].append(obs["parsed_response"]["overall_quality"])
     return {
         key: {story_id: (statistics.mean(vals), len(vals)) for story_id, vals in by_story.items()}
@@ -765,40 +910,42 @@ def rank_from_single_text_by_condition(observations):
 
 
 def rank_from_single_text(observations):
-    """DIAGNOSTIC ONLY: per model, pooling every context_single condition
-    together. Returns {model: {story_id: (mean_score, n)}}."""
+    """DIAGNOSTIC ONLY: per (model, evaluation_regime), pooling every
+    context_single condition together (still never pooling across
+    evaluation_regime). Returns {(model, evaluation_regime): {story_id: (mean_score, n)}}."""
     scores = defaultdict(lambda: defaultdict(list))
     for obs in observations.values():
         if obs["type"] != "context_single":
             continue
-        scores[obs["model"]][obs["story_id"]].append(obs["parsed_response"]["overall_quality"])
+        scores[(obs["model"], obs["evaluation_regime"])][obs["story_id"]].append(obs["parsed_response"]["overall_quality"])
     return {
-        model: {story_id: (statistics.mean(vals), len(vals)) for story_id, vals in by_story.items()}
-        for model, by_story in scores.items()
+        key: {story_id: (statistics.mean(vals), len(vals)) for story_id, vals in by_story.items()}
+        for key, by_story in scores.items()
     }
 
 
 def compute_pairwise_wins(observations):
-    """DIAGNOSTIC ONLY: tally wins/losses/ties per story per model, pooling
-    ALL context_pairwise observations regardless of contrast/assignment/
-    position. See rank_from_pairwise_wins for why this isn't a per-condition
-    ranking."""
+    """DIAGNOSTIC ONLY: tally wins/losses/ties per story per
+    (model, evaluation_regime), pooling ALL context_pairwise observations
+    regardless of contrast/assignment/position (but never across
+    evaluation_regime). See rank_from_pairwise_wins for why this isn't a
+    per-condition ranking."""
     records = defaultdict(lambda: defaultdict(lambda: {"wins": 0, "losses": 0, "ties": 0}))
     for obs in observations.values():
         if obs["type"] != "context_pairwise":
             continue
-        model = obs["model"]
+        key = (obs["model"], obs["evaluation_regime"])
         a, b = obs["story_a_id"], obs["story_b_id"]
         choice = obs["parsed_response"]["overall_quality"]
         if choice == "A":
-            records[model][a]["wins"] += 1
-            records[model][b]["losses"] += 1
+            records[key][a]["wins"] += 1
+            records[key][b]["losses"] += 1
         elif choice == "B":
-            records[model][b]["wins"] += 1
-            records[model][a]["losses"] += 1
+            records[key][b]["wins"] += 1
+            records[key][a]["losses"] += 1
         else:
-            records[model][a]["ties"] += 1
-            records[model][b]["ties"] += 1
+            records[key][a]["ties"] += 1
+            records[key][b]["ties"] += 1
     return records
 
 
@@ -836,7 +983,7 @@ def load_human_pairwise(path=HUMAN_PAIRWISE_FILE):
     return pairs
 
 
-def human_comparison_row(model, dimension, value, ranking_source, scores_dict, human_reference, human_pairs):
+def human_comparison_row(model, evaluation_regime, dimension, value, ranking_source, scores_dict, human_reference, human_pairs):
     """scores_dict: {story_id: (mean_score, n)} or {story_id: (scalar, ..., ...)}
     where the FIRST tuple element is always the scalar used for ranking."""
     values = {sid: v[0] for sid, v in scores_dict.items()}
@@ -856,6 +1003,7 @@ def human_comparison_row(model, dimension, value, ranking_source, scores_dict, h
     decided = concordant + discordant
     return {
         "model": model,
+        "evaluation_regime": evaluation_regime,
         "dimension": dimension,
         "value": value,
         "ranking_source": ranking_source,
@@ -915,7 +1063,9 @@ def main():
         choices=list(SAMPLING_REGIMES),
         default=DEFAULT_SAMPLING_REGIME,
         help="Only observations recorded under this regime are analyzed (default: low_variance_primary). "
-        "The primary and secondary regimes are never pooled automatically.",
+        "The primary and secondary regimes are never pooled automatically. Unlike sampling_regime, "
+        "evaluation_regime (naturalistic / text_only_invariance) is not filtered here -- it's stratified "
+        "throughout instead, since it's the substantive variable under study.",
     )
     args = parser.parse_args()
 
@@ -936,6 +1086,8 @@ def main():
             f"  Excluded {excluded_by_regime} observation(s) recorded under a different sampling regime "
             f"(pass --sampling-regime to analyze them instead; regimes are never pooled automatically)."
         )
+    evaluation_regime_counts = count_by(observations.values(), lambda o: o.get("evaluation_regime", "n/a"))
+    print(f"  Evaluation regimes present in this run (stratified below, never pooled): {evaluation_regime_counts}")
 
     # --- Pairwise A: directional context-sensitivity effect (PRIMARY) + changed diagnostic (SECONDARY) ---
     changed_rows = analyze_pairwise_changed_diagnostic(observations)
@@ -944,6 +1096,16 @@ def main():
     directional_rows = analyze_directional_pairwise_effects(observations)
     directional_by_contrast_rows = summarize_directional_effects_by_contrast(directional_rows)
     summarize_directional_pairwise_effects(directional_rows, directional_by_contrast_rows)
+
+    pairwise_regime_comparison_rows = compare_pairwise_regimes(directional_by_contrast_rows)
+    if pairwise_regime_comparison_rows:
+        print("\n  Naturalistic vs. text_only_invariance (descriptive attenuation of the directional effect):")
+        for row in sorted(pairwise_regime_comparison_rows, key=lambda r: (r["model"], r["contrast_id"], r["category"])):
+            print(
+                f"    {row['model']} | {row['contrast_id']} | {row['category']}: "
+                f"naturalistic={row['effect_naturalistic']:+.3f}  invariance={row['effect_text_only_invariance']:+.3f}  "
+                f"({row['attenuation']})"
+            )
 
     # --- context_prompt: extraneous prompt-level sentence effect ---
     prompt_effect_rows = analyze_prompt_context_effects(observations)
@@ -958,7 +1120,8 @@ def main():
     delta_obs_rows = analyze_treatment_vs_neutral(observations)
     delta_by_story_condition_rows = summarize_delta_by_story_condition(delta_obs_rows)
     delta_by_model_dim_value_rows = summarize_delta_by_model_dimension_value(delta_obs_rows)
-    print_treatment_vs_neutral(delta_by_story_condition_rows, delta_by_model_dim_value_rows)
+    single_regime_comparison_rows = compare_single_text_regimes(delta_by_model_dim_value_rows)
+    print_treatment_vs_neutral(delta_by_model_dim_value_rows, single_regime_comparison_rows)
 
     # --- Single-text B: tie-aware rankings vs human reference (PRIMARY), pooled diagnostics (SECONDARY) ---
     human_reference = load_human_reference()
@@ -966,54 +1129,60 @@ def main():
     single_by_condition = rank_from_single_text_by_condition(observations)
     single_by_condition_rows = []
     human_comparison_rows = []
-    print("\n=== Single-text B PRIMARY: tie-aware ranking per (model, dimension, value) vs human reference ===")
+    print("\n=== Single-text B PRIMARY: tie-aware ranking per (model, evaluation_regime, dimension, value) vs human reference ===")
     print("(includes the neutral baseline as its own condition; ties are never broken artificially)")
     if not single_by_condition:
         print("  No context_single observations found.")
-    for (model, dimension, value), scores in sorted(single_by_condition.items(), key=lambda kv: str(kv[0])):
-        print(f"  Model: {model}  dimension={dimension}  value={value}")
+    for (model, evaluation_regime, dimension, value), scores in sorted(single_by_condition.items(), key=lambda kv: str(kv[0])):
+        print(f"  Model: {model}  evaluation_regime={evaluation_regime}  dimension={dimension}  value={value}")
         print_ranking_with_ties(scores)
-        single_by_condition_rows.extend(ranking_csv_rows(scores, {"model": model, "dimension": dimension, "value": value}))
-        row = human_comparison_row(model, dimension, value, "single_text_per_condition", scores, human_reference, human_pairs)
+        single_by_condition_rows.extend(
+            ranking_csv_rows(scores, {"model": model, "evaluation_regime": evaluation_regime, "dimension": dimension, "value": value})
+        )
+        row = human_comparison_row(model, evaluation_regime, dimension, value, "single_text_per_condition", scores, human_reference, human_pairs)
         human_comparison_rows.append(row)
         tau_text = row["kendall_tau_b"] if row["kendall_tau_b"] != "" else "unavailable"
         spearman_text = row["spearman_vs_human"] if row["spearman_vs_human"] != "" else "unavailable"
         print(f"    vs human reference (n_common={row['n_common_with_human_reference']}): Kendall tau-b={tau_text}  Spearman(tie-aware)={spearman_text}")
 
-    print("\n=== Single-text B diagnostic only: pooled ranking across ALL conditions ===")
-    print("(averages over every context_single trial regardless of dimension/value; a rough sanity check, NOT the main result)")
-    single_pooled_by_model = rank_from_single_text(observations)
+    print("\n=== Single-text B diagnostic only: pooled ranking across ALL conditions (per evaluation_regime) ===")
+    print("(averages over every context_single trial regardless of dimension/value, within one evaluation_regime;")
+    print(" a rough sanity check, NOT the main result -- never pooled across evaluation_regime)")
+    single_pooled_by_key = rank_from_single_text(observations)
     single_ranking_rows = []
-    for model, scores in sorted(single_pooled_by_model.items()):
-        print(f"  Model: {model}")
+    for (model, evaluation_regime), scores in sorted(single_pooled_by_key.items()):
+        print(f"  Model: {model}  evaluation_regime={evaluation_regime}")
         print_ranking_with_ties(scores)
-        single_ranking_rows.extend(ranking_csv_rows(scores, {"model": model}))
-        human_comparison_rows.append(human_comparison_row(model, "ALL", "ALL", "single_text_pooled_diagnostic", scores, human_reference, human_pairs))
+        single_ranking_rows.extend(ranking_csv_rows(scores, {"model": model, "evaluation_regime": evaluation_regime}))
+        human_comparison_rows.append(
+            human_comparison_row(model, evaluation_regime, "ALL", "ALL", "single_text_pooled_diagnostic", scores, human_reference, human_pairs)
+        )
 
-    print("\n=== Pairwise diagnostic only: pooled Copeland ranking (all contrasts/assignments/positions) ===")
+    print("\n=== Pairwise diagnostic only: pooled Copeland ranking (all contrasts/assignments/positions, per evaluation_regime) ===")
     print("(not a ranking under any one context condition -- see rank_from_pairwise_wins docstring)")
     pairwise_wins = compute_pairwise_wins(observations)
     pairwise_ranking_rows = []
-    for model, tally_by_story in sorted(pairwise_wins.items()):
+    for (model, evaluation_regime), tally_by_story in sorted(pairwise_wins.items()):
         scores = rank_from_pairwise_wins(tally_by_story)  # {story_id: (copeland, win_rate, games)}
-        print(f"  Model: {model}")
-        for g in tied_groups({sid: v[0] for sid, v in scores.items()}, list(scores.keys())):
+        print(f"  Model: {model}  evaluation_regime={evaluation_regime}")
+        groups = tied_groups({sid: v[0] for sid, v in scores.items()}, list(scores.keys()))
+        for g in groups:
             ids = ", ".join(g["story_ids"])
             print(f"    rank {g['rank_position']}: {ids}  (copeland={g['score']})")
+        rank_by_story = {s: g["rank_position"] for g in groups for s in g["story_ids"]}
+        size_by_story = {s: len(g["story_ids"]) for g in groups for s in g["story_ids"]}
         for sid in sorted(scores):
             copeland, win_rate, games = scores[sid]
-            groups = tied_groups({s: v[0] for s, v in scores.items()}, list(scores.keys()))
-            rank_by_story = {s: g["rank_position"] for g in groups for s in g["story_ids"]}
-            size_by_story = {s: len(g["story_ids"]) for g in groups for s in g["story_ids"]}
             pairwise_ranking_rows.append(
                 {
-                    "model": model, "story_id": sid, "copeland": copeland, "win_rate": round(win_rate, 3), "games": games,
+                    "model": model, "evaluation_regime": evaluation_regime, "story_id": sid, "copeland": copeland,
+                    "win_rate": round(win_rate, 3), "games": games,
                     "rank_position": rank_by_story[sid], "tie_group_size": size_by_story[sid],
                 }
             )
         scores_for_comparison = {sid: (v[0], v[2]) for sid, v in scores.items()}  # (copeland, games) as (score, n)
         human_comparison_rows.append(
-            human_comparison_row(model, "ALL", "ALL", "pairwise_pooled_diagnostic", scores_for_comparison, human_reference, human_pairs)
+            human_comparison_row(model, evaluation_regime, "ALL", "ALL", "pairwise_pooled_diagnostic", scores_for_comparison, human_reference, human_pairs)
         )
 
     print("\n=== Comparison against human reference: availability ===")
@@ -1028,74 +1197,84 @@ def main():
 
     write_csv(
         changed_rows,
-        ["model", "contrast_id", "dimension", "story_1_id", "story_2_id", "position", "replicate_id", "category",
+        ["model", "evaluation_regime", "contrast_id", "dimension", "story_1_id", "story_2_id", "position", "replicate_id", "category",
          "story1_context_forward", "story1_context_flipped", "forward_choice", "forward_chosen_story_id",
          "flipped_choice", "flipped_chosen_story_id", "changed"],
         os.path.join(ANALYSIS_DIR, "pairwise_changed_diagnostic.csv"),
     )
     write_csv(
         directional_rows,
-        ["model", "contrast_id", "story_1_id", "story_2_id", "category", "p_story1_preferred_given_value_a",
+        ["model", "evaluation_regime", "contrast_id", "story_1_id", "story_2_id", "category", "p_story1_preferred_given_value_a",
          "n_value_a", "tie_n_value_a", "p_story1_preferred_given_value_b", "n_value_b", "tie_n_value_b",
          "directional_effect_a_minus_b"],
         os.path.join(ANALYSIS_DIR, "pairwise_directional_effects.csv"),
     )
     write_csv(
         directional_by_contrast_rows,
-        ["model", "contrast_id", "category", "mean_directional_effect", "n_story_pairs"],
+        ["model", "evaluation_regime", "contrast_id", "category", "mean_directional_effect", "n_story_pairs"],
         os.path.join(ANALYSIS_DIR, "pairwise_directional_effects_by_contrast.csv"),
     )
     write_csv(
+        pairwise_regime_comparison_rows,
+        ["model", "contrast_id", "category", "effect_naturalistic", "effect_text_only_invariance", "attenuation"],
+        os.path.join(ANALYSIS_DIR, "pairwise_regime_comparison.csv"),
+    )
+    write_csv(
         prompt_effect_rows,
-        ["model", "contrast_id", "story_a_id", "story_b_id", "replicate_id", "category", "baseline_value",
+        ["model", "evaluation_regime", "contrast_id", "story_a_id", "story_b_id", "replicate_id", "category", "baseline_value",
          "treatment_value", "baseline_choice", "treatment_choice", "changed"],
         os.path.join(ANALYSIS_DIR, "prompt_context_effects.csv"),
     )
     write_csv(
         pairwise_vs_human_rows,
-        ["model", "story_a_id", "story_b_id", "contrast_id", "assignment", "position", "replicate_id",
+        ["model", "evaluation_regime", "story_a_id", "story_b_id", "contrast_id", "assignment", "position", "replicate_id",
          "human_winner", "model_choice", "model_chosen_story_id", "outcome"],
         os.path.join(ANALYSIS_DIR, "pairwise_vs_human_reference_observations.csv"),
     )
     write_csv(
         pairwise_vs_human_summary_rows,
-        ["model", "concordant", "discordant", "model_tied", "n", "concordant_rate"],
+        ["model", "evaluation_regime", "concordant", "discordant", "model_tied", "n", "concordant_rate"],
         os.path.join(ANALYSIS_DIR, "pairwise_vs_human_reference_summary.csv"),
     )
     write_csv(
         delta_obs_rows,
-        ["model", "story_id", "dimension", "value", "replicate_id", "category", "treatment_rating",
+        ["model", "evaluation_regime", "story_id", "dimension", "value", "replicate_id", "category", "treatment_rating",
          "neutral_baseline_mean", "delta"],
         os.path.join(ANALYSIS_DIR, "treatment_vs_neutral_observations.csv"),
     )
     write_csv(
         delta_by_story_condition_rows,
-        ["model", "story_id", "dimension", "value", "category", "mean_delta", "n"],
+        ["model", "evaluation_regime", "story_id", "dimension", "value", "category", "mean_delta", "n"],
         os.path.join(ANALYSIS_DIR, "treatment_vs_neutral_by_story_condition.csv"),
     )
     write_csv(
         delta_by_model_dim_value_rows,
-        ["model", "dimension", "value", "category", "mean_delta", "n"],
+        ["model", "evaluation_regime", "dimension", "value", "category", "mean_delta", "n"],
         os.path.join(ANALYSIS_DIR, "treatment_vs_neutral_by_model_dimension_value.csv"),
     )
     write_csv(
+        single_regime_comparison_rows,
+        ["model", "dimension", "value", "category", "delta_naturalistic", "delta_text_only_invariance", "attenuation"],
+        os.path.join(ANALYSIS_DIR, "single_text_regime_comparison.csv"),
+    )
+    write_csv(
         single_by_condition_rows,
-        ["model", "dimension", "value", "story_id", "mean_overall_quality", "n", "rank_position", "tie_group_size"],
+        ["model", "evaluation_regime", "dimension", "value", "story_id", "mean_overall_quality", "n", "rank_position", "tie_group_size"],
         os.path.join(ANALYSIS_DIR, "single_text_rankings_by_condition.csv"),
     )
     write_csv(
         single_ranking_rows,
-        ["model", "story_id", "mean_overall_quality", "n", "rank_position", "tie_group_size"],
+        ["model", "evaluation_regime", "story_id", "mean_overall_quality", "n", "rank_position", "tie_group_size"],
         os.path.join(ANALYSIS_DIR, "single_text_rankings_pooled_diagnostic.csv"),
     )
     write_csv(
         pairwise_ranking_rows,
-        ["model", "story_id", "copeland", "win_rate", "games", "rank_position", "tie_group_size"],
+        ["model", "evaluation_regime", "story_id", "copeland", "win_rate", "games", "rank_position", "tie_group_size"],
         os.path.join(ANALYSIS_DIR, "pairwise_rankings_pooled_diagnostic.csv"),
     )
     write_csv(
         human_comparison_rows,
-        ["model", "dimension", "value", "ranking_source", "n_common_with_human_reference", "kendall_tau_b",
+        ["model", "evaluation_regime", "dimension", "value", "ranking_source", "n_common_with_human_reference", "kendall_tau_b",
          "spearman_vs_human", "pairwise_concordant", "pairwise_discordant", "pairwise_model_tied",
          "pairwise_concordant_rate", "pairwise_checked_n"],
         os.path.join(ANALYSIS_DIR, "human_comparison.csv"),
