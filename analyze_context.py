@@ -20,32 +20,53 @@ never be silently pooled:
   side, so naturalistic context sensitivity and invariance-instructed
   effects can be compared directly rather than averaged together.
 
-Four distinct questions are answered here, deliberately kept separate rather
-than collapsed into one "ranking" analysis (see FINAL_DESIGN.md):
+This project's primary question is how external contextual cues change LLM
+evaluations of fixed prose, and how robust those evaluations are to
+contextual perturbation. The analyses below are organized around that,
+PRIMARY first, SECONDARY after -- never collapsed into one "ranking"
+analysis (see FINAL_DESIGN.md's "Primary and secondary empirical questions"):
 
-  Single-text:
-    A. Does context move the score of the SAME story relative to the neutral
-       no-context baseline?              -> analyze_treatment_vs_neutral
-    B. Does the (possibly tied) score ordering under a condition resemble
-       the human reference ordering?      -> rank_from_single_text_by_condition
-                                             + Kendall tau-b / tie-aware Spearman
+  PRIMARY -- context sensitivity and invariance:
+    Single-text: does context move the score of the SAME story relative to
+      its own neutral no-context baseline?    -> analyze_treatment_vs_neutral
+    Pairwise: does assigning context to a story change its probability of
+      being preferred?                        -> analyze_directional_pairwise_effects
+    Invariance: how much of either effect survives an explicit
+      text-only-judge instruction?            -> compare_single_text_regimes /
+                                                   compare_pairwise_regimes
+                                                   (evaluation_regime stratification)
+    Stochastic robustness: repeated identical cells are kept as separate
+      observations throughout (never collapsed to a majority vote), so
+      effect sizes above can be read against ordinary response variation --
+      see collapse_attempts and "Replication" in FINAL_DESIGN.md.
 
-  Pairwise:
-    A. Does assigning context to a story change its probability of being
-       preferred?                         -> analyze_directional_pairwise_effects
-    B. Do direct model pairwise choices resemble the human reference's
-       direct pairwise judgments?         -> analyze_pairwise_vs_human_reference
+  SECONDARY -- agreement with the researcher reference ordering (a
+  single-researcher, ORDINAL-only, personalized preference ranking over the
+  12-story corpus -- not population ground truth, not a cardinal utility,
+  and not the organizing goal of this benchmark; see FINAL_DESIGN.md's
+  "Researcher reference ranking"):
+    Single-text: does the (possibly tied) score ordering under a condition
+      agree with the researcher's ordering?   -> rank_from_single_text_by_condition
+                                                  + Kendall tau-b / tie-aware Spearman
+    Pairwise: do direct model pairwise choices agree with the researcher's
+      direct pairwise judgments?              -> analyze_pairwise_vs_human_reference
 
-Each of A/A above is additionally compared across evaluation_regime
-(compare_single_text_regimes / compare_pairwise_regimes) with a purely
-descriptive "attenuation" label -- not a new statistical model.
+The two PRIMARY effect analyses are additionally compared across
+evaluation_regime (compare_single_text_regimes / compare_pairwise_regimes)
+with a purely descriptive "attenuation" label -- not a new statistical
+model. A table or CSV ranking conditions by reference-agreement is
+descriptive only, not evidence that the top-ranked condition is genuinely
+"best" -- see the multiple-comparisons caution in FINAL_DESIGN.md.
 
-The neutral/no-context condition is a REFERENCE BASELINE for measuring
-context sensitivity, not a ground-truth score and not assumed unbiased. A
-naturalistic context effect is not automatically "bias"; an effect that
-survives text_only_invariance instructions is described as an invariance
-effect, never automatically as bias/sycophancy/irrationality (see
-FINAL_DESIGN.md's terminology section).
+The neutral/no-context condition and the researcher reference ordering are
+two DIFFERENT reference concepts and neither is ground truth: the neutral
+baseline is this model's own no-context answer, used only to measure
+within-story context-induced change; the researcher reference is one
+person's fixed ordinal preference, used only for the secondary,
+personalized agreement analysis. A naturalistic context effect is not
+automatically "bias"; an effect that survives text_only_invariance
+instructions is described as an invariance effect, never automatically as
+bias/sycophancy/irrationality (see FINAL_DESIGN.md's terminology section).
 
 Model rating ties are legitimate and are never broken by story ID, filename,
 alphabetical order, or insertion order -- see average_ranks/kendall_tau_b/
@@ -312,9 +333,11 @@ def kendall_tau_b(values_a, values_b, items):
 
 
 def human_reference_scores(ranking):
-    """Turn a best-first human reference list into {item: score} (higher =
-    more preferred), so it can feed the same tie-aware functions above as a
-    possibly-tied model score dict. The human reference itself has no ties."""
+    """Turn the researcher's best-first ordinal reference list into
+    {item: score} (higher = more preferred), so it can feed the same
+    tie-aware functions above as a possibly-tied model score dict. The
+    reference ordering itself has no ties -- it's an ordinal relation only
+    (A > B > C...), not a cardinal preference intensity."""
     n = len(ranking)
     return {story_id: n - i for i, story_id in enumerate(ranking)}
 
@@ -668,15 +691,19 @@ def summarize_prompt_context_effects(rows):
 
 
 # ---------------------------------------------------------------------------
-# Pairwise vs human reference: DIRECT comparison in story identity, no
-# derived ranking involved -- for every context_pairwise observation whose
-# two displayed stories exactly match a known human judgment, does the
-# model's choice agree? Stratified by evaluation_regime.
+# SECONDARY: pairwise agreement with the researcher reference. DIRECT
+# comparison in story identity, no derived ranking involved -- for every
+# context_pairwise observation whose two displayed stories exactly match a
+# judgment the researcher made, does the model's choice agree? A secondary,
+# personalized comparison, not evidence about which context is "better" --
+# stratified by evaluation_regime, so the more interesting reading is
+# whether contextual perturbation makes this agreement more or less robust,
+# not "which context wins" (see FINAL_DESIGN.md).
 # ---------------------------------------------------------------------------
 
 def analyze_pairwise_vs_human_reference(observations, human_pairs, category="overall_quality"):
     """Restricted to `category` (default overall_quality, the closest
-    analogue to a single human preference judgment). Reports concordant/
+    analogue to a single preference judgment). Reports concordant/
     discordant/model_tied counts -- never converts a model tie into a
     fabricated win or loss. Stratified by (model, evaluation_regime).
     """
@@ -735,10 +762,10 @@ def analyze_pairwise_vs_human_reference(observations, human_pairs, category="ove
 
 
 def summarize_pairwise_vs_human_reference(summary_rows):
-    print("\n=== Pairwise B: direct model choices vs direct human judgments (no derived ranking) ===")
-    print("(restricted to overall_quality, and to story pairs with a known human judgment)")
+    print("\n=== SECONDARY: direct model choices vs the researcher's pairwise judgments (no derived ranking) ===")
+    print("(restricted to overall_quality, and to story pairs the researcher judged; personalized, ordinal, exploratory)")
     if not summary_rows:
-        print("  No context_pairwise observations matched a known human judgment.")
+        print("  No context_pairwise observations matched a researcher judgment.")
         return
     for row in sorted(summary_rows, key=lambda r: (r["model"], r["evaluation_regime"])):
         rate_text = f"{row['concordant_rate']:.3f}" if row["concordant_rate"] != "" else "unavailable"
@@ -749,10 +776,12 @@ def summarize_pairwise_vs_human_reference(summary_rows):
 
 
 # ---------------------------------------------------------------------------
-# Single-text A: treatment vs neutral baseline deltas, stratified by
+# PRIMARY: single-text treatment vs neutral baseline deltas, stratified by
 # evaluation_regime -- a naturalistic treatment observation is only ever
 # compared against the naturalistic neutral baseline for that story, never
-# against the text_only_invariance baseline.
+# against the text_only_invariance baseline. This is this project's main
+# question (context sensitivity), not the researcher-reference comparisons
+# further below, which are secondary.
 # ---------------------------------------------------------------------------
 
 def neutral_baseline_means(observations):
@@ -858,7 +887,7 @@ def compare_single_text_regimes(by_model_dim_value_rows):
 
 
 def print_treatment_vs_neutral(by_model_dim_value_rows, regime_comparison_rows):
-    print("\n=== Single-text A: treatment vs NEUTRAL BASELINE deltas ===")
+    print("\n=== PRIMARY: single-text treatment vs NEUTRAL BASELINE deltas ===")
     print("(neutral is a reference baseline for measuring context sensitivity, not a ground-truth score;")
     print(" stratified by evaluation_regime -- naturalistic and text_only_invariance are never pooled)")
     if not by_model_dim_value_rows:
@@ -885,18 +914,26 @@ def print_treatment_vs_neutral(by_model_dim_value_rows, regime_comparison_rows):
 
 
 # ---------------------------------------------------------------------------
-# Single-text B: rankings (tie-aware) and comparison against the human
-# reference. Scores are always kept as {story_id: (mean, n)} dicts -- never
-# pre-sorted with an arbitrary tie-break -- until presentation time, where
-# tied_groups() reports rank_position/tie_group_size without breaking ties.
-# Stratified by evaluation_regime throughout.
+# SECONDARY: single-text rankings (tie-aware) and agreement with the
+# researcher reference ordering. This is a personalized, ordinal-only
+# reference-agreement analysis -- not the benchmark's organizing goal, and
+# not evidence that any one condition is objectively "better" (see
+# FINAL_DESIGN.md's "Researcher reference ranking" and its multiple-
+# comparisons caution). Scores are always kept as {story_id: (mean, n)}
+# dicts -- never pre-sorted with an arbitrary tie-break -- until
+# presentation time, where tied_groups() reports rank_position/tie_group_size
+# without breaking ties. Stratified by evaluation_regime throughout.
 # ---------------------------------------------------------------------------
 
 def rank_from_single_text_by_condition(observations):
-    """PRIMARY human-alignment ranking: one score dict per
+    """SECONDARY reference-agreement ranking: one score dict per
     (model, evaluation_regime, dimension, value), including the neutral
     baseline as its own condition. Returns
-    {(model, evaluation_regime, dimension, value): {story_id: (mean_score, n)}}."""
+    {(model, evaluation_regime, dimension, value): {story_id: (mean_score, n)}}.
+    Feeds into the researcher-reference agreement statistics below -- this
+    is a secondary, personalized analysis, not the benchmark's primary
+    context-sensitivity question (see analyze_treatment_vs_neutral for that).
+    """
     scores = defaultdict(lambda: defaultdict(list))
     for obs in observations.values():
         if obs["type"] != "context_single":
@@ -1111,26 +1148,28 @@ def main():
     prompt_effect_rows = analyze_prompt_context_effects(observations)
     summarize_prompt_context_effects(prompt_effect_rows)
 
-    # --- Pairwise B: direct pairwise choices vs direct human judgments ---
+    # --- SECONDARY: direct pairwise choices vs the researcher's judgments ---
     human_pairs = load_human_pairwise()
     pairwise_vs_human_rows, pairwise_vs_human_summary_rows = analyze_pairwise_vs_human_reference(observations, human_pairs)
     summarize_pairwise_vs_human_reference(pairwise_vs_human_summary_rows)
 
-    # --- Single-text A: treatment vs neutral baseline deltas ---
+    # --- PRIMARY: single-text treatment vs neutral baseline deltas ---
     delta_obs_rows = analyze_treatment_vs_neutral(observations)
     delta_by_story_condition_rows = summarize_delta_by_story_condition(delta_obs_rows)
     delta_by_model_dim_value_rows = summarize_delta_by_model_dimension_value(delta_obs_rows)
     single_regime_comparison_rows = compare_single_text_regimes(delta_by_model_dim_value_rows)
     print_treatment_vs_neutral(delta_by_model_dim_value_rows, single_regime_comparison_rows)
 
-    # --- Single-text B: tie-aware rankings vs human reference (PRIMARY), pooled diagnostics (SECONDARY) ---
+    # --- SECONDARY: tie-aware ranking agreement with the researcher reference
+    # (per-condition is preferred over the pooled diagnostic further below) ---
     human_reference = load_human_reference()
 
     single_by_condition = rank_from_single_text_by_condition(observations)
     single_by_condition_rows = []
     human_comparison_rows = []
-    print("\n=== Single-text B PRIMARY: tie-aware ranking per (model, evaluation_regime, dimension, value) vs human reference ===")
-    print("(includes the neutral baseline as its own condition; ties are never broken artificially)")
+    print("\n=== SECONDARY: tie-aware ranking per (model, evaluation_regime, dimension, value) vs researcher reference ===")
+    print("(personalized, ordinal-only agreement analysis -- not the benchmark's primary question; see FINAL_DESIGN.md.")
+    print(" Includes the neutral baseline as its own condition; ties are never broken artificially.)")
     if not single_by_condition:
         print("  No context_single observations found.")
     for (model, evaluation_regime, dimension, value), scores in sorted(single_by_condition.items(), key=lambda kv: str(kv[0])):
@@ -1143,9 +1182,9 @@ def main():
         human_comparison_rows.append(row)
         tau_text = row["kendall_tau_b"] if row["kendall_tau_b"] != "" else "unavailable"
         spearman_text = row["spearman_vs_human"] if row["spearman_vs_human"] != "" else "unavailable"
-        print(f"    vs human reference (n_common={row['n_common_with_human_reference']}): Kendall tau-b={tau_text}  Spearman(tie-aware)={spearman_text}")
+        print(f"    vs researcher reference (n_common={row['n_common_with_human_reference']}): Kendall tau-b={tau_text}  Spearman(tie-aware)={spearman_text}")
 
-    print("\n=== Single-text B diagnostic only: pooled ranking across ALL conditions (per evaluation_regime) ===")
+    print("\n=== SECONDARY diagnostic only: pooled ranking across ALL conditions (per evaluation_regime) ===")
     print("(averages over every context_single trial regardless of dimension/value, within one evaluation_regime;")
     print(" a rough sanity check, NOT the main result -- never pooled across evaluation_regime)")
     single_pooled_by_key = rank_from_single_text(observations)
@@ -1158,7 +1197,7 @@ def main():
             human_comparison_row(model, evaluation_regime, "ALL", "ALL", "single_text_pooled_diagnostic", scores, human_reference, human_pairs)
         )
 
-    print("\n=== Pairwise diagnostic only: pooled Copeland ranking (all contrasts/assignments/positions, per evaluation_regime) ===")
+    print("\n=== SECONDARY diagnostic only: pooled Copeland ranking (all contrasts/assignments/positions, per evaluation_regime) ===")
     print("(not a ranking under any one context condition -- see rank_from_pairwise_wins docstring)")
     pairwise_wins = compute_pairwise_wins(observations)
     pairwise_ranking_rows = []
@@ -1185,7 +1224,9 @@ def main():
             human_comparison_row(model, evaluation_regime, "ALL", "ALL", "pairwise_pooled_diagnostic", scores_for_comparison, human_reference, human_pairs)
         )
 
-    print("\n=== Comparison against human reference: availability ===")
+    print("\n=== SECONDARY: agreement with the researcher reference ordering -- availability ===")
+    print("(personalized, ordinal, exploratory -- a descriptive comparison, not evidence of an objectively 'best' context;")
+    print(" see the multiple-comparisons caution in FINAL_DESIGN.md before reading too much into any single top result)")
     if human_reference is None:
         print("  data/human_reference.json does not exist yet (run human_ranking.py once enough")
         print("  pairwise judgments are collected). Kendall tau-b / Spearman are unavailable for now.")

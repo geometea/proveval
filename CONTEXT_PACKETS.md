@@ -232,17 +232,20 @@ required run, and no results exist for it.
   collapses retry *attempts* (never replicates), and only ever analyzes one
   `--sampling-regime` at a time (`evaluation_regime` is NOT filtered this
   way -- it's stratified throughout instead, since it's the substantive
-  variable under study). It keeps four questions distinct rather than
-  collapsing them into a "ranking" -- treatment-vs-neutral-baseline deltas,
-  a tie-aware ranking-vs-human-reference comparison (Kendall tau-b primary,
-  tie-aware Spearman secondary, never an artificial tie-break), a
-  directional pairwise context-sensitivity effect in story identity (not a
-  boolean), and a direct pairwise-choices-vs-human-judgments comparison --
-  see "Four distinct questions" in `FINAL_DESIGN.md`. Each of the
-  effect/delta analyses also gets a descriptive naturalistic-vs-invariance
-  "attenuation" comparison (`*_regime_comparison.csv`). Pooled single-text
-  and pairwise rankings are also computed but clearly labelled **diagnostic
-  only**. Writes CSVs to `results/context_analysis/`.
+  variable under study). It is organized PRIMARY-first, SECONDARY-second
+  rather than collapsing everything into a "ranking" -- see "Primary and
+  secondary empirical questions" in `FINAL_DESIGN.md`. **Primary**:
+  treatment-vs-neutral-baseline deltas and a directional pairwise
+  context-sensitivity effect in story identity (not a boolean), each with a
+  descriptive naturalistic-vs-invariance "attenuation" comparison
+  (`*_regime_comparison.csv`). **Secondary**: a tie-aware ranking's
+  agreement with the researcher reference ordering (Kendall tau-b primary
+  statistic, tie-aware Spearman secondary statistic, never an artificial
+  tie-break) and a direct pairwise-choices-vs-researcher-judgments
+  comparison -- both personalized/exploratory, not evidence that any
+  condition is objectively "better." Pooled single-text and pairwise
+  rankings are also computed but clearly labelled **diagnostic only**.
+  Writes CSVs to `results/context_analysis/`.
 
 **Not done:** no benchmark API calls have actually been made. The trial
 count above (7680, plus 1254 optional/never-run) is deliberately generated

@@ -1,12 +1,21 @@
 # Proveval
 
-Proveval is an LLM-as-judge benchmark for subjective prose evaluation. It
-tests whether LLM judges change their evaluation of fixed prose when given
-task-irrelevant context — for example, being told a story was "written by an
-AI" versus "written by me," found in "a literary journal" versus "somewhere
-random online," or that the user "really liked" versus "wasn't a fan of" it.
-It also asks whether some model/context combinations track a fixed human
-preference ranking better than others.
+Proveval studies how external contextual cues change LLM evaluations of
+fixed prose, and how robust those evaluations are to contextual
+perturbation — for example, being told a story was "written by an AI"
+versus "written by me," found in "a literary journal" versus "somewhere
+random online," or that the user "really liked" versus "wasn't a fan of"
+it. It measures both **naturalistic context sensitivity** (does the cue
+move an ordinary evaluation?) and **text-only invariance** (can the model
+resist that same cue when explicitly instructed to judge only the prose?).
+
+A fixed single-researcher **ordinal** preference ranking over the corpus
+provides a secondary, personalized reference point: it lets us ask whether
+model judgments — and the shifts context induces in them — move toward or
+away from one person's preferences. It is not ground truth, not a cardinal
+preference function, and not the organizing goal of this project; see
+"Researcher reference ranking" in `FINAL_DESIGN.md` for exactly what it is
+and isn't.
 
 ## Status
 
@@ -36,12 +45,17 @@ preference ranking better than others.
   runner, and offline analysis all exist and are exercised with dry-runs and
   synthetic fixtures — see `CONTEXT_PACKETS.md` for exactly what's built.
   No benchmark API calls have been made yet.
-- **Human reference ranking: complete.** 31 pairwise judgments are recorded
-  in `data/human_pairwise.jsonl`, with no contradictions or cycles, and they
-  uniquely determine a full ranking of all 12 corpus stories.
-  `human_ranking.py` has written `data/human_reference.json`
-  (`num_judgments: 31`), which `analyze_context.py` now picks up
-  automatically for Spearman correlation and pairwise-agreement comparisons.
+- **Researcher reference ranking (secondary benchmark): complete.** 31
+  pairwise judgments are recorded in `data/human_pairwise.jsonl`, with no
+  contradictions or cycles, and they uniquely determine a full **ordinal**
+  ranking of all 12 corpus stories — one researcher's ordering, not a
+  population preference or a cardinal utility. `human_ranking.py` has
+  written `data/human_reference.json` (`num_judgments: 31`), which
+  `analyze_context.py` now picks up automatically for the secondary
+  reference-agreement analyses (Kendall tau-b / tie-aware Spearman /
+  pairwise concordance) — see "Researcher reference ranking" in
+  `FINAL_DESIGN.md` for why this is secondary and exploratory, not the
+  project's organizing goal.
 
 See `EXPERIMENT.md` for the original v0.1 design write-up.
 
@@ -139,30 +153,37 @@ See `EXPERIMENT.md` for the original v0.1 design write-up.
   and the original v0.1 integer 1-5 and story_a/story_b/preference schemas —
   all fully backward compatible. `--dry-run` never calls the API in either
   script.
-- `data/human_pairwise.jsonl` — known human pairwise judgments (winner,
-  loser); 31 judgments, all actually made (never invented).
+- `data/human_pairwise.jsonl` — one researcher's pairwise judgments (winner,
+  loser); 31 judgments, all actually made (never invented). This is the raw
+  input to the secondary, personalized reference ranking below — not a
+  population survey.
 - `human_ranking.py` — checks those judgments for cycles/contradictions and
   writes `data/human_reference.json` only once they uniquely determine a
   complete ranking. They now do — see Status above.
-- `data/human_reference.json` — the complete, unique 12-story human
-  preference ranking derived from the above (regenerate with
+- `data/human_reference.json` — the complete, unique 12-story **ordinal**
+  researcher reference ranking derived from the above (regenerate with
   `python3 human_ranking.py`; only written when the judgments are
-  contradiction-free and uniquely determine a full order).
+  contradiction-free and uniquely determine a full order). An ordering only
+  (A > B > C...), not a cardinal preference score, and not ground truth —
+  see "Researcher reference ranking" in `FINAL_DESIGN.md`.
 - `analyze_context.py` — separate from `analyze.py`: collapses retries
   (never replicates), analyzes only one `--sampling-regime` at a time, and
-  keeps four questions distinct rather than collapsing them into one
-  ranking (see FINAL_DESIGN.md): single-text treatment-vs-neutral-baseline
-  deltas; a tie-aware single-text ranking vs. the human reference (Kendall
-  tau-b primary, tie-aware Spearman secondary, concordant/discordant/
-  model_tied counts — never an artificial tie-break); a directional pairwise
+  is organized PRIMARY-first, SECONDARY-second (see FINAL_DESIGN.md's
+  "Primary and secondary empirical questions") rather than collapsing
+  everything into one ranking. **Primary**: single-text
+  treatment-vs-neutral-baseline deltas, and a directional pairwise
   context-sensitivity effect in story identity (not just a boolean
-  "changed"); and a direct pairwise-choices-vs-human-judgments comparison.
-  Every one of the four is also stratified by `evaluation_regime`
-  (`naturalistic` / `text_only_invariance` are never pooled), with a
-  descriptive naturalistic-vs-invariance "attenuation" comparison for the
-  two directional/delta analyses. Pooled single-text and pairwise rankings
-  are still computed but clearly labelled **diagnostic only**. Writes CSVs
-  to `results/context_analysis/`.
+  "changed") — both compared across `evaluation_regime` with a descriptive
+  naturalistic-vs-invariance "attenuation" label. **Secondary**: a tie-aware
+  single-text ranking's agreement with the researcher reference (Kendall
+  tau-b primary statistic, tie-aware Spearman secondary statistic,
+  concordant/discordant/model_tied counts — never an artificial tie-break),
+  and a direct pairwise-choices-vs-researcher-judgments comparison — both
+  personalized/exploratory, not evidence of an objectively "best" context.
+  Every analysis is stratified by `evaluation_regime`
+  (`naturalistic` / `text_only_invariance` are never pooled). Pooled
+  single-text and pairwise rankings are still computed but clearly labelled
+  **diagnostic only**. Writes CSVs to `results/context_analysis/`.
 - `results/context_raw.jsonl` — suggested results path for the benchmark
   (via `--results-file`); not committed, and never the same file as the
   pilot's `results/raw.jsonl`.
@@ -223,7 +244,7 @@ python3 analyze_context.py              # analyze results/context_raw.jsonl (low
                                          # both evaluation regimes present are stratified, never pooled)
 python3 analyze_context.py --sampling-regime provider_default_secondary  # analyze the other sampling regime explicitly
 
-# --- human reference ranking ---
+# --- researcher reference ranking (secondary benchmark) ---
 python3 human_ranking.py                # report + write data/human_reference.json once complete
 ```
 

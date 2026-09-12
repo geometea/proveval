@@ -24,10 +24,18 @@ worth testing next.
 
 ## Research question
 
-How does task-irrelevant context affect LLM judgments in subjective
-evaluations of prose, and can different model/context combinations better
-match a fixed human preference ranking? This decomposes into two related
-but distinct questions -- see "Two questions" below.
+How do external contextual cues change LLM evaluations of fixed prose, and
+how robust are those evaluations to contextual perturbation? This
+decomposes into two related but distinct questions -- see "Two questions"
+below: naturalistic context sensitivity, and text-only invariance.
+
+A single researcher's fixed ordinal preference ranking over the corpus
+provides a **secondary**, personalized reference point for asking whether
+model judgments -- and the shifts induced by context -- move toward or away
+from one person's preferences. It is not the organizing goal of this
+project: it is not ground truth, not a cardinal preference function, and
+not evidence that any one context or model is objectively "better" -- see
+"Researcher reference ranking" below for what it is and isn't.
 
 ## Two questions: naturalistic sensitivity vs. text-only invariance
 
@@ -83,7 +91,7 @@ prose_style, characterization, originality, overall_quality):
   something rather than being arbitrary precision. The point of the finer
   scale is more resolution than 5 integer bins -- **not** to eliminate ties;
   exact ties remain fully legitimate and are never broken artificially (see
-  "Rankings and human alignment" below). Every story also gets its own
+  "Primary and secondary empirical questions" below). Every story also gets its own
   explicit no-context `neutral` **baseline** trial
   (`context_packets.neutral_condition`), distinct from any of the v0.1
   pilot's own conditions. This neutral condition is a **reference point for
@@ -215,7 +223,7 @@ identities, for grouping a block regardless of display position) alongside
 position for that cell) and `context_a`/`context_b`, so analysis can always
 recover "which story got which context" and "which story was chosen"
 independent of the raw A/B letters -- see `analyze_context.choice_to_story_id`
-and "Four distinct questions" below.
+and "Primary and secondary empirical questions" below.
 
 `evaluation_regime` is a third, independent factor crossed with every block
 (baked into `block_id`/`trial_id` so the two regimes' cells never collide):
@@ -229,7 +237,7 @@ value on both sides), these trials are built to measure **causal context
 sensitivity** -- whether the display-position-corrected preference changes
 with context assignment -- not to produce a ranking "under" one context
 condition. A ranking pooled across every contrast/cell is a rough diagnostic
-at best (see "Rankings and human alignment" below); it is not a
+at best (see "Primary and secondary empirical questions" below); it is not a
 `context_single`-style per-condition result and must not be read as one.
 
 ### Optional same-context pairwise family (not run)
@@ -297,8 +305,8 @@ observations it excluded because they belonged to the other regime -- the
 two sampling regimes cannot be silently pooled by omission.
 `evaluation_regime`, in contrast, is never filtered this way -- it's the
 substantive variable under study, so the analysis stratifies by it and
-reports both values side by side instead (see "Four distinct questions"
-below).
+reports both values side by side instead (see "Primary and secondary
+empirical questions" below).
 
 ## Replication
 
@@ -321,17 +329,39 @@ or a rating's typical spread, not to treat one API call as the model's
 fixed, deterministic answer. Final replication counts are a decision to
 make when choosing what to actually run, not fixed by this document.
 
-## Human reference ranking
+## Researcher reference ranking (secondary, ordinal, personalized)
 
-A fixed human preference ranking of the 12-text corpus, derived from human
-pairwise judgments (`data/human_pairwise.jsonl`), not invented or estimated.
-`human_ranking.py` checks the judgments for cycles/contradictions and
-computes a full ranking only when the judgments collected so far uniquely
-determine one (via topological sort, requiring the "next" story to be
-unambiguous at every step). This was meant to let just enough adaptive
-pairwise comparisons be collected to pin down a full order, rather than
-requiring all C(12,2) = 66 pairs, and in the end 31 judgments were needed and
-collected.
+A fixed **single-researcher ordinal reference ranking** of the 12-text
+corpus, derived from one researcher's pairwise judgments
+(`data/human_pairwise.jsonl`), not invented or estimated. `human_ranking.py`
+checks the judgments for cycles/contradictions and computes a full ranking
+only when the judgments collected so far uniquely determine one (via
+topological sort, requiring the "next" story to be unambiguous at every
+step). This was meant to let just enough adaptive pairwise comparisons be
+collected to pin down a full order, rather than requiring all C(12,2) = 66
+pairs, and in the end 31 judgments were needed and collected.
+
+**What this is:** an ORDINAL relation only -- story A > story B > story C...
+-- reflecting one person's preferences over this specific 12-text corpus.
+**What this is not:** it does not say how much A is preferred to B, whether
+two adjacent stories are nearly tied, a cardinal utility or preference
+intensity, or a population-level human preference. It is not ground truth,
+and it is not the primary optimization target of this project -- see
+"Research question" above. It exists to support one **secondary** question:
+does a model's induced ordering, or its direct pairwise choices, agree with
+this particular researcher's ordering, and does that agreement become more
+or less robust as contextual framing changes -- not "which context wins"
+(see "Primary and secondary empirical questions" below).
+
+**A caution about searching across many conditions.** The benchmark spans
+many contexts, contrasts, models, evaluation regimes, and sampling regimes.
+Reporting whichever one happens to correlate most highly with this
+12-story, single-researcher reference is descriptive, not a strong
+scientific conclusion: searching over many conditions can produce an
+unusually high match by chance alone (a multiple-comparisons / winner's-curse
+effect), and this corpus is not a held-out generalization test. Any
+reference-agreement comparison in this project should be read as
+exploratory unless a specific comparison was prespecified.
 
 **Status: complete.** All 31 judgments in `data/human_pairwise.jsonl` are
 free of direct contradictions and cycles, and uniquely determine a full
@@ -345,27 +375,48 @@ ranking. `human_ranking.py` has written `data/human_reference.json`
 4. saturn           8. afterlife        12. qual_panic
 ```
 
-`analyze_context.py` picks this up automatically (see "Rankings and human
-alignment" below) -- no code change was needed for this, since it was
-already written to gracefully use the reference once it exists.
+`analyze_context.py` picks this up automatically (see "Primary and secondary
+empirical questions" below) -- no code change was needed for this, since it
+was already written to gracefully use the reference once it exists.
 
-## Four distinct questions, not one "ranking" analysis
+## Primary and secondary empirical questions
 
-`analyze_context.py` deliberately keeps four questions separate rather than
-collapsing them into a single ranking result. Every one of the four is
-additionally **stratified by `evaluation_regime`** throughout -- naturalistic
-and text_only_invariance observations are never pooled into one number, and
-each question's function also has a `compare_*_regimes` counterpart that
-reports the naturalistic value, the invariance value, and a purely
-descriptive attenuation label (`attenuated` / `unchanged` / `amplified` /
-`reversed`) side by side, with no new statistical model behind it:
+`analyze_context.py` is organized PRIMARY-first, SECONDARY-second, rather
+than collapsing everything into a single ranking result. Every analysis
+below is additionally **stratified by `evaluation_regime`** throughout --
+naturalistic and text_only_invariance observations are never pooled into
+one number, and each PRIMARY effect analysis also has a `compare_*_regimes`
+counterpart that reports the naturalistic value, the invariance value, and
+a purely descriptive attenuation label (`attenuated` / `unchanged` /
+`amplified` / `reversed`) side by side, with no new statistical model
+behind it:
 
-|            | A. Effect of context (this study's main question)              | B. Resemblance to the human reference |
+|            | PRIMARY: effect of context (this project's main question)   | SECONDARY: agreement with the researcher reference |
 |------------|-------------------------------------------------------------|----------------------------------------|
-| Single-text | Does context move the SAME story's score relative to its own neutral baseline? -- `analyze_treatment_vs_neutral` / `compare_single_text_regimes` | Does the (possibly tied) score ordering under one condition resemble the human ordering? -- `rank_from_single_text_by_condition` + Kendall tau-b / tie-aware Spearman |
-| Pairwise    | Does assigning context to a story change its probability of being preferred? -- `analyze_directional_pairwise_effects` / `compare_pairwise_regimes` | Do direct model pairwise choices resemble the human's direct pairwise judgments? -- `analyze_pairwise_vs_human_reference` |
+| Single-text | Does context move the SAME story's score relative to its own neutral baseline? -- `analyze_treatment_vs_neutral` / `compare_single_text_regimes` | Does the (possibly tied) score ordering under one condition agree with the researcher's ordering? -- `rank_from_single_text_by_condition` + Kendall tau-b / tie-aware Spearman |
+| Pairwise    | Does assigning context to a story change its probability of being preferred? -- `analyze_directional_pairwise_effects` / `compare_pairwise_regimes` | Do direct model pairwise choices agree with the researcher's direct pairwise judgments? -- `analyze_pairwise_vs_human_reference` |
 
-### Single-text A: treatment vs. neutral baseline
+Plus two more PRIMARY questions that cut across both rows: **C. text-only
+invariance** -- how much of either effect above survives when the model is
+explicitly told to judge only the prose (the `compare_*_regimes` attenuation
+columns are exactly this) -- and **D. stochastic robustness** -- how stable
+are judgments across repeated identical calls, and how do the effects above
+compare to that ordinary variation. D is supported by design (every
+replicate is kept as its own observation; see "Replication" above) but this
+codebase does not yet compute a dedicated effect-size-vs-replicate-variance
+statistic -- that's an honest current gap, not a claim of a finished
+analysis.
+
+**Two different "reference" concepts, kept distinct throughout:** the
+*no-context/neutral baseline* is this model's own answer without the
+contextual treatment, used only to measure within-story, within-model
+context-induced change (PRIMARY, row above). The *researcher reference
+ranking* is one person's fixed ordinal preference over the corpus, used
+only for the SECONDARY, personalized agreement analysis (column above).
+Neither is ground truth, and they answer different questions -- see
+"Researcher reference ranking" above for what the second one is and isn't.
+
+### PRIMARY, Single-text: context-sensitivity effect
 
 For every story and treatment condition:
 
@@ -388,9 +439,12 @@ replicates), and aggregated model x evaluation_regime x dimension x value
 delta_text_only_invariance with a descriptive attenuation label, for every
 (model, dimension, value, category) present under both regimes).
 
-### Single-text B: tie-aware ranking vs. the human reference
+### SECONDARY, Single-text: tie-aware ranking agreement with the researcher reference
 
-`rank_from_single_text_by_condition` builds one score dict per
+A personalized, exploratory comparison -- not the benchmark's primary
+question, and not evidence that any one condition is objectively "better"
+(see "Researcher reference ranking" and its multiple-comparisons caution
+above). `rank_from_single_text_by_condition` builds one score dict per
 `(model, dimension, value)` -- including the neutral baseline as its own
 condition -- and **never** breaks a tie via story ID, filename, insertion
 order, or any other arbitrary field: `tied_groups()` reports the actual tie
@@ -414,7 +468,17 @@ distinction the benchmark exists to measure (averaging can even wash out a
 real, opposite-signed effect into an apparent null -- see the offline
 verification in the implementation notes).
 
-### Pairwise A: directional context-sensitivity effect (PRIMARY)
+Since `human_comparison.csv` is already stratified by `evaluation_regime`,
+the more interesting reading of this table isn't "which condition scores
+highest against the researcher" but whether agreement for the same
+(model, dimension, value) holds up, strengthens, or weakens between the
+naturalistic and text_only_invariance rows -- i.e. whether contextual
+perturbation makes agreement with the researcher's ordering more or less
+robust. No dedicated attenuation column is pre-computed for this yet (unlike
+`compare_single_text_regimes` for the PRIMARY delta); it's a direct read of
+the existing rows.
+
+### PRIMARY, Pairwise: directional context effect
 
 For each `(model, contrast, story_1, story_2, category)`,
 `analyze_directional_pairwise_effects` estimates, pooling over the
@@ -446,14 +510,18 @@ and flipped" comparison, restricted to one fixed display position so it
 doesn't conflate position with context assignment. It preserves chosen
 story IDs but is not the primary result.
 
-### Pairwise B: direct comparison against human pairwise judgments
+### SECONDARY, Pairwise: direct agreement with the researcher's judgments
 
-`analyze_pairwise_vs_human_reference` never builds a derived ranking for
-this: for every `context_pairwise` observation whose two displayed stories
-exactly match a known judgment in `data/human_pairwise.jsonl`, it checks
+Another personalized, exploratory comparison, not a "which context wins"
+result. `analyze_pairwise_vs_human_reference` never builds a derived ranking
+for this: for every `context_pairwise` observation whose two displayed
+stories exactly match a judgment in `data/human_pairwise.jsonl`, it checks
 whether the model's `overall_quality` choice agrees (`concordant`),
 disagrees (`discordant`), or was a tie (`model_tied`) -- directly, in story
-identity, pair by pair.
+identity, pair by pair. As with the single-text case above, this table is
+stratified by `evaluation_regime`, so the interesting question is whether
+agreement holds up across the naturalistic/invariance split, not which
+single row has the highest concordant_rate.
 
 ### Diagnostics, clearly labelled, never the headline result
 
@@ -487,6 +555,23 @@ of these. "Sycophancy-adjacent" remains fine as a descriptive label for
 hypothesis text), but empirical output (analysis prints, CSVs) stays neutral
 ("context sensitivity" / "invariance effect") unless the specific design
 genuinely supports a stronger claim.
+
+For the researcher reference specifically, prefer:
+
+- "agreement with the researcher reference ordering" / "reference agreement"
+- "personalized ordinal benchmark" / "personalized-alignment analysis"
+- "robustness of agreement across contextual conditions"
+- "movement toward/away from the researcher reference"
+
+and avoid, except where explicitly marked descriptive/exploratory:
+
+- "human ground truth" / "true ranking"
+- "best context" / "optimal context" / "best model/context combination"
+
+A table or CSV that ranks conditions by correlation with the researcher
+reference is a descriptive listing, not a claim that the top-ranked
+condition is genuinely superior -- see the multiple-comparisons caution
+under "Researcher reference ranking" above.
 
 No v0.2 empirical result is claimed anywhere in this document or in the
 code's comments, since nothing has been run yet -- see "Status" above.
