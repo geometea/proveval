@@ -17,6 +17,14 @@ produced it (--sampling-regime; see run_trial.SAMPLING_REGIMES) so the
 primary low-variance regime and the secondary provider-default regime can
 never be silently pooled by analysis code -- v0.1 trial types are
 unaffected and never carry this field, regardless of the flag's default.
+
+--limit operates on complete experimental units, not raw trial rows: a
+context_pairwise 4-cell counterbalanced block (forward/flipped x
+A/B-position) is always selected or skipped as a whole, so a budget cap can
+never buy an orphan cell and leave the rest of its block unrun -- see
+group_trials_into_units/group_failed_candidates_into_units. Every other
+trial type's replicate logic (including the neutral-vs-treatment single-text
+counts from --replicates-treatment/--replicates-neutral) is unaffected.
 """
 
 import argparse
@@ -70,6 +78,39 @@ def resolve_replicate_counts(replicates, replicates_treatment, replicates_neutra
     return treatment, neutral
 
 
+def group_trials_into_units(trials):
+    """Group trials into selection units so a budget/--limit can't orphan a
+    pairwise counterbalance block.
+
+    context_pairwise cells carry a "block_id" shared by all 4 cells of one
+    story-pair/contrast/evaluation_regime/choice_mode block (see
+    context_contrasts.build_contrast_block). Cells sharing a block_id are
+    grouped into a single unit here, so shuffling and slicing to --limit
+    below operates on whole blocks, never on individual forward/flipped or
+    A/B-position cells -- a block is always selected or skipped as a whole.
+
+    Trials without a block_id (context_single, context_prompt, and every
+    v0.1 trial type) have no such grouping concern and are each their own
+    singleton unit, so --limit continues to mean exactly what it did before
+    for those trial types (a count of individual trials).
+
+    Returns a list of units (each unit a list of 1+ trials), in first-seen
+    order; the caller shuffles/slices this list, not the raw trials.
+    """
+    units = []
+    block_index = {}
+    for trial in trials:
+        block_id = trial.get("block_id")
+        if block_id is None:
+            units.append([trial])
+            continue
+        if block_id not in block_index:
+            block_index[block_id] = []
+            units.append(block_index[block_id])
+        block_index[block_id].append(trial)
+    return units
+
+
 def select_trials(trials, only_type, id_prefix, conditions, contrasts, evaluation_regimes, limit):
     """Filter by type, trial_id prefix, condition_id, contrast_id, and
     evaluation_regime (each if given), shuffle with a fixed seed, then cut
@@ -79,6 +120,13 @@ def select_trials(trials, only_type, id_prefix, conditions, contrasts, evaluatio
     contrast_id (context_pairwise/context_prompt), and evaluation_regime
     (all v0.2 context trial types) are read with .get() since not every
     trial type has all of these fields.
+
+    Shuffling and --limit operate on whole selection units (see
+    group_trials_into_units), not on raw trial rows: for context_pairwise,
+    a unit is a complete 4-cell block, so --limit counts blocks, never
+    individual cells, and can never leave a block partially selected. For
+    every other trial type, a unit is just that one trial, so --limit means
+    exactly what it always has.
     """
     if only_type:
         trials = [t for t in trials if t["type"] == only_type]
@@ -95,12 +143,12 @@ def select_trials(trials, only_type, id_prefix, conditions, contrasts, evaluatio
     if evaluation_regimes:
         trials = [t for t in trials if t.get("evaluation_regime") in evaluation_regimes]
 
-    trials = list(trials)
-    Random(RANDOM_SEED).shuffle(trials)
+    units = group_trials_into_units(list(trials))
+    Random(RANDOM_SEED).shuffle(units)
 
     if limit is not None:
-        trials = trials[:limit]
-    return trials
+        units = units[:limit]
+    return [trial for unit in units for trial in unit]
 
 
 def build_observations(trials, replicates_treatment, replicates_neutral):
@@ -187,7 +235,7 @@ def run_one(trial, replicate_id, model, attempt_id, results_file, sampling_regim
         return "error"
 
     response_text = api_result["response_text"]
-    parsed_response, validation_error = parse_and_validate(response_text, trial["type"])
+    parsed_response, validation_error = parse_and_validate(response_text, trial["type"], trial.get("choice_mode"))
 
     result = {
         "trial_id": trial["trial_id"],
@@ -211,11 +259,41 @@ def run_one(trial, replicate_id, model, attempt_id, results_file, sampling_regim
     return "invalid" if validation_error else "valid"
 
 
+def group_failed_candidates_into_units(candidates):
+    """Analogous to group_trials_into_units, but for (trial, replicate_id)
+    retry candidates.
+
+    Cells of the same context_pairwise block AND the same replicate_id are
+    grouped into one unit, so a --limit-bounded retry can't retry some
+    failed cells of a block+replicate while leaving sibling failed cells of
+    that same block+replicate un-retried. Candidates without a block_id are
+    each their own singleton unit, unchanged from before.
+    """
+    units = []
+    block_index = {}
+    for trial, replicate_id in candidates:
+        block_id = trial.get("block_id")
+        if block_id is None:
+            units.append([(trial, replicate_id)])
+            continue
+        key = (block_id, replicate_id)
+        if key not in block_index:
+            block_index[key] = []
+            units.append(block_index[key])
+        block_index[key].append((trial, replicate_id))
+    return units
+
+
 def select_failed_observations(existing_results, trials_by_id, model, only_type, id_prefix, conditions, contrasts, evaluation_regimes, limit):
     """Find (trial, replicate_id) pairs that have failed attempts and no successful one.
 
     Only observations for the current model are considered, since a different
     model's failure can't be retried without also re-running everything else.
+
+    Shuffling and --limit operate on whole units (see
+    group_failed_candidates_into_units) so a retry batch can't orphan part
+    of a failed context_pairwise block+replicate the way raw-candidate
+    slicing could.
     """
     candidates = []
     for (trial_id, result_model, replicate_id), records in existing_results.items():
@@ -236,10 +314,11 @@ def select_failed_observations(existing_results, trials_by_id, model, only_type,
             continue
         candidates.append((trial, replicate_id))
 
-    Random(RANDOM_SEED).shuffle(candidates)
+    units = group_failed_candidates_into_units(candidates)
+    Random(RANDOM_SEED).shuffle(units)
     if limit is not None:
-        candidates = candidates[:limit]
-    return candidates
+        units = units[:limit]
+    return [candidate for unit in units for candidate in unit]
 
 
 def main():
@@ -289,7 +368,13 @@ def main():
         help="Only run trials with this evaluation_regime (repeatable; all v0.2 context trial types have one -- "
         "see context_trials.EVALUATION_REGIMES). Independent of --sampling-regime.",
     )
-    parser.add_argument("--limit", type=int, help="Only run the first N selected trials (for testing)")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Only run the first N selected units (for testing). A unit is one complete "
+        "4-cell context_pairwise block, or one trial for every other type -- see "
+        "group_trials_into_units; a block is never partially selected.",
+    )
     parser.add_argument(
         "--retry-failed",
         action="store_true",

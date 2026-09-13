@@ -26,10 +26,12 @@ def load_results(path):
     return results
 
 
-def reparse(result, trial_types):
+def reparse(result, trials_by_id):
     """Return a copy of result with parsed_response and validation_error updated."""
-    trial_type = trial_types[result["trial_id"]]
-    parsed_response, validation_error = parse_and_validate(result["response_text"], trial_type)
+    trial = trials_by_id[result["trial_id"]]
+    parsed_response, validation_error = parse_and_validate(
+        result["response_text"], trial["type"], trial.get("choice_mode")
+    )
     updated = dict(result)
     updated["parsed_response"] = parsed_response
     updated["validation_error"] = validation_error
@@ -38,12 +40,12 @@ def reparse(result, trial_types):
 
 def main():
     results = load_results(RESULTS_FILE)
-    trial_types = {trial["trial_id"]: trial["type"] for trial in load_trials(TRIALS_FILE)}
+    trials_by_id = {trial["trial_id"]: trial for trial in load_trials(TRIALS_FILE)}
 
     shutil.copyfile(RESULTS_FILE, BACKUP_FILE)
     print(f"Backed up {RESULTS_FILE} to {BACKUP_FILE}")
 
-    updated_results = [reparse(result, trial_types) for result in results]
+    updated_results = [reparse(result, trials_by_id) for result in results]
 
     with open(RESULTS_FILE, "w") as f:
         for result in updated_results:

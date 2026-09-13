@@ -145,12 +145,14 @@ This design went through three bug fixes before landing on its current shape:
 Through all of this, `story_1`/`story_2` are the pair's fixed identities,
 and every cell records both which story received which context value AND
 which story was displayed in which position — see
-`analyze_context.choice_to_story_id`, which maps a raw A/B/tie choice back
-to the actual story id so analysis operates in story identity, never raw
-A/B letters. This is the same swap logic as the self_vs_ai/ai_vs_self and
+`analyze_context.choice_to_story_id`, which maps a raw choice back to the
+actual story id so analysis operates in story identity, never raw A/B
+letters. This is the same swap logic as the self_vs_ai/ai_vs_self and
 ai_vs_journal/journal_vs_ai conditions already analyzed in `analyze.py`,
-generalized to the new dimensions, this A/B/tie prompt format, full position
-counterbalancing, and both evaluation regimes.
+generalized to the new dimensions, this pairwise prompt format (forced A/B
+for the primary task, A/B/tie for the secondary `choice_mode="tie_allowed"`
+diagnostic -- see `context_comparisons.py`), full position counterbalancing,
+and both evaluation regimes.
 
 ### Dependent dimensions can't be contrasted across two stories
 
@@ -217,8 +219,13 @@ required run, and no results exist for it.
   and validate all trial types' responses (`context_single` validates v0.2's
   own 1.0-10.0 decimal schema, separately from the v0.1 pilot's integer 1-5
   schema; `context_pairwise`/`context_prompt`/`context_pairwise_same`
-  validate the A/B/tie schema above, normalizing "characterisation" to
-  "characterization"). `--results-file` keeps benchmark results out of the
+  dispatch on each trial's `choice_mode` -- `forced` validates A/B only,
+  `tie_allowed` validates A/B/tie -- normalizing "characterisation" to
+  "characterization" either way; a `choice_mode="forced"` response of "tie"
+  fails validation rather than being coerced into "A" or "B"). `--limit`
+  selects whole `context_pairwise` 4-cell blocks, never an orphan cell (see
+  `run_batch.group_trials_into_units`). `--results-file` keeps benchmark
+  results out of the
   pilot's `results/raw.jsonl`. `--model`, `--contrast`, `--sampling-regime`
   (recorded on every v0.2 result row; ignored and unrecorded for v0.1 trial
   types), `--evaluation-regime` (filter to `naturalistic` and/or

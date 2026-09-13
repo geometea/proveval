@@ -37,6 +37,26 @@ project: it is not ground truth, not a cardinal preference function, and
 not evidence that any one context or model is objectively "better" -- see
 "Researcher reference ranking" below for what it is and isn't.
 
+## What "model preference" means
+
+Every use of "preference," "prefers," or "preferred" in this document and in
+the analysis code is **behavioral**, not mentalistic: it refers to the
+distribution of observed choices under a specified model, prompt, context,
+evaluation regime, and sampling regime. It is not intended as a claim about
+an internal mental state, a hidden "true preference," or anything the model
+"really" thinks independent of how it was asked. Write results as "story X
+was preferred in 70% of repeated comparisons under condition Y," never as
+"the model's true preference is X" or "the model secretly prefers X."
+
+The neutral/no-context single-text condition is described as an
+**uncontextualized behavioral baseline**: the model's own rating of a story
+with no context attached, used only as a reference point for measuring
+within-story context-induced change. It is not described as the model's
+"underlying preference," "true preference," "unbiased preference," or
+"ground truth" -- a no-context prompt is still one specific prompt, not a
+window onto some context-free preference that exists independently of
+prompting.
+
 ## Two questions: naturalistic sensitivity vs. text-only invariance
 
 The benchmark asks two related but distinct questions, represented by an
@@ -56,6 +76,26 @@ is independent of every context manipulation and of `sampling_regime`
    text-only instruction is described as an **invariance effect** (or
    invariance failure), a materially stronger claim than a naturalistic
    effect.
+
+**Interpreting a difference between the two regimes.** If the invariance
+effect is much smaller than the naturalistic effect (e.g. +18pp under
+naturalistic framing vs. +3pp under the text-only instruction), describe
+this as "the explicit text-only instruction substantially attenuated the
+observed context effect" -- not as "the naturalistic model was biased," "the
+invariance prompt recovered the true preference," "the remaining 3pp is
+irreducible bias," or "the naturalistic effect was irrational." None of
+those follow from this design. In particular, the text-only instruction is
+itself an intervention, not a neutral window onto a context-free judgment:
+a model may infer from that instruction alone that it is being evaluated or
+tested, and alter its behavior for that reason, independent of whether it
+"really" would ignore context otherwise (a demand-characteristics /
+evaluation-awareness confound). A reduced effect under the invariance
+instruction shows the model is responsive to that instruction's wording; it
+is not proof that a latent, context-free preference has been recovered.
+This benchmark does not currently include a control condition that could
+separate genuine invariance from evaluation-awareness -- that remains an
+open methodological question, not something resolved by comparing the two
+regimes as they stand.
 
 The same contextual manipulations (all context families, all contrasts) are
 run under both regimes, so the same cue's effect can be compared directly
@@ -97,9 +137,27 @@ prose_style, characterization, originality, overall_quality):
   pilot's own conditions. This neutral condition is a **reference point for
   measuring context sensitivity, not a ground-truth score and not assumed
   unbiased** -- see "Treatment vs. neutral baseline" below.
-- **Pairwise multidimensional A/B/tie judgments** -- two different stories,
-  a per-dimension choice of "A", "B", or "tie" (`context_comparisons.py`,
-  `context_pairwise`/`context_prompt` trials in `context_trials.py`).
+- **Pairwise multidimensional judgments** -- two different stories, a
+  per-dimension choice (`context_comparisons.py`, `context_pairwise`/
+  `context_prompt` trials in `context_trials.py`). A second, independent
+  `choice_mode` factor selects the response format:
+  - **`forced`** (PRIMARY): the choice must be exactly "A" or "B" -- "tie"
+    is not an allowed response, and a model that answers "tie" anyway fails
+    validation rather than being coerced into either letter
+    (`run_trial.validate_pairwise_context_response_forced`). This is the
+    main `context_pairwise`/`context_prompt` task and the one all directional
+    context-effect analysis is computed from.
+  - **`tie_allowed`** (SECONDARY, optional): the choice may be "A", "B", or
+    "tie" (`run_trial.validate_pairwise_context_response_tie_allowed`),
+    generated as its own separate trial family
+    (`context_trials.build_tie_allowed_pairwise_trials`, written to
+    `data/context_trials_tie_allowed.jsonl`, not part of the required
+    manifest). This measures how often the model declines to state a strict
+    preference at all -- a hedging/indifference diagnostic -- and whether
+    context shifts that tendency, reported as "tie rate" or "hedging rate,"
+    never as "uncertainty" in a strong psychological sense. `choice_mode` is
+    recorded as explicit trial/result metadata; the two modes are never
+    pooled by any analysis (`analyze_context.is_forced_choice_pairwise`).
 
 Both formats exist in two `evaluation_regime` variants (`data/context_tasks.jsonl`
 for single-text, `context_comparisons.INSTRUCTION_TEMPLATES` for pairwise),
@@ -239,6 +297,63 @@ with context assignment -- not to produce a ranking "under" one context
 condition. A ranking pooled across every contrast/cell is a rough diagnostic
 at best (see "Primary and secondary empirical questions" below); it is not a
 `context_single`-style per-condition result and must not be read as one.
+
+### Position effect, context x position interaction, and the raw cells
+
+The primary directional pairwise estimate
+(`analyze_context.analyze_directional_pairwise_effects`) pools over display
+position on purpose, to isolate a context-assignment effect from story
+identity. That pooling means a large or context-dependent *position* effect
+could otherwise go unreported, so three additional, purely descriptive
+analyses expose what the pooled estimate cannot, all derived from the same
+four raw cells (`analyze_context.analyze_pairwise_cell_rates`, one row per
+block with all four cells' `story_1_wins`/`story_2_wins`/`n` -- the aggregate
+CSVs are never the only way to see a block's results):
+
+- **Position effect** (`analyze_context.analyze_position_and_interaction_effects`):
+  P(story_1 chosen | displayed as A) - P(story_1 chosen | displayed as B),
+  pooling over context assignment -- plus the same effect computed
+  separately under `forward` and under `flipped` assignment.
+- **Context x position interaction diagnostic**: the context effect computed
+  separately for each display position (story_1 shown as A vs. as B), and
+  their difference. This exists specifically so a pooled context effect can
+  never hide a case where the effect only appears (or reverses) at one
+  display position.
+
+None of this is a new inferential/hierarchical model -- it is a descriptive
+decomposition of one 2x2 (assignment x position) table per block, reported
+alongside the pooled estimate, not instead of it.
+
+### Non-independence of story pairs; per-story and leave-one-out diagnostics
+
+The corpus has 12 stories, so the 66 unordered story pairs used by
+`context_pairwise` are **not 66 independent samples from a population of
+prose**: every story appears in 11 of the 66 pairs, so one unusually
+context-sensitive story can make an effect look "repeated across many
+pairs" when it is really one story's behavior showing up 11 times. This
+benchmark does not attempt a formal correction for that dependence (no
+mixed-effects or dyadic-cluster model is introduced) -- instead, two
+lightweight, purely descriptive diagnostics preserve the underlying
+heterogeneity instead of collapsing it into a single mean:
+
+- **Per-story context-effect summary**
+  (`analyze_context.analyze_per_story_context_effects`): for each story,
+  every per-pair effect against each of its 11 opponents, plus a mean/min/
+  max/range across them. This distinguishes "this context family generally
+  helps whichever story holds it" from "one specific story reacts unusually
+  across most or all of its opponents."
+- **Leave-one-story-out sensitivity**
+  (`analyze_context.analyze_leave_one_story_out`): the aggregate context
+  effect recomputed once excluding all pairs involving each story in turn.
+  A headline aggregate that collapses once a single story is excluded is
+  being carried by that one story, not by a general pattern; this is a
+  robustness/sensitivity check, not a formal correction for dependence.
+
+Any aggregate mean directional effect
+(`analyze_context.summarize_directional_effects_by_contrast`) is reported
+together with its range across story pairs, never as a bare mean --
+documentation and output should never imply that one aggregate number
+describes every story pair equally.
 
 ### Optional same-context pairwise family (not run)
 
@@ -416,6 +531,23 @@ only for the SECONDARY, personalized agreement analysis (column above).
 Neither is ground truth, and they answer different questions -- see
 "Researcher reference ranking" above for what the second one is and isn't.
 
+**Single-text and pairwise formats may legitimately disagree.** These are
+two genuinely different elicitation formats, not two measurements of one
+underlying quantity, so it is not automatically a bug if single-text ratings
+show little or no context effect while pairwise choices show a large one (or
+vice versa). Valid, non-error explanations include: numeric ratings compress
+onto a coarse 1.0-10.0 scale in a way a binary A/B choice does not; a
+pairwise trial makes the two contextual framings directly, relationally
+comparable in a way two separately-rated single texts are not; the two
+contrasted context values can interact with which specific opponent a story
+is paired against; and asking for one rating vs. asking for a relative
+comparison are simply different behavioral tasks. This design can establish
+a claim like "pairwise judgments were more context-sensitive than numerical
+ratings for this contrast" -- it cannot, from that pattern alone, establish
+that pairwise judgments "reveal the model's true underlying preference" more
+than single-text ratings do; no such latent-preference claim is licensed by
+either format (see "What 'model preference' means" above).
+
 ### PRIMARY, Single-text: context-sensitivity effect
 
 For every story and treatment condition:
@@ -505,10 +637,21 @@ attenuation label, for every (model, contrast, category) present under both
 regimes).
 
 A **secondary** diagnostic, `analyze_pairwise_changed_diagnostic`,
-reproduces the original "did the raw A/B/tie choice change between forward
-and flipped" comparison, restricted to one fixed display position so it
+reproduces the original "did the raw choice change between forward and
+flipped" comparison, restricted to one fixed display position so it
 doesn't conflate position with context assignment. It preserves chosen
 story IDs but is not the primary result.
+
+All of the above (and everything else described as a `context_pairwise`
+PRIMARY result) is restricted to `choice_mode="forced"` observations only
+(`analyze_context.is_forced_choice_pairwise`) -- see "Evaluation tasks"
+above for `choice_mode`. See "Position effect, context x position
+interaction, and the raw cells" and "Non-independence of story pairs; per-
+story and leave-one-out diagnostics" above for the additional descriptive
+analyses (`analyze_pairwise_cell_rates`, `analyze_position_and_interaction_effects`,
+`analyze_per_story_context_effects`, `analyze_leave_one_story_out`) that sit
+alongside this directional estimate, all derived from the same underlying
+observations and none replacing it.
 
 ### SECONDARY, Pairwise: direct agreement with the researcher's judgments
 
@@ -546,6 +689,16 @@ and this document:
   effect that survives the explicit `text_only_invariance` instruction. This
   is a materially stronger claim than a naturalistic effect and should never
   be used interchangeably with it.
+
+- **"model preference"** -- always behavioral: the distribution of observed
+  choices under a specified model/prompt/context/regime, never a claim about
+  a hidden mental state -- see "What 'model preference' means" above. The
+  no-context single-text condition is an **"uncontextualized behavioral
+  baseline,"** never an "underlying," "true," or "unbiased" preference.
+- **"tie rate"** / **"hedging rate"** / **"indifference diagnostic"** -- the
+  vocabulary for the `choice_mode="tie_allowed"` secondary diagnostic. Avoid
+  "uncertainty" in a strong psychological sense; this measures how often a
+  strict preference is declined, not a claim about the model's confidence.
 
 Do **not** automatically use "bias," "sycophancy," or "irrationality" for
 every observed context effect -- see "Context families by normative status"
@@ -587,6 +740,16 @@ budget on via `--type`, `--contrast`, `--condition`, `--id-prefix`,
 (`--trials-file`)/results file (`--results-file`) pair. Which
 contrasts/models/subsets are worth running is a decision made before
 spending money, not something this design presumes in advance.
+
+`--limit` operates on complete experimental units, never on raw trial rows:
+a `context_pairwise` 4-cell counterbalanced block is always selected or
+skipped as a whole (`run_batch.group_trials_into_units`/
+`group_failed_candidates_into_units`), so a budget cap can never buy an
+orphan forward/flipped or A/B-position cell and leave the rest of that
+block un-run. Every other trial type's unit is just that one trial, so
+`--limit` means exactly what it always has for those. Single-text
+neutral-vs-treatment replicate logic (`--replicates-treatment`/
+`--replicates-neutral`) is entirely separate and unaffected by this.
 
 ## Pilot data stays exploratory
 

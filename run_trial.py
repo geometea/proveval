@@ -187,7 +187,20 @@ def validate_comparison_response(parsed):
 # but standardize on "characterization" (matching RATING_FIELDS) for anything
 # we actually store, so downstream analysis never has to handle both.
 AB_TIE_FIELDS = ["plot_structure", "prose_style", "characterization", "originality", "overall_quality"]
-AB_TIE_VALUES = {"A", "B", "tie"}
+
+# PRIMARY forced-choice schema: "tie" is not an allowed value. A model that
+# answers "tie" on a forced-choice trial fails validation -- it is never
+# silently coerced into "A" or "B" (see validate_pairwise_context_response_forced).
+FORCED_CHOICE_VALUES = {"A", "B"}
+
+# SECONDARY tie-allowed schema, used only for the hedging/indifference
+# diagnostic (choice_mode="tie_allowed", see context_comparisons.py and
+# context_trials.build_tie_allowed_pairwise_trials). Never used for the
+# primary context_pairwise task.
+TIE_ALLOWED_VALUES = {"A", "B", "tie"}
+
+# Kept for backward-compatible naming; equivalent to TIE_ALLOWED_VALUES.
+AB_TIE_VALUES = TIE_ALLOWED_VALUES
 
 
 def normalize_ab_tie_keys(parsed):
@@ -200,13 +213,7 @@ def normalize_ab_tie_keys(parsed):
     return normalized
 
 
-def validate_pairwise_context_response(parsed):
-    """Check a context_pairwise/context_prompt response: 5 fields, each "A"/"B"/"tie".
-
-    Normalizes "characterisation" -> "characterization" first (see
-    normalize_ab_tie_keys), so either spelling validates the same way.
-    Returns (normalized_parsed_or_None, error_or_None).
-    """
+def _validate_ab_tie_shape(parsed, allowed_values, allowed_values_label):
     parsed = normalize_ab_tie_keys(parsed)
     if not isinstance(parsed, dict) or set(parsed.keys()) != set(AB_TIE_FIELDS):
         return None, (
@@ -214,9 +221,43 @@ def validate_pairwise_context_response(parsed):
             "(or characterisation), originality, and overall_quality"
         )
     for field in AB_TIE_FIELDS:
-        if parsed[field] not in AB_TIE_VALUES:
-            return None, f"{field} must be exactly \"A\", \"B\", or \"tie\""
+        if parsed[field] not in allowed_values:
+            return None, f"{field} must be exactly {allowed_values_label}"
     return parsed, None
+
+
+def validate_pairwise_context_response_forced(parsed):
+    """Check a PRIMARY forced-choice context_pairwise/context_prompt response.
+
+    5 fields, each exactly "A" or "B" -- "tie" fails validation here rather
+    than being coerced into either letter (requirement: never silently treat
+    a declined choice as a real preference). Normalizes "characterisation"
+    -> "characterization" first (see normalize_ab_tie_keys). Returns
+    (normalized_parsed_or_None, error_or_None).
+    """
+    return _validate_ab_tie_shape(parsed, FORCED_CHOICE_VALUES, '"A" or "B"')
+
+
+def validate_pairwise_context_response_tie_allowed(parsed):
+    """Check a SECONDARY tie-allowed hedging-diagnostic response.
+
+    5 fields, each "A"/"B"/"tie". Used only for choice_mode="tie_allowed"
+    trials (context_trials.build_tie_allowed_pairwise_trials) and for the
+    legacy "context_pairwise_same" optional family. Returns
+    (normalized_parsed_or_None, error_or_None).
+    """
+    return _validate_ab_tie_shape(parsed, TIE_ALLOWED_VALUES, '"A", "B", or "tie"')
+
+
+def validate_pairwise_context_response(parsed):
+    """Backward-compatible alias for the tie-allowed validator.
+
+    Kept only so any external caller still importing this exact name keeps
+    working; new code should call validate_pairwise_context_response_forced
+    or validate_pairwise_context_response_tie_allowed explicitly instead of
+    relying on this name's behavior.
+    """
+    return validate_pairwise_context_response_tie_allowed(parsed)
 
 
 def strip_code_fence(text):
@@ -232,7 +273,7 @@ def strip_code_fence(text):
     return "\n".join(lines).strip()
 
 
-def parse_and_validate(response_text, trial_type):
+def parse_and_validate(response_text, trial_type, choice_mode=None):
     """Try to parse response_text as JSON and check it matches the expected shape.
 
     Returns (parsed_response, validation_error). On any failure, parsed_response
@@ -245,13 +286,21 @@ def parse_and_validate(response_text, trial_type):
       "context_single"  -> v0.2's own 1.0-10.0 decimal ratings (a distinct
         schema -- see validate_context_single_response)
       "context_pairwise" / "context_prompt" / "context_pairwise_same"
-        -> A/B/tie per category (new; parsed_response is normalized to use
-        "characterization"). "context_pairwise_same" is the OPTIONAL,
-        never-run same-context trial family (context_trials.py); it reuses
-        this schema since it uses the same A/B/tie prompt template.
+        -> dispatches again on choice_mode:
+          - choice_mode == "tie_allowed" -> A/B/tie per category (SECONDARY
+            hedging diagnostic; see validate_pairwise_context_response_tie_allowed)
+          - anything else (choice_mode == "forced", or missing/None) -> A/B
+            only per category (PRIMARY forced-choice task; see
+            validate_pairwise_context_response_forced). A response of "tie"
+            fails validation here rather than being coerced into "A" or "B".
+        "context_pairwise_same" is the OPTIONAL, never-run same-context
+        trial family (context_trials.py); it carries choice_mode="forced"
+        and is validated the same way as the primary task.
       anything else (e.g. "comparison", "comparison_control", and any future
         or unrecognized type) -> the original story_a/story_b/preference
-        schema, exactly as before this function grew a dispatch at all.
+        schema (v0.1's integer -2..2 "preference" field), exactly as before
+        this function grew a dispatch at all -- entirely separate from, and
+        unaffected by, the A/B/tie string schema above.
     """
     try:
         parsed = json.loads(strip_code_fence(response_text))
@@ -267,7 +316,9 @@ def parse_and_validate(response_text, trial_type):
         return (None, error) if error else (parsed, None)
 
     if trial_type in ("context_pairwise", "context_prompt", "context_pairwise_same"):
-        return validate_pairwise_context_response(parsed)
+        if choice_mode == "tie_allowed":
+            return validate_pairwise_context_response_tie_allowed(parsed)
+        return validate_pairwise_context_response_forced(parsed)
 
     error = validate_comparison_response(parsed)
     return (None, error) if error else (parsed, None)
@@ -341,7 +392,7 @@ def main():
 
     api_result = call_claude(trial["prompt"], model, sampling_params)
     response_text = api_result["response_text"]
-    parsed_response, validation_error = parse_and_validate(response_text, trial["type"])
+    parsed_response, validation_error = parse_and_validate(response_text, trial["type"], trial.get("choice_mode"))
 
     if validation_error:
         print(f"Warning: invalid response for {trial['trial_id']}: {validation_error}")

@@ -28,28 +28,54 @@ analysis (see FINAL_DESIGN.md's "Primary and secondary empirical questions"):
 
   PRIMARY -- context sensitivity and invariance:
     Single-text: does context move the score of the SAME story relative to
-      its own neutral no-context baseline?    -> analyze_treatment_vs_neutral
-    Pairwise: does assigning context to a story change its probability of
+      its own uncontextualized behavioral baseline (see FINAL_DESIGN.md's
+      "What 'model preference' means")?       -> analyze_treatment_vs_neutral
+    Pairwise (choice_mode="forced" ONLY -- see is_forced_choice_pairwise):
+      does assigning context to a story change its probability of
       being preferred?                        -> analyze_directional_pairwise_effects
+      Position effect / context x position interaction (a pooled context
+      effect must not hide a large or context-dependent position effect):
+                                                -> analyze_pairwise_cell_rates,
+                                                   analyze_position_and_interaction_effects
+      Heterogeneity across the 66 non-independent story pairs (12 stories,
+      11 pairs each -- see FINAL_DESIGN.md): per-story summaries and
+      leave-one-story-out sensitivity, never just a bare mean:
+                                                -> analyze_per_story_context_effects,
+                                                   analyze_leave_one_story_out
     Invariance: how much of either effect survives an explicit
       text-only-judge instruction?            -> compare_single_text_regimes /
                                                    compare_pairwise_regimes
-                                                   (evaluation_regime stratification)
+                                                   (evaluation_regime stratification;
+                                                   see FINAL_DESIGN.md's demand-
+                                                   characteristics caveat)
     Stochastic robustness: repeated identical cells are kept as separate
       observations throughout (never collapsed to a majority vote), so
       effect sizes above can be read against ordinary response variation --
       see collapse_attempts and "Replication" in FINAL_DESIGN.md.
 
+  SECONDARY, optional -- tie-allowed hedging/indifference diagnostic
+  (choice_mode="tie_allowed" ONLY, never pooled with the forced-choice
+  PRIMARY results above): how often does the model decline a strict
+  preference, and does context shift that rate? -> analyze_tie_allowed_diagnostic
+
   SECONDARY -- agreement with the researcher reference ordering (a
   single-researcher, ORDINAL-only, personalized preference ranking over the
   12-story corpus -- not population ground truth, not a cardinal utility,
   and not the organizing goal of this benchmark; see FINAL_DESIGN.md's
-  "Researcher reference ranking"):
+  "Researcher reference ranking"). This is never the headline result:
     Single-text: does the (possibly tied) score ordering under a condition
       agree with the researcher's ordering?   -> rank_from_single_text_by_condition
                                                   + Kendall tau-b / tie-aware Spearman
     Pairwise: do direct model pairwise choices agree with the researcher's
       direct pairwise judgments?              -> analyze_pairwise_vs_human_reference
+
+main() prints/writes all of the above in one fixed scientific order:
+stochasticity, single-text PRIMARY, pairwise PRIMARY (directional, then
+position/interaction, then heterogeneity, then leave-one-out), the
+naturalistic-vs-invariance comparison for both PRIMARY effects, the optional
+tie-allowed diagnostic, and finally the SECONDARY researcher-reference
+agreement -- reference-agreement is deliberately last and is never the
+headline output.
 
 The two PRIMARY effect analyses are additionally compared across
 evaluation_regime (compare_single_text_regimes / compare_pairwise_regimes)
@@ -403,10 +429,21 @@ def choice_to_story_id(obs, category):
     return None
 
 
+def is_forced_choice_pairwise(obs):
+    """True for a context_pairwise/context_prompt observation from the
+    PRIMARY forced-choice task. choice_mode defaults to "forced" for
+    observations that predate the field (there are none in this repo's own
+    data, but this keeps the check total) -- never for "tie_allowed", which
+    must always be excluded from every primary forced-choice analysis below
+    so the two choice modes are never silently pooled into one estimate.
+    """
+    return obs.get("choice_mode", "forced") == "forced"
+
+
 def index_pairwise_by_assignment_fixed_position(observations, position="story1_as_a"):
     index = {}
     for obs in observations.values():
-        if obs["type"] != "context_pairwise" or obs.get("position") != position:
+        if obs["type"] != "context_pairwise" or obs.get("position") != position or not is_forced_choice_pairwise(obs):
             continue
         key = (obs["model"], obs["evaluation_regime"], obs["story_1_id"], obs["story_2_id"], obs["contrast_id"], obs["replicate_id"])
         index.setdefault(key, {})[obs["assignment"]] = obs
@@ -506,7 +543,7 @@ def analyze_directional_pairwise_effects(observations):
     """
     tallies = defaultdict(lambda: {"story_1_preferred": 0, "story_2_preferred": 0, "tie": 0, "n": 0})
     for obs in observations.values():
-        if obs["type"] != "context_pairwise":
+        if obs["type"] != "context_pairwise" or not is_forced_choice_pairwise(obs):
             continue
         for category in RATING_FIELDS:
             chosen = choice_to_story_id(obs, category)
@@ -555,7 +592,14 @@ def analyze_directional_pairwise_effects(observations):
 def summarize_directional_effects_by_contrast(directional_rows):
     """Aggregate the per-story-pair directional effect across story pairs,
     per (model, evaluation_regime, contrast_id, category) -- the pairwise
-    analogue of the single-text model x dimension x value aggregate."""
+    analogue of the single-text model x dimension x value aggregate.
+
+    Reports heterogeneity alongside the mean (min/max/range across the
+    underlying per-pair effects), not the mean alone -- with only 12
+    stories/66 pairs, a single mean can obscure whether every pair actually
+    behaves similarly (see analyze_per_story_context_effects and
+    analyze_leave_one_story_out for finer-grained heterogeneity diagnostics).
+    """
     grouped = defaultdict(list)
     for row in directional_rows:
         if row["directional_effect_a_minus_b"] == "":
@@ -569,6 +613,9 @@ def summarize_directional_effects_by_contrast(directional_rows):
             "contrast_id": c,
             "category": cat,
             "mean_directional_effect": round(statistics.mean(effects), 3),
+            "min_directional_effect": round(min(effects), 3),
+            "max_directional_effect": round(max(effects), 3),
+            "range_directional_effect": round(max(effects) - min(effects), 3),
             "n_story_pairs": len(effects),
         }
         for (m, er, c, cat), effects in grouped.items()
@@ -587,7 +634,269 @@ def summarize_directional_pairwise_effects(rows, by_contrast_rows):
     for row in sorted(by_contrast_rows, key=lambda r: (r["model"], r["evaluation_regime"], r["contrast_id"], r["category"])):
         print(
             f"    {row['model']} | {row['evaluation_regime']} | {row['contrast_id']} | {row['category']}: "
-            f"mean_effect={row['mean_directional_effect']:+.3f} (n_story_pairs={row['n_story_pairs']})"
+            f"mean_effect={row['mean_directional_effect']:+.3f} "
+            f"range=[{row['min_directional_effect']:+.3f}, {row['max_directional_effect']:+.3f}] "
+            f"(n_story_pairs={row['n_story_pairs']})"
+        )
+
+
+def analyze_pairwise_cell_rates(observations):
+    """Expose the four raw counterbalanced cells separately, never collapsed
+    into the pooled directional estimate above.
+
+    For each (model, evaluation_regime, contrast_id, story_1_id, story_2_id,
+    category) block, reports story_1_wins/story_2_wins/n for each of the 4
+    cells (forward x story1_as_a, forward x story2_as_a, flipped x
+    story1_as_a, flipped x story2_as_a) -- "story2_as_a" means story_1 is
+    displayed as Story B. Restricted to forced-choice observations (see
+    is_forced_choice_pairwise), since ties make a "wins" count ambiguous.
+
+    This is the shared basis for both the raw four-cell-rates output (an
+    aggregate CSV is not the only way to see pairwise results) and the
+    position/context-x-position analyses below, which are derived from
+    exactly these four numbers per block.
+    """
+    tallies = defaultdict(lambda: {"story_1_preferred": 0, "story_2_preferred": 0, "n": 0})
+    for obs in observations.values():
+        if obs["type"] != "context_pairwise" or not is_forced_choice_pairwise(obs):
+            continue
+        for category in RATING_FIELDS:
+            chosen = choice_to_story_id(obs, category)
+            key = (
+                obs["model"], obs["evaluation_regime"], obs["contrast_id"],
+                obs["story_1_id"], obs["story_2_id"], category, obs["assignment"], obs["position"],
+            )
+            t = tallies[key]
+            t["n"] += 1
+            if chosen == obs["story_1_id"]:
+                t["story_1_preferred"] += 1
+            elif chosen == obs["story_2_id"]:
+                t["story_2_preferred"] += 1
+
+    by_block = defaultdict(dict)
+    for (model, evaluation_regime, contrast_id, s1, s2, category, assignment, position), t in tallies.items():
+        by_block[(model, evaluation_regime, contrast_id, s1, s2, category)][(assignment, position)] = t
+
+    cell_labels = [
+        ("forward", "story1_as_a"), ("forward", "story2_as_a"),
+        ("flipped", "story1_as_a"), ("flipped", "story2_as_a"),
+    ]
+    rows = []
+    for (model, evaluation_regime, contrast_id, s1, s2, category), cells in by_block.items():
+        if not all(label in cells for label in cell_labels):
+            continue  # incomplete block (e.g. a partial/failed run); skip rather than guess
+        row = {"model": model, "evaluation_regime": evaluation_regime, "contrast_id": contrast_id,
+               "story_1_id": s1, "story_2_id": s2, "category": category}
+        for assignment, position in cell_labels:
+            t = cells[(assignment, position)]
+            row[f"{assignment}_{position}_story_1_wins"] = t["story_1_preferred"]
+            row[f"{assignment}_{position}_story_2_wins"] = t["story_2_preferred"]
+            row[f"{assignment}_{position}_n"] = t["n"]
+        rows.append(row)
+    return rows
+
+
+def analyze_position_and_interaction_effects(cell_rows):
+    """Decompose the pooled directional context effect into a position
+    effect and a context x position interaction diagnostic, from the four
+    raw cells (analyze_pairwise_cell_rates) -- so a pooled context effect
+    can never silently hide a large or context-dependent position effect.
+
+    For each block, using p(cell) = story_1_wins / n:
+      - context_effect_at_position_a  = p(forward, story1_as_a) - p(flipped, story1_as_a)
+      - context_effect_at_position_b  = p(forward, story2_as_a) - p(flipped, story2_as_a)
+      - context_x_position_interaction = context_effect_at_position_a - context_effect_at_position_b
+      - position_effect_pooled = p(story_1 chosen | displayed as A) - p(story_1 chosen | displayed as B),
+          pooling story_1_wins/n across assignment within each position
+      - position_effect_under_forward  = p(forward, story1_as_a) - p(forward, story2_as_a)
+      - position_effect_under_flipped  = p(flipped, story1_as_a) - p(flipped, story2_as_a)
+
+    This is a descriptive decomposition of one 2x2 (assignment x position)
+    table per block, not a new inferential/hierarchical model.
+    """
+    rows = []
+    for row in cell_rows:
+        def p(assignment, position):
+            n = row[f"{assignment}_{position}_n"]
+            return row[f"{assignment}_{position}_story_1_wins"] / n if n else None
+
+        p_fwd_a, p_fwd_b = p("forward", "story1_as_a"), p("forward", "story2_as_a")
+        p_flp_a, p_flp_b = p("flipped", "story1_as_a"), p("flipped", "story2_as_a")
+        if None in (p_fwd_a, p_fwd_b, p_flp_a, p_flp_b):
+            continue
+
+        n_a = row["forward_story1_as_a_n"] + row["flipped_story1_as_a_n"]
+        n_b = row["forward_story2_as_a_n"] + row["flipped_story2_as_a_n"]
+        wins_a = row["forward_story1_as_a_story_1_wins"] + row["flipped_story1_as_a_story_1_wins"]
+        wins_b = row["forward_story2_as_a_story_1_wins"] + row["flipped_story2_as_a_story_1_wins"]
+        p_position_a = wins_a / n_a if n_a else None
+        p_position_b = wins_b / n_b if n_b else None
+
+        context_effect_at_a = p_fwd_a - p_flp_a
+        context_effect_at_b = p_fwd_b - p_flp_b
+        rows.append(
+            {
+                "model": row["model"],
+                "evaluation_regime": row["evaluation_regime"],
+                "contrast_id": row["contrast_id"],
+                "story_1_id": row["story_1_id"],
+                "story_2_id": row["story_2_id"],
+                "category": row["category"],
+                "context_effect_at_position_a": round(context_effect_at_a, 3),
+                "context_effect_at_position_b": round(context_effect_at_b, 3),
+                "context_x_position_interaction": round(context_effect_at_a - context_effect_at_b, 3),
+                "position_effect_pooled": round(p_position_a - p_position_b, 3) if None not in (p_position_a, p_position_b) else "",
+                "position_effect_under_forward": round(p_fwd_a - p_fwd_b, 3),
+                "position_effect_under_flipped": round(p_flp_a - p_flp_b, 3),
+            }
+        )
+    return rows
+
+
+def summarize_position_and_interaction_effects(rows):
+    print("\n=== PRIMARY: A/B display-position effect and context x position interaction ===")
+    print("(a pooled context effect can hide a large or context-dependent position effect; this decomposes")
+    print(" one 2x2 assignment x position table per block into both -- descriptive, not a new inferential model)")
+    if not rows:
+        print("  No complete 4-cell blocks found.")
+        return
+    print(f"  n={len(rows)} (model, evaluation_regime, contrast, story pair, category) blocks")
+    interactions = [r["context_x_position_interaction"] for r in rows]
+    positions = [r["position_effect_pooled"] for r in rows if r["position_effect_pooled"] != ""]
+    print(f"  context x position interaction: mean={statistics.mean(interactions):+.3f}  "
+          f"range=[{min(interactions):+.3f}, {max(interactions):+.3f}]")
+    if positions:
+        print(f"  position effect (pooled over assignment): mean={statistics.mean(positions):+.3f}  "
+              f"range=[{min(positions):+.3f}, {max(positions):+.3f}]")
+
+
+def analyze_per_story_context_effects(directional_rows):
+    """Per-story summary of the directional context effect across a story's
+    opponents, preserving every underlying per-pair value.
+
+    66 unordered story pairs are NOT 66 independent samples: each of the 12
+    stories appears in 11 of them, so one unusual story can create the
+    appearance of a repeated effect across many pairs. This reorganizes the
+    existing per-pair directional_effect_a_minus_b (analyze_directional_pairwise_effects)
+    by story identity so that question is directly answerable: does a
+    context value generally help whichever story holds it, or is one
+    specific story (e.g. it responds unusually across most/all of its 11
+    opponents) driving an apparently repeated effect? The per-pair effect is
+    identical from either story's point of view in a two-outcome forced
+    choice (holding value "a" either helps or doesn't, symmetrically for
+    whichever story holds it) -- so grouping by story here reveals whether
+    that "holding value a helps" pattern is uniform across a story's
+    opponents or concentrated/absent for a particular one.
+    """
+    grouped = defaultdict(list)
+    for row in directional_rows:
+        if row["directional_effect_a_minus_b"] == "":
+            continue
+        base_key = (row["model"], row["evaluation_regime"], row["contrast_id"], row["category"])
+        grouped[(*base_key, row["story_1_id"])].append((row["story_2_id"], row["directional_effect_a_minus_b"]))
+        grouped[(*base_key, row["story_2_id"])].append((row["story_1_id"], row["directional_effect_a_minus_b"]))
+
+    rows = []
+    for (model, evaluation_regime, contrast_id, category, story_id), pair_effects in grouped.items():
+        effects = [e for _, e in pair_effects]
+        rows.append(
+            {
+                "model": model,
+                "evaluation_regime": evaluation_regime,
+                "contrast_id": contrast_id,
+                "category": category,
+                "story_id": story_id,
+                "n_opponents": len(pair_effects),
+                "mean_effect": round(statistics.mean(effects), 3),
+                "min_effect": round(min(effects), 3),
+                "max_effect": round(max(effects), 3),
+                "range_effect": round(max(effects) - min(effects), 3),
+                "per_opponent_effects": "; ".join(f"{opp}={e:+.3f}" for opp, e in sorted(pair_effects)),
+            }
+        )
+    return rows
+
+
+def summarize_per_story_context_effects(rows):
+    print("\n=== Per-story context-effect summary (heterogeneity across a story's opponents) ===")
+    print("(66 pairs are not 66 independent units -- each of 12 stories appears in 11 pairs; this checks")
+    print(" whether the aggregate effect is uniform across stories or concentrated in one unusual story)")
+    if not rows:
+        print("  No per-story effects available.")
+        return
+    by_widest_range = sorted(rows, key=lambda r: -r["range_effect"])[:5]
+    print("  Widest within-story range across opponents (top 5, largest heterogeneity first):")
+    for row in by_widest_range:
+        print(
+            f"    {row['model']} | {row['evaluation_regime']} | {row['contrast_id']} | {row['category']} | "
+            f"{row['story_id']}: mean={row['mean_effect']:+.3f} range=[{row['min_effect']:+.3f}, {row['max_effect']:+.3f}] "
+            f"(n_opponents={row['n_opponents']})"
+        )
+
+
+def analyze_leave_one_story_out(directional_rows):
+    """Sensitivity/robustness diagnostic: recompute each aggregate context
+    effect after excluding every pair involving each story in turn.
+
+    Descriptive only -- NOT a formal correction for the non-independence of
+    story pairs (see analyze_per_story_context_effects docstring). Answers:
+    is the headline aggregate (mean directional effect across all pairs for
+    a model/evaluation_regime/contrast/category) carried largely by one
+    unusual story, or does it hold up under removing any single story?
+    """
+    grouped = defaultdict(list)
+    all_stories = defaultdict(set)
+    for row in directional_rows:
+        if row["directional_effect_a_minus_b"] == "":
+            continue
+        key = (row["model"], row["evaluation_regime"], row["contrast_id"], row["category"])
+        grouped[key].append(row)
+        all_stories[key].add(row["story_1_id"])
+        all_stories[key].add(row["story_2_id"])
+
+    rows = []
+    for key, pair_rows in grouped.items():
+        model, evaluation_regime, contrast_id, category = key
+        full_mean = statistics.mean(r["directional_effect_a_minus_b"] for r in pair_rows)
+        rows.append(
+            {
+                "model": model, "evaluation_regime": evaluation_regime, "contrast_id": contrast_id, "category": category,
+                "excluded_story_id": "(none -- full aggregate)",
+                "mean_directional_effect": round(full_mean, 3), "n_story_pairs": len(pair_rows),
+            }
+        )
+        for excluded in sorted(all_stories[key]):
+            remaining = [r for r in pair_rows if r["story_1_id"] != excluded and r["story_2_id"] != excluded]
+            if not remaining:
+                continue
+            rows.append(
+                {
+                    "model": model, "evaluation_regime": evaluation_regime, "contrast_id": contrast_id, "category": category,
+                    "excluded_story_id": excluded,
+                    "mean_directional_effect": round(statistics.mean(r["directional_effect_a_minus_b"] for r in remaining), 3),
+                    "n_story_pairs": len(remaining),
+                }
+            )
+    return rows
+
+
+def summarize_leave_one_story_out(rows):
+    print("\n=== Leave-one-story-out sensitivity (descriptive robustness check, not a formal correction) ===")
+    if not rows:
+        print("  No leave-one-story-out results available.")
+        return
+    by_key = defaultdict(dict)
+    for row in rows:
+        key = (row["model"], row["evaluation_regime"], row["contrast_id"], row["category"])
+        by_key[key][row["excluded_story_id"]] = row["mean_directional_effect"]
+    for key, by_excluded in sorted(by_key.items(), key=lambda kv: str(kv[0])):
+        full = by_excluded.get("(none -- full aggregate)")
+        loo_values = [v for k, v in by_excluded.items() if k != "(none -- full aggregate)"]
+        if full is None or not loo_values:
+            continue
+        print(
+            f"  {key[0]} | {key[1]} | {key[2]} | {key[3]}: full_aggregate={full:+.3f}  "
+            f"leave-one-out range=[{min(loo_values):+.3f}, {max(loo_values):+.3f}]"
         )
 
 
@@ -617,6 +926,76 @@ def compare_pairwise_regimes(directional_by_contrast_rows):
             }
         )
     return rows
+
+
+# ---------------------------------------------------------------------------
+# SECONDARY, optional hedging/indifference diagnostic: choice_mode="tie_allowed"
+# observations only (see context_trials.build_tie_allowed_pairwise_trials).
+# Never pooled with the PRIMARY forced-choice observations above -- this
+# section only ever reads obs with choice_mode == "tie_allowed", the primary
+# analyses above only ever read is_forced_choice_pairwise(obs). This
+# measures how often the model declines to state a strict preference, and
+# whether context shifts that tendency -- deliberately called "tie rate" /
+# "hedging rate", never "uncertainty" in a strong psychological sense.
+# ---------------------------------------------------------------------------
+
+def analyze_tie_allowed_diagnostic(observations):
+    """P(story_1 chosen) / P(story_2 chosen) / P(tie), in story identity, per
+    (model, evaluation_regime, contrast_id, story_1_id, story_2_id, category,
+    assignment) -- the tie-allowed analogue of analyze_pairwise_cell_rates,
+    but reporting rates (incl. tie) rather than forced win counts, since ties
+    are a real, informative outcome here rather than an excluded case.
+    """
+    tallies = defaultdict(lambda: {"story_1_preferred": 0, "story_2_preferred": 0, "tie": 0, "n": 0})
+    for obs in observations.values():
+        if obs["type"] != "context_pairwise" or obs.get("choice_mode") != "tie_allowed":
+            continue
+        for category in RATING_FIELDS:
+            chosen = choice_to_story_id(obs, category)
+            key = (obs["model"], obs["evaluation_regime"], obs["contrast_id"],
+                   obs["story_1_id"], obs["story_2_id"], category, obs["assignment"])
+            t = tallies[key]
+            t["n"] += 1
+            if chosen is None:
+                t["tie"] += 1
+            elif chosen == obs["story_1_id"]:
+                t["story_1_preferred"] += 1
+            else:
+                t["story_2_preferred"] += 1
+
+    rows = []
+    for (model, evaluation_regime, contrast_id, s1, s2, category, assignment), t in tallies.items():
+        n = t["n"]
+        rows.append(
+            {
+                "model": model, "evaluation_regime": evaluation_regime, "contrast_id": contrast_id,
+                "story_1_id": s1, "story_2_id": s2, "category": category, "assignment": assignment,
+                "p_story_1_chosen": round(t["story_1_preferred"] / n, 3) if n else "",
+                "p_story_2_chosen": round(t["story_2_preferred"] / n, 3) if n else "",
+                "p_tie": round(t["tie"] / n, 3) if n else "",
+                "n": n,
+            }
+        )
+    return rows
+
+
+def summarize_tie_allowed_diagnostic(rows):
+    print("\n=== SECONDARY, optional: tie-allowed hedging/indifference diagnostic ===")
+    print("(choice_mode=\"tie_allowed\" observations only, never pooled with the primary forced-choice results;")
+    print(" reports how often the model declines a strict preference, and whether context shifts that rate --")
+    print(" \"tie rate\"/\"hedging rate\", not a claim about a psychological state of uncertainty)")
+    if not rows:
+        print("  No tie-allowed observations found (this diagnostic is optional and not run by default).")
+        return
+    tie_rates = [r["p_tie"] for r in rows if r["p_tie"] != ""]
+    by_assignment = defaultdict(list)
+    for r in rows:
+        if r["p_tie"] != "":
+            by_assignment[r["assignment"]].append(r["p_tie"])
+    print(f"  n={len(rows)} (model, evaluation_regime, contrast, story pair, category, assignment) cells")
+    print(f"  Overall tie rate: mean={statistics.mean(tie_rates):.3f}  range=[{min(tie_rates):.3f}, {max(tie_rates):.3f}]")
+    for assignment, rates in sorted(by_assignment.items()):
+        print(f"    {assignment}: mean tie rate={statistics.mean(rates):.3f} (n={len(rates)})")
 
 
 # ---------------------------------------------------------------------------
@@ -712,7 +1091,7 @@ def analyze_pairwise_vs_human_reference(observations, human_pairs, category="ove
     tally = defaultdict(lambda: {"concordant": 0, "discordant": 0, "model_tied": 0})
 
     for obs in observations.values():
-        if obs["type"] != "context_pairwise":
+        if obs["type"] != "context_pairwise" or not is_forced_choice_pairwise(obs):
             continue
         pair_key = frozenset((obs["story_a_id"], obs["story_b_id"]))
         human_winner = human_winner_by_pair.get(pair_key)
@@ -886,10 +1265,16 @@ def compare_single_text_regimes(by_model_dim_value_rows):
     return rows
 
 
-def print_treatment_vs_neutral(by_model_dim_value_rows, regime_comparison_rows):
-    print("\n=== PRIMARY: single-text treatment vs NEUTRAL BASELINE deltas ===")
-    print("(neutral is a reference baseline for measuring context sensitivity, not a ground-truth score;")
-    print(" stratified by evaluation_regime -- naturalistic and text_only_invariance are never pooled)")
+def print_treatment_vs_neutral(by_model_dim_value_rows):
+    """PRIMARY single-text effect only. The naturalistic-vs-invariance
+    comparison for this effect is printed later, together with the pairwise
+    one -- see print_naturalistic_vs_invariance_comparison -- so both
+    regime comparisons appear at the same point in the output, per the
+    documented scientific ordering (see module docstring)."""
+    print("\n=== PRIMARY: single-text treatment vs an UNCONTEXTUALIZED BEHAVIORAL BASELINE ===")
+    print("(the neutral condition is this model's own no-context rating, a reference point for measuring")
+    print(" context-induced change -- not a ground-truth or 'true preference' score; stratified by")
+    print(" evaluation_regime -- naturalistic and text_only_invariance are never pooled)")
     if not by_model_dim_value_rows:
         print("  No context_single treatment observations with a matching neutral baseline found.")
         return
@@ -901,9 +1286,26 @@ def print_treatment_vs_neutral(by_model_dim_value_rows, regime_comparison_rows):
             f"    {row['model']} | {row['evaluation_regime']} | {row['dimension']}={row['value']}: "
             f"mean_delta={row['mean_delta']:+.3f} (n={row['n']})"
         )
-    if regime_comparison_rows:
-        print("\n  Naturalistic vs. text_only_invariance (descriptive attenuation, overall_quality only):")
-        for row in sorted(regime_comparison_rows, key=lambda r: (r["model"], r["dimension"], r["value"])):
+
+
+def print_naturalistic_vs_invariance_comparison(single_regime_comparison_rows, pairwise_regime_comparison_rows):
+    """Both PRIMARY effects' naturalistic-vs-invariance comparison, printed
+    together at one point in the output (see module docstring's ordering).
+    Purely descriptive attenuation labels, never a significance test --
+    see describe_attenuation and FINAL_DESIGN.md's demand-characteristics
+    caveat: a reduced invariance-regime effect shows the model responding to
+    that instruction's wording, not proof that a context-free preference was
+    recovered, since the instruction is itself an intervention the model may
+    react to simply by inferring it is being evaluated.
+    """
+    print("\n=== Naturalistic vs. text-only-invariance: does the effect survive an explicit judge-the-prose-only instruction? ===")
+    print("(descriptive attenuation labels only, not a significance test; a reduced or absent invariance effect")
+    print(" shows responsiveness to that instruction's wording, not proof that a context-free 'true preference'")
+    print(" was recovered -- the instruction is itself an intervention the model may react to just by inferring")
+    print(" it is being evaluated. See FINAL_DESIGN.md's demand-characteristics caveat.)")
+    if single_regime_comparison_rows:
+        print("\n  Single-text (overall_quality only):")
+        for row in sorted(single_regime_comparison_rows, key=lambda r: (r["model"], r["dimension"], r["value"])):
             if row["category"] != "overall_quality":
                 continue
             print(
@@ -911,6 +1313,16 @@ def print_treatment_vs_neutral(by_model_dim_value_rows, regime_comparison_rows):
                 f"naturalistic={row['delta_naturalistic']:+.3f}  invariance={row['delta_text_only_invariance']:+.3f}  "
                 f"({row['attenuation']})"
             )
+    if pairwise_regime_comparison_rows:
+        print("\n  Pairwise directional effect:")
+        for row in sorted(pairwise_regime_comparison_rows, key=lambda r: (r["model"], r["contrast_id"], r["category"])):
+            print(
+                f"    {row['model']} | {row['contrast_id']} | {row['category']}: "
+                f"naturalistic={row['effect_naturalistic']:+.3f}  invariance={row['effect_text_only_invariance']:+.3f}  "
+                f"({row['attenuation']})"
+            )
+    if not single_regime_comparison_rows and not pairwise_regime_comparison_rows:
+        print("  No (model, dimension/contrast, category) present under both evaluation regimes yet.")
 
 
 # ---------------------------------------------------------------------------
@@ -969,7 +1381,7 @@ def compute_pairwise_wins(observations):
     per-condition ranking."""
     records = defaultdict(lambda: defaultdict(lambda: {"wins": 0, "losses": 0, "ties": 0}))
     for obs in observations.values():
-        if obs["type"] != "context_pairwise":
+        if obs["type"] != "context_pairwise" or not is_forced_choice_pairwise(obs):
             continue
         key = (obs["model"], obs["evaluation_regime"])
         a, b = obs["story_a_id"], obs["story_b_id"]
@@ -1126,39 +1538,58 @@ def main():
     evaluation_regime_counts = count_by(observations.values(), lambda o: o.get("evaluation_regime", "n/a"))
     print(f"  Evaluation regimes present in this run (stratified below, never pooled): {evaluation_regime_counts}")
 
-    # --- Pairwise A: directional context-sensitivity effect (PRIMARY) + changed diagnostic (SECONDARY) ---
-    changed_rows = analyze_pairwise_changed_diagnostic(observations)
-    summarize_pairwise_changed_diagnostic(changed_rows)
+    # (1) Stochasticity / repeated-call behavior: every replicate of a cell is
+    # kept as its own observation, never collapsed to a majority vote (see
+    # collapse_attempts and "Replication" in FINAL_DESIGN.md) -- the "by
+    # replicate" breakdown above is exactly this; a dedicated effect-size-vs-
+    # replicate-variance statistic is an acknowledged gap, not computed here.
+    print("\n(1) Stochastic robustness: replicates are preserved as separate observations above, never")
+    print("    collapsed to a majority vote, so effects below can be read against ordinary response variation.")
 
+    # (2) PRIMARY, single-text: treatment vs. an uncontextualized behavioral baseline
+    delta_obs_rows = analyze_treatment_vs_neutral(observations)
+    delta_by_story_condition_rows = summarize_delta_by_story_condition(delta_obs_rows)
+    delta_by_model_dim_value_rows = summarize_delta_by_model_dimension_value(delta_obs_rows)
+    print_treatment_vs_neutral(delta_by_model_dim_value_rows)
+
+    # (3) PRIMARY, pairwise: directional context effect, plus its immediate
+    # SECONDARY raw-choice aside and the related context_prompt family
     directional_rows = analyze_directional_pairwise_effects(observations)
     directional_by_contrast_rows = summarize_directional_effects_by_contrast(directional_rows)
     summarize_directional_pairwise_effects(directional_rows, directional_by_contrast_rows)
 
-    pairwise_regime_comparison_rows = compare_pairwise_regimes(directional_by_contrast_rows)
-    if pairwise_regime_comparison_rows:
-        print("\n  Naturalistic vs. text_only_invariance (descriptive attenuation of the directional effect):")
-        for row in sorted(pairwise_regime_comparison_rows, key=lambda r: (r["model"], r["contrast_id"], r["category"])):
-            print(
-                f"    {row['model']} | {row['contrast_id']} | {row['category']}: "
-                f"naturalistic={row['effect_naturalistic']:+.3f}  invariance={row['effect_text_only_invariance']:+.3f}  "
-                f"({row['attenuation']})"
-            )
+    changed_rows = analyze_pairwise_changed_diagnostic(observations)
+    summarize_pairwise_changed_diagnostic(changed_rows)
 
-    # --- context_prompt: extraneous prompt-level sentence effect ---
     prompt_effect_rows = analyze_prompt_context_effects(observations)
     summarize_prompt_context_effects(prompt_effect_rows)
 
-    # --- SECONDARY: direct pairwise choices vs the researcher's judgments ---
+    # (4) A/B display-position effect and context x position interaction
+    cell_rows = analyze_pairwise_cell_rates(observations)
+    position_interaction_rows = analyze_position_and_interaction_effects(cell_rows)
+    summarize_position_and_interaction_effects(position_interaction_rows)
+
+    # (5) Heterogeneity across story pairs and stories (not 66 independent units)
+    per_story_rows = analyze_per_story_context_effects(directional_rows)
+    summarize_per_story_context_effects(per_story_rows)
+
+    # (6) Leave-one-story-out sensitivity (descriptive robustness check only)
+    leave_one_out_rows = analyze_leave_one_story_out(directional_rows)
+    summarize_leave_one_story_out(leave_one_out_rows)
+
+    # (7) Naturalistic vs. text-only-invariance comparison, both PRIMARY effects together
+    single_regime_comparison_rows = compare_single_text_regimes(delta_by_model_dim_value_rows)
+    pairwise_regime_comparison_rows = compare_pairwise_regimes(directional_by_contrast_rows)
+    print_naturalistic_vs_invariance_comparison(single_regime_comparison_rows, pairwise_regime_comparison_rows)
+
+    # (8) SECONDARY, optional: tie-allowed hedging/indifference diagnostic
+    tie_allowed_rows = analyze_tie_allowed_diagnostic(observations)
+    summarize_tie_allowed_diagnostic(tie_allowed_rows)
+
+    # (9) SECONDARY: direct pairwise choices vs the researcher's judgments
     human_pairs = load_human_pairwise()
     pairwise_vs_human_rows, pairwise_vs_human_summary_rows = analyze_pairwise_vs_human_reference(observations, human_pairs)
     summarize_pairwise_vs_human_reference(pairwise_vs_human_summary_rows)
-
-    # --- PRIMARY: single-text treatment vs neutral baseline deltas ---
-    delta_obs_rows = analyze_treatment_vs_neutral(observations)
-    delta_by_story_condition_rows = summarize_delta_by_story_condition(delta_obs_rows)
-    delta_by_model_dim_value_rows = summarize_delta_by_model_dimension_value(delta_obs_rows)
-    single_regime_comparison_rows = compare_single_text_regimes(delta_by_model_dim_value_rows)
-    print_treatment_vs_neutral(delta_by_model_dim_value_rows, single_regime_comparison_rows)
 
     # --- SECONDARY: tie-aware ranking agreement with the researcher reference
     # (per-condition is preferred over the pooled diagnostic further below) ---
@@ -1252,13 +1683,48 @@ def main():
     )
     write_csv(
         directional_by_contrast_rows,
-        ["model", "evaluation_regime", "contrast_id", "category", "mean_directional_effect", "n_story_pairs"],
+        ["model", "evaluation_regime", "contrast_id", "category", "mean_directional_effect",
+         "min_directional_effect", "max_directional_effect", "range_directional_effect", "n_story_pairs"],
         os.path.join(ANALYSIS_DIR, "pairwise_directional_effects_by_contrast.csv"),
     )
     write_csv(
         pairwise_regime_comparison_rows,
         ["model", "contrast_id", "category", "effect_naturalistic", "effect_text_only_invariance", "attenuation"],
         os.path.join(ANALYSIS_DIR, "pairwise_regime_comparison.csv"),
+    )
+    write_csv(
+        cell_rows,
+        ["model", "evaluation_regime", "contrast_id", "story_1_id", "story_2_id", "category",
+         "forward_story1_as_a_story_1_wins", "forward_story1_as_a_story_2_wins", "forward_story1_as_a_n",
+         "forward_story2_as_a_story_1_wins", "forward_story2_as_a_story_2_wins", "forward_story2_as_a_n",
+         "flipped_story1_as_a_story_1_wins", "flipped_story1_as_a_story_2_wins", "flipped_story1_as_a_n",
+         "flipped_story2_as_a_story_1_wins", "flipped_story2_as_a_story_2_wins", "flipped_story2_as_a_n"],
+        os.path.join(ANALYSIS_DIR, "pairwise_four_cell_rates.csv"),
+    )
+    write_csv(
+        position_interaction_rows,
+        ["model", "evaluation_regime", "contrast_id", "story_1_id", "story_2_id", "category",
+         "context_effect_at_position_a", "context_effect_at_position_b", "context_x_position_interaction",
+         "position_effect_pooled", "position_effect_under_forward", "position_effect_under_flipped"],
+        os.path.join(ANALYSIS_DIR, "pairwise_position_and_interaction_effects.csv"),
+    )
+    write_csv(
+        per_story_rows,
+        ["model", "evaluation_regime", "contrast_id", "category", "story_id", "n_opponents",
+         "mean_effect", "min_effect", "max_effect", "range_effect", "per_opponent_effects"],
+        os.path.join(ANALYSIS_DIR, "pairwise_per_story_context_effects.csv"),
+    )
+    write_csv(
+        leave_one_out_rows,
+        ["model", "evaluation_regime", "contrast_id", "category", "excluded_story_id",
+         "mean_directional_effect", "n_story_pairs"],
+        os.path.join(ANALYSIS_DIR, "pairwise_leave_one_story_out.csv"),
+    )
+    write_csv(
+        tie_allowed_rows,
+        ["model", "evaluation_regime", "contrast_id", "story_1_id", "story_2_id", "category", "assignment",
+         "p_story_1_chosen", "p_story_2_chosen", "p_tie", "n"],
+        os.path.join(ANALYSIS_DIR, "pairwise_tie_allowed_diagnostic.csv"),
     )
     write_csv(
         prompt_effect_rows,

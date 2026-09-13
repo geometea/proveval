@@ -12,3 +12,7 @@ data/context_trials.jsonl
 # OPTIONAL, never-run same-context pairwise family -- see context_trials.py's
 # build_context_pairwise_same_trials docstring and FINAL_DESIGN.md.
 data/context_trials_optional_same_context.jsonl
+# SECONDARY tie-allowed hedging diagnostic (choice_mode="tie_allowed") -- see
+# context_trials.py's TIE_ALLOWED_TRIALS_FILE docstring. Same regeneratable
+# build-artifact concern as data/context_trials.jsonl above.
+data/context_trials_tie_allowed.jsonl

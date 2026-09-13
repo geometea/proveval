@@ -115,9 +115,12 @@ See `EXPERIMENT.md` for the original v0.1 design write-up.
   paragraph, generates single-variable example conditions plus the explicit
   `neutral_condition()` no-context baseline.
 - `context_comparisons.py` — the natural "help me choose between these two
-  stories" A/B/tie prompt template (shared by the pairwise builders below).
-  Two variants, one per `evaluation_regime`, differing only in one added
-  evaluation-rule sentence for `text_only_invariance`.
+  stories" pairwise prompt template (shared by the pairwise builders below).
+  Two independent axes: `evaluation_regime` (differing only in one added
+  evaluation-rule sentence for `text_only_invariance`) and `choice_mode` --
+  `forced` (PRIMARY: A/B only, no tie) or `tie_allowed` (SECONDARY hedging
+  diagnostic: A/B/tie), each with its own JSON example and choice
+  instruction, so the prompt text itself never leaves the mode ambiguous.
 - `context_contrasts.py` — `build_contrast_block()` builds the full 4-cell
   counterbalanced block from `data/context_contrasts.jsonl` for a story
   pair: context assignment (which story gets which value) crossed with
@@ -138,7 +141,12 @@ See `EXPERIMENT.md` for the original v0.1 design write-up.
   trials, naturalistic only, both stories sharing one claimed context value)
   to a separate gitignored file,
   `data/context_trials_optional_same_context.jsonl` — not part of the
-  required manifest or any planned run.
+  required manifest or any planned run. Additionally generates the
+  SECONDARY `choice_mode="tie_allowed"` hedging-diagnostic family (6864
+  trials, both regimes) to its own gitignored file,
+  `data/context_trials_tie_allowed.jsonl` — also not part of the required
+  manifest; running it is a separate decision from running the primary
+  forced-choice manifest.
 - `run_trial.py` / `run_batch.py` — accept `--trials-file`, `--results-file`,
   and `--model`, so the v0.1 pilot and v0.2 benchmark never share a results
   file by accident. `--sampling-regime` (`low_variance_primary` default, or
@@ -148,10 +156,15 @@ See `EXPERIMENT.md` for the original v0.1 design write-up.
   counts for treatment vs. the neutral baseline; neutral defaults to, and
   can never be configured below, the treatment count) and
   `--evaluation-regime` (filter to `naturalistic` and/or
-  `text_only_invariance`; repeatable). Response validation accepts the v0.2
-  1.0-10.0 decimal single-text schema, the A/B/tie pairwise-context schema,
-  and the original v0.1 integer 1-5 and story_a/story_b/preference schemas —
-  all fully backward compatible. `--dry-run` never calls the API in either
+  `text_only_invariance`; repeatable). `--limit` selects complete
+  experimental units, never orphaning a `context_pairwise` 4-cell block (see
+  `run_batch.group_trials_into_units`) — every other trial type's unit is
+  one trial, unchanged. Response validation accepts the v0.2 1.0-10.0
+  decimal single-text schema, the forced-choice (A/B only) and tie-allowed
+  (A/B/tie) pairwise-context schemas — dispatched by each trial's
+  `choice_mode`, never coercing a tie into a forced A/B answer — and the
+  original v0.1 integer 1-5 and story_a/story_b/preference schemas — all
+  fully backward compatible. `--dry-run` never calls the API in either
   script.
 - `data/human_pairwise.jsonl` — one researcher's pairwise judgments (winner,
   loser); 31 judgments, all actually made (never invented). This is the raw

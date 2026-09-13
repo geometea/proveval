@@ -110,7 +110,7 @@ def intro_sentence(first_clause, second_clause):
     )
 
 
-def build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regime):
+def build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regime, choice_mode="forced"):
     """Build the full 4-cell counterbalanced block for one contrast, across two
     different stories: story_1 and story_2 are the pair's fixed identities,
     crossed with BOTH of:
@@ -127,6 +127,14 @@ def build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regi
     changes the contextual framing/intro sentence itself, so the same
     contextual manipulation can be compared under both regimes. It's baked
     into block_id/trial_id so the two regimes' cells never collide.
+
+    choice_mode ("forced" or "tie_allowed", see context_comparisons.py) is a
+    fourth, independent factor: "forced" is the PRIMARY task (every category
+    must be answered A or B); "tie_allowed" is a SECONDARY hedging
+    diagnostic that also permits "tie". It changes only the prompt's choice
+    instruction/JSON example, never the contextual framing, and is baked
+    into block_id/trial_id alongside evaluation_regime so the two choice
+    modes' cells never collide and are never silently pooled.
 
     Earlier versions of this function held position fixed (story_1 was
     always Story A) and only varied assignment. That isolates context
@@ -157,7 +165,7 @@ def build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regi
     text_1 = load_story(story_1["path"])
     text_2 = load_story(story_2["path"])
     pair_id = f"{story_1['id']}_vs_{story_2['id']}"
-    block_id = f"block__{contrast['id']}__{pair_id}__{evaluation_regime}"
+    block_id = f"block__{contrast['id']}__{pair_id}__{evaluation_regime}__{choice_mode}"
     a_clause, b_clause = contrast["a_clause"], contrast["b_clause"]
 
     # assignment -> (story_1's value/clause, story_2's value/clause)
@@ -187,10 +195,11 @@ def build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regi
                     "assignment": assignment,
                     "position": position,
                     "evaluation_regime": evaluation_regime,
+                    "choice_mode": choice_mode,
                     "context_a": {"value": value_a, "clause": clause_a},
                     "context_b": {"value": value_b, "clause": clause_b},
                     "intro": intro,
-                    "prompt": build_prompt(intro, text_a, text_b, evaluation_regime),
+                    "prompt": build_prompt(intro, text_a, text_b, evaluation_regime, choice_mode),
                 }
             )
     return cells

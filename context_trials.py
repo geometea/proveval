@@ -53,6 +53,17 @@ CONTEXT_TRIALS_FILE = "data/context_trials.jsonl"
 # "Optional same-context pairwise family" in FINAL_DESIGN.md.
 OPTIONAL_SAME_CONTEXT_TRIALS_FILE = "data/context_trials_optional_same_context.jsonl"
 
+# A separate, SECONDARY file: the tie-allowed hedging diagnostic (see
+# build_tie_allowed_pairwise_trials and context_comparisons.py's choice_mode
+# docs). This is not "never run" the way the same-context family is -- it's
+# a real secondary diagnostic that may be run alongside the primary
+# forced-choice manifest -- but it is kept out of CONTEXT_TRIALS_FILE so the
+# PRIMARY required manifest's trial count/composition doesn't change, and so
+# that nothing can accidentally pool forced and tie-allowed responses just by
+# reading "the" context trials file. run_batch.py must be pointed at this
+# file explicitly to run it.
+TIE_ALLOWED_TRIALS_FILE = "data/context_trials_tie_allowed.jsonl"
+
 # Used for context_prompt trials: story-level context is neutral (nothing
 # attributed to either story), so only the appended sentence varies.
 NEUTRAL_PAIRWISE_INTRO = "Hi! Can you give me some feedback on these two stories? I'm trying to make up my mind."
@@ -150,15 +161,35 @@ def build_context_single_trials(dimensions, items, evaluation_regime):
 # context_contrasts.build_contrast_block)
 # ---------------------------------------------------------------------------
 
-def build_context_pairwise_trials(dimensions, items, evaluation_regime):
+def build_context_pairwise_trials(dimensions, items, evaluation_regime, choice_mode="forced"):
+    """Build the PRIMARY forced-choice context_pairwise family by default.
+
+    choice_mode="forced" (the default) is the main experiment: every cell's
+    prompt requires an A/B answer, no tie. Passing choice_mode="tie_allowed"
+    builds the SECONDARY hedging-diagnostic family instead (see
+    build_tie_allowed_pairwise_trials, which is the only other caller) --
+    every emitted trial still carries an explicit "type": "context_pairwise"
+    plus a "choice_mode" field (from build_contrast_block), so the two
+    families are always distinguishable by metadata, never by trial_id
+    parsing alone.
+    """
     contrasts = load_contrasts()
     trials = []
 
     for story_1, story_2 in story_pairs(items):
         for contrast in contrasts:
-            for cell in build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regime):
+            for cell in build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regime, choice_mode):
                 trials.append({**cell, "type": "context_pairwise"})
     return trials
+
+
+def build_tie_allowed_pairwise_trials(dimensions, items, evaluation_regime):
+    """SECONDARY hedging diagnostic: same 4-cell design, but choice_mode="tie_allowed".
+
+    Written to its own file (TIE_ALLOWED_TRIALS_FILE), not merged into the
+    required CONTEXT_TRIALS_FILE manifest -- see that constant's docstring.
+    """
+    return build_context_pairwise_trials(dimensions, items, evaluation_regime, choice_mode="tie_allowed")
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +211,13 @@ def build_context_prompt_trials(dimensions, items, evaluation_regime):
             for value_id in (contrast["a"], contrast["b"]):
                 extra_sentence = dim["values"][value_id]
                 intro = f"{NEUTRAL_PAIRWISE_INTRO} {extra_sentence}".strip() if extra_sentence else NEUTRAL_PAIRWISE_INTRO
-                prompt = context_comparisons.build_prompt(intro, text_1, text_2, evaluation_regime)
+                # Forced-choice, same as context_pairwise: this family shares
+                # the identical A/B pairwise schema, so it is kept consistent
+                # with the primary task rather than left as a tie-allowing
+                # exception. choice_mode is recorded explicitly rather than
+                # left implicit in prompt wording -- see context_comparisons.py.
+                choice_mode = "forced"
+                prompt = context_comparisons.build_prompt(intro, text_1, text_2, evaluation_regime, choice_mode)
                 trials.append(
                     {
                         "trial_id": f"context_prompt__{contrast['id']}__{story_1['id']}_vs_{story_2['id']}__{value_id}__{evaluation_regime}",
@@ -192,6 +229,7 @@ def build_context_prompt_trials(dimensions, items, evaluation_regime):
                         "value": value_id,
                         "prompt_context_text": extra_sentence,
                         "evaluation_regime": evaluation_regime,
+                        "choice_mode": choice_mode,
                         "prompt": prompt,
                     }
                 )
@@ -251,7 +289,7 @@ def build_context_pairwise_same_trials(dimensions, items):
                     f"Hi! Can you give me some feedback on these two stories? "
                     f"{phrase} That's true of both of them. I'm trying to make up my mind."
                 )
-                prompt = context_comparisons.build_prompt(intro, text_1, text_2, "naturalistic")
+                prompt = context_comparisons.build_prompt(intro, text_1, text_2, "naturalistic", "forced")
                 trials.append(
                     {
                         "trial_id": f"context_pairwise_same__{dimension_id}__{value_id}__{story_1['id']}_vs_{story_2['id']}",
@@ -261,6 +299,7 @@ def build_context_pairwise_same_trials(dimensions, items):
                         "dimension": dimension_id,
                         "value": value_id,
                         "evaluation_regime": "naturalistic",
+                        "choice_mode": "forced",
                         "prompt": prompt,
                     }
                 )
@@ -306,6 +345,23 @@ def main():
     print(
         f"\nOptional (NOT part of the required manifest, NOT run): "
         f"{len(same_context_trials)} context_pairwise_same trials -> {OPTIONAL_SAME_CONTEXT_TRIALS_FILE}"
+    )
+
+    # SECONDARY hedging diagnostic, also a separate file from the required
+    # manifest -- see TIE_ALLOWED_TRIALS_FILE's docstring. Unlike the
+    # same-context family above, this one is a live secondary diagnostic
+    # (not "never run"), but running it is still a distinct decision from
+    # running the primary forced-choice manifest, so it is not folded into
+    # CONTEXT_TRIALS_FILE or all_trials.
+    tie_allowed_trials = []
+    for regime in EVALUATION_REGIMES:
+        tie_allowed_trials += build_tie_allowed_pairwise_trials(dimensions, items, regime)
+    with open(TIE_ALLOWED_TRIALS_FILE, "w") as f:
+        for trial in tie_allowed_trials:
+            f.write(json.dumps(trial) + "\n")
+    print(
+        f"\nSecondary diagnostic (NOT part of the required manifest, choice_mode=tie_allowed): "
+        f"{len(tie_allowed_trials)} context_pairwise trials -> {TIE_ALLOWED_TRIALS_FILE}"
     )
 
 
