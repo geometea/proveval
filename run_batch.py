@@ -17,6 +17,12 @@ produced it (--sampling-regime; see run_trial.SAMPLING_REGIMES) so the
 primary low-variance regime and the secondary provider-default regime can
 never be silently pooled by analysis code -- v0.1 trial types are
 unaffected and never carry this field, regardless of the flag's default.
+sampling_regime is also part of an observation's identity for the runner's
+own "already completed" / "already failed" bookkeeping (see
+load_existing_results/result_sampling_regime), matching
+analyze_context.collapse_attempts: a valid result under one sampling regime
+never causes the same trial/replicate to be skipped when subsequently run
+under the other regime into the same results file.
 
 --limit operates on complete experimental units, not raw trial rows: a
 context_pairwise 4-cell counterbalanced block (forward/flipped x
@@ -168,8 +174,29 @@ def build_observations(trials, replicates_treatment, replicates_neutral):
     return observations
 
 
+def result_sampling_regime(trial_type, sampling_regime):
+    """The sampling_regime value that will actually be recorded on a result
+    row for this trial type, given the --sampling-regime a run is using.
+
+    v0.1 trial types never record a sampling_regime at all (see
+    run_trial.resolve_sampling_params, which returns None for any type not
+    in CONTEXT_TRIAL_TYPES) -- their identity key's regime slot is always
+    None, regardless of what --sampling-regime was passed. Every v0.2
+    context trial type records exactly the regime it was run under.
+    """
+    return sampling_regime if trial_type in CONTEXT_TRIAL_TYPES else None
+
+
 def load_existing_results(path):
-    """Return {(trial_id, model, replicate_id): [existing result records]}.
+    """Return {(trial_id, model, replicate_id, sampling_regime): [existing result records]}.
+
+    sampling_regime is part of the identity key -- matching
+    analyze_context.collapse_attempts -- so a result recorded under
+    low_variance_primary is never mistaken for a completed observation of
+    the same trial/model/replicate under provider_default_secondary (or
+    vice versa). Without this, running the same trial under a second
+    sampling regime into the same results file would see the first
+    regime's valid result and skip the second regime's call entirely.
 
     A key can have more than one record if earlier attempts failed and were
     retried; failures are never deleted, only added to.
@@ -182,7 +209,7 @@ def load_existing_results(path):
             line = line.strip()
             if line:
                 result = json.loads(line)
-                key = (result["trial_id"], result["model"], result["replicate_id"])
+                key = (result["trial_id"], result["model"], result["replicate_id"], result.get("sampling_regime"))
                 existing.setdefault(key, []).append(result)
     return existing
 
@@ -284,11 +311,14 @@ def group_failed_candidates_into_units(candidates):
     return units
 
 
-def select_failed_observations(existing_results, trials_by_id, model, only_type, id_prefix, conditions, contrasts, evaluation_regimes, limit):
+def select_failed_observations(existing_results, trials_by_id, model, sampling_regime, only_type, id_prefix, conditions, contrasts, evaluation_regimes, limit):
     """Find (trial, replicate_id) pairs that have failed attempts and no successful one.
 
-    Only observations for the current model are considered, since a different
-    model's failure can't be retried without also re-running everything else.
+    Only observations for the current model AND the current --sampling-regime
+    are considered: a failure recorded under one sampling regime is never
+    retried as if it belonged to the other, since a retry re-runs the API
+    call under sampling_regime and would otherwise silently record a second
+    regime's result under what looks like the first regime's failed slot.
 
     Shuffling and --limit operate on whole units (see
     group_failed_candidates_into_units) so a retry batch can't orphan part
@@ -296,12 +326,14 @@ def select_failed_observations(existing_results, trials_by_id, model, only_type,
     slicing could.
     """
     candidates = []
-    for (trial_id, result_model, replicate_id), records in existing_results.items():
+    for (trial_id, result_model, replicate_id, result_regime), records in existing_results.items():
         if result_model != model or is_completed(records):
             continue
         trial = trials_by_id.get(trial_id)
         if trial is None:
             continue  # trial no longer exists in the trials file
+        if result_regime != result_sampling_regime(trial["type"], sampling_regime):
+            continue
         if only_type and trial["type"] != only_type:
             continue
         if id_prefix and not trial_id.startswith(id_prefix):
@@ -400,7 +432,8 @@ def main():
     if args.retry_failed:
         trials_by_id = {t["trial_id"]: t for t in load_trials(args.trials_file)}
         observations = select_failed_observations(
-            existing_results, trials_by_id, model, args.type, args.id_prefix, conditions, contrasts, evaluation_regimes, args.limit
+            existing_results, trials_by_id, model, args.sampling_regime,
+            args.type, args.id_prefix, conditions, contrasts, evaluation_regimes, args.limit
         )
     else:
         trials = load_trials(args.trials_file)
@@ -409,7 +442,7 @@ def main():
 
     total = len(observations)
     for i, (trial, replicate_id) in enumerate(observations, start=1):
-        key = (trial["trial_id"], model, replicate_id)
+        key = (trial["trial_id"], model, replicate_id, result_sampling_regime(trial["type"], args.sampling_regime))
         label = f"{i} / {total} — {trial['trial_id']} — replicate {replicate_id}"
         records = existing_results.get(key, [])
 

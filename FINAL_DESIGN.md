@@ -11,8 +11,11 @@ This project has three distinct stages. Do not confuse them:
 2. **Broader benchmark: currently being implemented.** This is what this
    document now describes. The trial-generation code, response validation,
    runner, and offline analysis all exist and are exercised with dry-runs and
-   synthetic fixtures (see `CONTEXT_PACKETS.md` for what's built vs. planned).
-   No benchmark API calls have been made under this design.
+   a persistent offline test suite (`tests/`, see the README's "Tests"
+   section -- `python3 -m pytest tests/`), rather than one-off synthetic
+   fixtures generated and discarded by hand (see `CONTEXT_PACKETS.md` for
+   what's built vs. planned). No benchmark API calls have been made under
+   this design.
 3. **Future API collection: not yet run.** Actually spending API budget on
    the benchmark below is a separate, deliberate step, gated on reviewing the
    generated trial manifest and choosing which contrasts/models/subsets are

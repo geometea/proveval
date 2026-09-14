@@ -210,6 +210,41 @@ See `EXPERIMENT.md` for the original v0.1 design write-up.
   bugs found and fixed while building it, and exactly what's wired up versus
   still planned.
 
+## Tests
+
+`tests/` is a persistent pytest suite (no synthetic fixtures are generated
+and deleted by hand anymore -- these run every time):
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest tests/          # ~80 tests, offline, no API calls, < 5s
+```
+
+- `test_run_trial_validation.py` — forced-choice vs. tie-allowed response
+  schemas; confirms the v0.1 pilot's own schemas are untouched.
+- `test_context_comparisons.py` — prompt-template correctness across the
+  (evaluation_regime × choice_mode) grid.
+- `test_context_contrasts.py` — the 4-cell counterbalanced block builder.
+- `test_run_batch.py` — block-level `--limit` selection (never orphans a
+  pairwise cell), replicate-count resolution, and a regression test for a
+  real bug: `sampling_regime` was missing from `run_batch.py`'s own
+  already-completed/already-failed bookkeeping, so a valid result recorded
+  under one sampling regime would silently block a subsequent run of the
+  same trial/replicate under the *other* regime into the same results file
+  (now fixed — see `result_sampling_regime`/`load_existing_results`).
+- `test_analyze_context.py` — tie-aware rank statistics, `collapse_attempts`
+  regime separation, the position-effect/context×position-interaction
+  decomposition, per-story heterogeneity + leave-one-story-out sensitivity,
+  the tie-allowed hedging diagnostic, and the single-vs-pairwise
+  disagreement case.
+- `test_manifest_generation.py` — integration-level checks against the real
+  `data/*.jsonl` files (manifest totals to exactly 7,680, trial IDs unique,
+  the tie-allowed family stays the same size but disjoint, the v0.1 pilot
+  stays pinned to its original 4 stories). No files are written; the
+  builder functions are called directly rather than `context_trials.main()`.
+
+Nothing here makes an API call or reads `ANTHROPIC_API_KEY`.
+
 ## Running things
 
 ```bash
