@@ -8,6 +8,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 
 TRIALS_FILE = "data/trials.jsonl"
 RESULTS_FILE = "results/raw.jsonl"
@@ -260,17 +261,28 @@ def validate_pairwise_context_response(parsed):
     return validate_pairwise_context_response_tie_allowed(parsed)
 
 
+_CODE_FENCE_OPEN = re.compile(r"^```[ \t]*[a-zA-Z0-9_+-]*[ \t]*\n?")
+
+
 def strip_code_fence(text):
-    """Remove a surrounding Markdown code fence (```json ... ``` or ``` ... ```), if present."""
+    """Remove a surrounding Markdown code fence (```json ... ``` or ``` ... ```), if present.
+
+    Handles the fence entirely on its own lines (the common case) AND a
+    fence collapsed onto a single line with no internal newline (e.g.
+    '```json{"a": 1}```') -- a line-based split used to drop the whole
+    first "line" as the opening fence, which silently discarded the entire
+    response when it was all on one line, turning a valid answer into a
+    JSON-decode failure.
+    """
     text = text.strip()
     if not text.startswith("```"):
         return text
 
-    lines = text.split("\n")
-    lines = lines[1:]  # drop the opening ``` or ```json line
-    if lines and lines[-1].strip() == "```":
-        lines = lines[:-1]
-    return "\n".join(lines).strip()
+    match = _CODE_FENCE_OPEN.match(text)
+    text = text[match.end():] if match else text[3:]
+    if text.rstrip().endswith("```"):
+        text = text.rstrip()[:-3]
+    return text.strip()
 
 
 def parse_and_validate(response_text, trial_type, choice_mode=None):

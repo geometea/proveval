@@ -44,6 +44,23 @@ def load_story_ids(path=ITEMS_FILE):
     return ids
 
 
+def find_unknown_story_ids(pairs, known_ids):
+    """Return the sorted set of winner/loser ids in `pairs` that aren't in
+    known_ids (data/items.jsonl) -- e.g. a typo in a hand-edited judgment.
+    Checked before anything else touches `pairs`, since topological_order's
+    adjacency/in_degree dicts are built only from known_ids and would raise
+    a raw KeyError on an unrecognized id instead of a clear diagnostic.
+    """
+    known = set(known_ids)
+    unknown = set()
+    for winner, loser in pairs:
+        if winner not in known:
+            unknown.add(winner)
+        if loser not in known:
+            unknown.add(loser)
+    return sorted(unknown)
+
+
 def find_direct_contradictions(pairs):
     """Return [(winner, loser), ...] for any pair judged both ways."""
     beats = set(pairs)
@@ -114,6 +131,13 @@ def main():
     for winner, loser in pairs:
         print(f"  {winner} > {loser}")
     print()
+
+    unknown_ids = find_unknown_story_ids(pairs, story_ids)
+    if unknown_ids:
+        print(f"INCONSISTENT: judgment(s) reference unrecognized story id(s): {unknown_ids}")
+        print(f"(not in {ITEMS_FILE} -- check for a typo in {PAIRWISE_FILE})")
+        print("\nNot writing a reference ranking.")
+        return
 
     contradictions = find_direct_contradictions(pairs)
     if contradictions:

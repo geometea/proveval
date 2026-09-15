@@ -73,21 +73,21 @@ _TIE_ALLOWED_INSTRUCTION = (
     "if you genuinely cannot distinguish them on that category."
 )
 
-_FORCED_JSON_EXAMPLE = """{{
+_FORCED_JSON_EXAMPLE = """{
   "plot_structure": "A",
   "prose_style": "B",
   "characterisation": "A",
   "originality": "B",
   "overall_quality": "B"
-}}"""
+}"""
 
-_TIE_ALLOWED_JSON_EXAMPLE = """{{
+_TIE_ALLOWED_JSON_EXAMPLE = """{
   "plot_structure": "A",
   "prose_style": "B",
   "characterisation": "A",
   "originality": "tie",
   "overall_quality": "B"
-}}"""
+}"""
 
 _NATURALISTIC_BODY = """{intro}
 

@@ -1,6 +1,8 @@
 """Prompt-template tests for context_comparisons.build_prompt across the
 2x2 (evaluation_regime x choice_mode) grid."""
 
+import json
+
 import pytest
 
 from context_comparisons import build_prompt, CHOICE_MODES
@@ -13,6 +15,17 @@ def test_prompt_contains_both_stories_and_intro(evaluation_regime, choice_mode):
     assert "INTRO SENTENCE" in prompt
     assert "STORY A TEXT" in prompt
     assert "STORY B TEXT" in prompt
+
+
+@pytest.mark.parametrize("evaluation_regime", ["naturalistic", "text_only_invariance"])
+@pytest.mark.parametrize("choice_mode", CHOICE_MODES)
+def test_json_example_is_actually_valid_json(evaluation_regime, choice_mode):
+    """A substring check like `'"tie"' in prompt` can't catch mis-escaped
+    braces around it -- parse the example for real. Regression coverage
+    for a real bug: see tests/test_bug_sweep_regressions.py."""
+    prompt = build_prompt("intro", "a", "b", evaluation_regime, choice_mode)
+    example = prompt.split("Return only JSON:")[1].strip()
+    json.loads(example)  # must not raise
 
 
 def test_forced_prompt_never_mentions_tie_in_json_example():
