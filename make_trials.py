@@ -27,8 +27,22 @@ PILOT_STORY_IDS = ["gilbert", "dunnest_smoke", "prophet", "santa"]
 
 
 def pilot_items(items):
-    """Filter a loaded items list down to the fixed v0.1 pilot subset."""
-    return [item for item in items if item["id"] in PILOT_STORY_IDS]
+    """Filter a loaded items list down to the fixed v0.1 pilot subset.
+
+    Raises if any PILOT_STORY_IDS entry has no match in `items` -- silently
+    returning fewer than 4 stories would produce a smaller-than-108 trial
+    set with no error, directly contradicting this module's stated purpose
+    of reproducing the exact same pilot set regardless of how many stories
+    data/items.jsonl registers later.
+    """
+    found = [item for item in items if item["id"] in PILOT_STORY_IDS]
+    missing = set(PILOT_STORY_IDS) - {item["id"] for item in found}
+    if missing:
+        raise ValueError(
+            f"pilot_items: {sorted(missing)} not found in the loaded items list -- "
+            f"the v0.1 pilot set can no longer be reproduced. Check data/items.jsonl."
+        )
+    return found
 
 
 def build_single_trials():
@@ -113,11 +127,17 @@ def build_comparison_control_trials():
 def main():
     trials = build_single_trials() + build_comparison_trials() + build_comparison_control_trials()
 
+    trial_ids = [t["trial_id"] for t in trials]
+    if len(trial_ids) != len(set(trial_ids)):
+        duplicates = sorted({tid for tid in trial_ids if trial_ids.count(tid) > 1})
+        raise ValueError(
+            f"Refusing to write {TRIALS_FILE}: duplicate trial_id(s) found: {duplicates}"
+        )
+
     with open(TRIALS_FILE, "w") as f:
         for trial in trials:
             f.write(json.dumps(trial) + "\n")
 
-    trial_ids = [t["trial_id"] for t in trials]
     num_single = sum(1 for t in trials if t["type"] == "single")
     num_comparison = sum(1 for t in trials if t["type"] == "comparison")
     num_comparison_control = sum(1 for t in trials if t["type"] == "comparison_control")

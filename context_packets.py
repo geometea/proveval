@@ -63,11 +63,27 @@ def value_text(dimensions, dimension_id, value_id, packet):
 
 
 def validate_packet(dimensions, packet):
-    """Check every dimension/value in the packet is real, and dependencies are met."""
+    """Check every dimension/value in the packet is real, and dependencies are met.
+
+    Also rejects any dimension whose scope isn't "story" -- render_packet
+    only ever walks DIMENSION_ORDER (story-scope dimensions), so a
+    prompt-scope dimension (e.g. prompt_context) sneaking into a packet
+    would otherwise pass this check cleanly and then be silently dropped
+    by render_packet's DIMENSION_ORDER-only loop, producing a
+    validated-looking packet whose rendered text is missing content.
+    Prompt-scope context is handled separately by context_trials.py, never
+    through a packet passed here.
+    """
     for dimension_id, value_id in packet.items():
         if dimension_id not in dimensions:
             raise ValueError(f"Unknown dimension: {dimension_id}")
         dim = dimensions[dimension_id]
+        if dim.get("scope") != "story":
+            raise ValueError(
+                f"{dimension_id!r} has scope {dim.get('scope')!r}, not 'story' -- "
+                f"render_packet only renders story-scope dimensions (see DIMENSION_ORDER); "
+                f"prompt-scope dimensions are handled separately by context_trials.py"
+            )
         if value_id not in dim["values"]:
             raise ValueError(f"Unknown value {value_id!r} for dimension {dimension_id!r}")
         depends_on = dim.get("depends_on")

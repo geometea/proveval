@@ -53,9 +53,20 @@ def load_items(path):
 
 
 def load_story(path):
-    """Read the story text from its .txt file."""
+    """Read the story text from its .txt file.
+
+    build_comparison_prompt wraps each story in a literal \"\"\" ... \"\"\"
+    delimiter, so a story containing that exact three-character sequence
+    would make the prompt look like it ends early to a model reading it --
+    checked here, at load time, rather than left as a silent formatting
+    hazard (see prompts.load_story for the identical check on the
+    single-story side).
+    """
     with open(path, "r") as f:
-        return f.read().strip()
+        text = f.read().strip()
+    if '"""' in text:
+        raise ValueError(f'{path} contains a literal \'"""\' sequence, which build_comparison_prompt uses as a delimiter')
+    return text
 
 
 def build_comparison_prompt(text_a, text_b, a_context, b_context):

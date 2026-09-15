@@ -23,9 +23,19 @@ def load_items(path):
 
 
 def load_story(path):
-    """Read the story text from its .txt file."""
+    """Read the story text from its .txt file.
+
+    build_prompt wraps the text in a literal \"\"\" ... \"\"\" delimiter, so a
+    story containing that exact three-character sequence would make the
+    prompt look like the story ends early to a model reading it, with the
+    remainder appearing after the closing delimiter -- checked here, at
+    load time, rather than left as a silent formatting hazard.
+    """
     with open(path, "r") as f:
-        return f.read().strip()
+        text = f.read().strip()
+    if '"""' in text:
+        raise ValueError(f'{path} contains a literal \'"""\' sequence, which build_prompt uses as a delimiter')
+    return text
 
 
 def build_prompt(text, context, instruction):
