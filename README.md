@@ -197,6 +197,20 @@ See `EXPERIMENT.md` for the original v0.1 design write-up.
   (`naturalistic` / `text_only_invariance` are never pooled). Pooled
   single-text and pairwise rankings are still computed but clearly labelled
   **diagnostic only**. Writes CSVs to `results/context_analysis/`.
+  `analyze_context.py` itself is a thin orchestrator (argument parsing, the
+  fixed print/CSV order, and the one function genuinely spanning both
+  PRIMARY effects) — the actual analysis logic lives in five focused
+  modules it imports from and re-exports, each independently readable:
+  `context_analysis_common.py` (shared constants), `context_analysis_io.py`
+  (loading/collapsing results, sampling_regime filtering, inventory),
+  `context_analysis_stats.py` (tie-aware rank statistics, the descriptive
+  attenuation label), `context_analysis_single_text.py` (PRIMARY
+  treatment-vs-baseline), `context_analysis_pairwise.py` (PRIMARY
+  directional effect, position/interaction/heterogeneity/leave-one-out, the
+  optional tie-allowed diagnostic, context_prompt), and
+  `context_analysis_reference.py` (SECONDARY researcher-reference
+  agreement). `import analyze_context as ac` still exposes every function
+  by its original name.
 - `results/context_raw.jsonl` — suggested results path for the benchmark
   (via `--results-file`); not committed, and never the same file as the
   pilot's `results/raw.jsonl`.
