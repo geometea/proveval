@@ -49,7 +49,10 @@ def collapse_attempts(raw_rows, trials_by_id):
     """Returns (observations, unresolved, absorbed_failed_attempts, missing_metadata)."""
     attempts_by_key = defaultdict(list)
     for row in raw_rows:
-        key = (row["trial_id"], row["model"], row["replicate_id"], row.get("sampling_regime"))
+        # replicate_id defaults to 1, matching attempt_number's own default
+        # just below: a row saved by run_trial.py's single-trial CLI carries
+        # no replicate_id at all, since replication is a run_batch.py concept.
+        key = (row["trial_id"], row["model"], row.get("replicate_id", 1), row.get("sampling_regime"))
         attempts_by_key[key].append(row)
 
     observations = {}
@@ -80,7 +83,10 @@ def collapse_attempts(raw_rows, trials_by_id):
             "sampling_regime": sampling_regime,
             "sampling_params": row.get("sampling_params"),
         }
-        absorbed_failed_attempts += len(attempts) - 1
+        # Only the failed attempts before the eventual success count as
+        # "absorbed" -- if more than one attempt for this key happened to
+        # succeed, the extra success must never be miscounted as a failure.
+        absorbed_failed_attempts += len(attempts) - len(successes)
 
     return observations, unresolved, absorbed_failed_attempts, missing_metadata
 

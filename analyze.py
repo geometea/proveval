@@ -2,10 +2,14 @@
 
 Run this file directly: python3 analyze.py
 
-Reads data/trials.jsonl and results/raw.jsonl, collapses retry attempts into
-one record per experimental observation, prints a dataset inventory and the
+Reads results/raw.jsonl, collapses retry attempts into one record per
+experimental observation, prints a dataset inventory and the
 provenance-swap / control analyses, and writes tidy derived tables to
 results/analysis/. No API calls are made and no input files are changed.
+
+Trial structure (story ids, condition, task) is recovered by parsing each
+result's trial_id (see parse_trial_id) rather than by joining against
+data/trials.jsonl -- this file never reads the trials manifest.
 """
 
 import csv
@@ -14,7 +18,6 @@ import os
 import statistics
 from collections import defaultdict
 
-TRIALS_FILE = "data/trials.jsonl"
 RESULTS_FILE = "results/raw.jsonl"
 ANALYSIS_DIR = "results/analysis"
 
@@ -103,7 +106,11 @@ def collapse_attempts(raw_rows):
     """
     attempts_by_key = defaultdict(list)
     for row in raw_rows:
-        key = (row["trial_id"], row["model"], row["replicate_id"])
+        # replicate_id defaults to 1, matching attempt_number's own default
+        # just below: a row saved by run_trial.py's single-trial CLI (see
+        # README.md's `python3 run_trial.py <trial_id>`) carries no
+        # replicate_id at all, since replication is a run_batch.py concept.
+        key = (row["trial_id"], row["model"], row.get("replicate_id", 1))
         attempts_by_key[key].append(row)
 
     observations = {}
@@ -115,7 +122,13 @@ def collapse_attempts(raw_rows):
         successes = [a for a in attempts if is_successful(a)]
         if successes:
             observations[key] = build_observation(key, successes[-1])
-            absorbed_failed_attempts += len(attempts) - 1
+            # Only the failed attempts before the eventual success count as
+            # "absorbed" -- if more than one attempt for this key happened
+            # to succeed (run_trial.py has no completed-check, unlike
+            # run_batch.py's is_completed guard, so re-running it can
+            # produce two successes for the same key), the extra success
+            # must never be miscounted as an absorbed failure.
+            absorbed_failed_attempts += len(attempts) - len(successes)
         else:
             unresolved[key] = attempts
 

@@ -27,15 +27,30 @@ def load_results(path):
 
 
 def reparse(result, trials_by_id):
-    """Return a copy of result with parsed_response and validation_error updated."""
-    trial = trials_by_id[result["trial_id"]]
+    """Return a copy of result with parsed_response and validation_error
+    updated, or an unchanged copy if there's nothing to reparse.
+
+    Two cases pass through unchanged rather than crashing the whole run:
+    - response_text is None (the API call itself failed -- there is no
+      text to re-parse; parse_and_validate would otherwise raise
+      AttributeError trying to strip() a None).
+    - trial_id has no match in the current trials manifest (e.g. after
+      regenerating data/trials.jsonl or data/context_trials.jsonl with a
+      different trial set) -- an unhandled KeyError here would otherwise
+      abort before any other row got reparsed.
+    """
+    if result.get("response_text") is None:
+        return dict(result), "no_response_text"
+    trial = trials_by_id.get(result["trial_id"])
+    if trial is None:
+        return dict(result), "unknown_trial_id"
     parsed_response, validation_error = parse_and_validate(
         result["response_text"], trial["type"], trial.get("choice_mode")
     )
     updated = dict(result)
     updated["parsed_response"] = parsed_response
     updated["validation_error"] = validation_error
-    return updated
+    return updated, "reparsed"
 
 
 def main():
@@ -45,7 +60,13 @@ def main():
     shutil.copyfile(RESULTS_FILE, BACKUP_FILE)
     print(f"Backed up {RESULTS_FILE} to {BACKUP_FILE}")
 
-    updated_results = [reparse(result, trials_by_id) for result in results]
+    updated_results = []
+    skip_counts = {"no_response_text": 0, "unknown_trial_id": 0}
+    for result in results:
+        updated, status = reparse(result, trials_by_id)
+        updated_results.append(updated)
+        if status != "reparsed":
+            skip_counts[status] += 1
 
     with open(RESULTS_FILE, "w") as f:
         for result in updated_results:
@@ -54,6 +75,10 @@ def main():
     num_valid = sum(1 for r in updated_results if r["validation_error"] is None)
     print(f"Reparsed {len(updated_results)} results.")
     print(f"Now valid: {num_valid} / {len(updated_results)}")
+    if skip_counts["no_response_text"]:
+        print(f"Skipped {skip_counts['no_response_text']} row(s) with no response_text (API call failures) -- left unchanged.")
+    if skip_counts["unknown_trial_id"]:
+        print(f"Skipped {skip_counts['unknown_trial_id']} row(s) whose trial_id is not in {TRIALS_FILE} -- left unchanged.")
 
 
 if __name__ == "__main__":
