@@ -161,7 +161,7 @@ def build_context_single_trials(dimensions, items, evaluation_regime):
 # context_contrasts.build_contrast_block)
 # ---------------------------------------------------------------------------
 
-def build_context_pairwise_trials(dimensions, items, evaluation_regime, choice_mode="forced"):
+def build_context_pairwise_trials(dimensions, items, evaluation_regime, choice_mode="forced", contrasts=None):
     """Build the PRIMARY forced-choice context_pairwise family by default.
 
     choice_mode="forced" (the default) is the main experiment: every cell's
@@ -172,8 +172,17 @@ def build_context_pairwise_trials(dimensions, items, evaluation_regime, choice_m
     plus a "choice_mode" field (from build_contrast_block), so the two
     families are always distinguishable by metadata, never by trial_id
     parsing alone.
+
+    contrasts defaults to the full data/context_contrasts.jsonl set (via
+    load_contrasts()) when omitted, so every existing caller's behavior is
+    unchanged. Passing an explicit list of contrast dicts (same schema --
+    see context_contrasts.load_contrasts) restricts generation to just
+    those contrasts, e.g. for a focused sub-experiment's own contrast file
+    (see llm_provenance_trials.py) -- dependency injection, not a second
+    trial-generation implementation.
     """
-    contrasts = load_contrasts()
+    if contrasts is None:
+        contrasts = load_contrasts()
     trials = []
 
     for story_1, story_2 in story_pairs(items):

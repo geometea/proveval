@@ -11,7 +11,8 @@ calls the builder functions directly instead of main()).
 
 import pytest
 
-from context_packets import load_dimensions
+from context_contrasts import load_contrasts
+from context_packets import DIMENSION_ORDER, load_dimensions
 from context_trials import (
     build_context_pairwise_trials,
     build_context_prompt_trials,
@@ -42,9 +43,39 @@ def all_required_trials(dims, items):
     return trials
 
 
-def test_required_manifest_totals_7680(dims, items):
+def expected_context_single_count(dims, items):
+    """Number of single-variable conditions is a function of how many
+    values each DIMENSION_ORDER dimension currently registers (see
+    context_packets.single_variable_conditions) -- computed here rather
+    than hardcoded, since adding a legitimate new dimension value (e.g. a
+    new named-model provenance label) is expected to grow this count, and
+    a hardcoded literal would make that an unrelated test failure instead
+    of the expected, calculable consequence it actually is.
+    """
+    n_conditions = sum(len(dims[d]["values"]) for d in DIMENSION_ORDER) + 1  # +1 neutral baseline
+    return len(items) * n_conditions * len(EVALUATION_REGIMES)
+
+
+def expected_context_pairwise_count(items):
+    n_pairs = len(items) * (len(items) - 1) // 2
+    return n_pairs * len(load_contrasts()) * 4 * len(EVALUATION_REGIMES)
+
+
+def test_required_manifest_context_single_count_matches_dimension_sizes(dims, items):
     trials = all_required_trials(dims, items)
-    assert len(trials) == 7680
+    single = [t for t in trials if t["type"] == "context_single"]
+    assert len(single) == expected_context_single_count(dims, items)
+
+
+def test_required_manifest_totals(dims, items):
+    """Total = context_single (a function of dimension sizes -- see above)
+    + context_pairwise (66 pairs x len(contrasts) x 4 cells x 2 regimes,
+    structurally unaffected by dimension-value counts) + context_prompt
+    (unaffected). Adding a new provenance value legitimately grows the
+    total via context_single alone."""
+    trials = all_required_trials(dims, items)
+    expected = expected_context_single_count(dims, items) + expected_context_pairwise_count(items) + 264
+    assert len(trials) == expected
 
 
 def test_required_manifest_trial_ids_are_globally_unique(dims, items):
@@ -56,16 +87,20 @@ def test_required_manifest_trial_ids_are_globally_unique(dims, items):
 def test_required_manifest_splits_evenly_by_evaluation_regime(dims, items):
     trials = all_required_trials(dims, items)
     counts = {regime: sum(1 for t in trials if t["evaluation_regime"] == regime) for regime in EVALUATION_REGIMES}
-    assert counts["naturalistic"] == counts["text_only_invariance"] == 3840
+    assert counts["naturalistic"] == counts["text_only_invariance"] == len(trials) // 2
 
 
 def test_required_manifest_pairwise_trials_are_all_forced_choice(dims, items):
-    """The required manifest must never silently include tie-allowed
-    trials -- that family lives only in the separate, optional
+    """The pairwise family's own structure (66 pairs x 13 contrasts x 4
+    cells x 2 regimes) is entirely unaffected by the provenance dimension
+    growing new values -- contrasts are explicit rows in
+    data/context_contrasts.jsonl, not derived from "all values of a
+    dimension". The required manifest must also never silently include
+    tie-allowed trials -- that family lives only in the separate, optional
     tie-allowed file (see test_tie_allowed_family_is_the_same_size_but_separate)."""
     trials = all_required_trials(dims, items)
     pairwise = [t for t in trials if t["type"] == "context_pairwise"]
-    assert len(pairwise) == 6864
+    assert len(pairwise) == expected_context_pairwise_count(items) == 6864
     assert all(t["choice_mode"] == "forced" for t in pairwise)
 
 

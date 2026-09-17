@@ -16,3 +16,10 @@ data/context_trials_optional_same_context.jsonl
 # context_trials.py's TIE_ALLOWED_TRIALS_FILE docstring. Same regeneratable
 # build-artifact concern as data/context_trials.jsonl above.
 data/context_trials_tie_allowed.jsonl
+# Standalone named-LLM provenance experiment manifest -- regenerate locally
+# with `python3 llm_provenance_trials.py`; same regeneratable build-artifact
+# concern as the other generated trial files above.
+data/llm_provenance_trials.jsonl
+# Results are never committed (see README.md) -- this project's own runs,
+# not a fixture.
+results/
