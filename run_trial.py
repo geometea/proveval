@@ -1,8 +1,16 @@
-"""Run exactly one trial from data/trials.jsonl through the Claude API.
+"""Run exactly one trial from data/trials.jsonl through a model provider.
 
 Usage:
-    python3 run_trial.py <trial_id>            # calls the API and saves the result
-    python3 run_trial.py <trial_id> --dry-run  # just prints what would be sent
+    python3 run_trial.py <trial_id>                                    # Anthropic, calls the API and saves the result
+    python3 run_trial.py <trial_id> --dry-run                          # just prints what would be sent
+    python3 run_trial.py <trial_id> --provider openai --model gpt-5.6  # any supported provider
+
+Provider execution goes through model_providers.call_model() (see that
+module for the provider table, default models, and reasoning profiles) --
+this file and run_batch.py never construct or parse a provider-native
+payload directly. Omitting --provider defaults to "anthropic" for
+backward compatibility with every command that predates multi-provider
+support.
 """
 
 import argparse
@@ -10,9 +18,12 @@ import json
 import os
 import re
 
+import model_providers
+
 TRIALS_FILE = "data/trials.jsonl"
 RESULTS_FILE = "results/raw.jsonl"
 DEFAULT_MODEL = "claude-sonnet-5"
+DEFAULT_PROVIDER = "anthropic"
 
 RATING_FIELDS = [
     "plot_structure",
@@ -85,48 +96,21 @@ DEFAULT_MAX_TOKENS = 4096
 PLAIN_AB_MAX_TOKENS = 64
 
 
-def max_tokens_for(response_format):
-    return PLAIN_AB_MAX_TOKENS if response_format == "plain_ab" else DEFAULT_MAX_TOKENS
+DEFAULT_MAX_TOKENS = 4096
 
 
-def call_claude(prompt, model, sampling_params=None, max_tokens=DEFAULT_MAX_TOKENS):
-    """Send the prompt as a single user message and return the reply text.
-
-    sampling_params (e.g. {"temperature": 0}) are passed through to the API
-    verbatim when truthy; None or {} (both mean "no override") send nothing
-    extra, so the v0.1 pilot's original call shape is unchanged when this is
-    omitted. max_tokens defaults to the original 4096 for every existing
-    trial type; see max_tokens_for/PLAIN_AB_MAX_TOKENS for the smaller cap
-    used by the plain A/B response format.
-    """
-    import anthropic  # imported here so --dry-run works without the package installed
-
-    client = anthropic.Anthropic(api_key=get_api_key())
-    create_kwargs = dict(
-        model=model,
-        max_tokens=max_tokens,  # required by the API; not a sampling parameter
-        messages=[{"role": "user", "content": prompt}],
-    )
-    if sampling_params:
-        create_kwargs.update(sampling_params)
-    response = client.messages.create(**create_kwargs)
-
-    text_blocks = [block.text for block in response.content if block.type == "text"]
-    if not text_blocks:
-        block_types = [block.type for block in response.content]
-        raise ValueError(f"No text blocks in response. Block types were: {block_types}")
-
-    return {
-        "response_text": "\n".join(text_blocks),
-        "stop_reason": response.stop_reason,
-        "input_tokens": response.usage.input_tokens,
-        "output_tokens": response.usage.output_tokens,
-        # The actual model version the API resolved the request to -- may
-        # differ from the requested alias (e.g. "claude-sonnet-5"). See
-        # trial/result field "response_model"; analysis must not silently
-        # pool different returned model versions together.
-        "response_model": getattr(response, "model", None),
-    }
+def max_tokens_for(provider, response_format):
+    """response_format="plain_ab" trials (see controllability_trials.
+    RESPONSE_FORMAT) only ever need a few tokens of output, so they use each
+    provider's own small default cap (model_providers.DEFAULT_MAX_OUTPUT_TOKENS
+    -- e.g. Gemini gets more headroom for internal thinking). Every other
+    (pre-existing) trial type predates multi-provider execution and was only
+    ever run against Anthropic with a 4096-token cap; that cap is kept
+    exactly as before regardless of --provider, so nothing already run
+    changes."""
+    if response_format == "plain_ab":
+        return model_providers.default_max_output_tokens(provider)
+    return DEFAULT_MAX_TOKENS
 
 
 def is_valid_ratings(ratings):
@@ -467,9 +451,20 @@ def save_result(result, results_file=RESULTS_FILE):
         f.write(json.dumps(result) + "\n")
 
 
-def resolve_model(cli_model):
-    """--model on the command line wins; otherwise ANTHROPIC_MODEL, otherwise DEFAULT_MODEL."""
-    return cli_model or os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
+def resolve_provider(cli_provider):
+    return cli_provider or DEFAULT_PROVIDER
+
+
+def resolve_model(provider, cli_model):
+    """--model on the command line always wins. Otherwise: for the default
+    "anthropic" provider, ANTHROPIC_MODEL (then DEFAULT_MODEL) -- exactly
+    the pre-existing behavior, unaffected by multi-provider support; for
+    any other provider, model_providers.DEFAULT_MODELS[provider]."""
+    if cli_model:
+        return cli_model
+    if provider == "anthropic":
+        return os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
+    return model_providers.DEFAULT_MODELS[provider]
 
 
 # Trial types introduced for the v0.2 context benchmark (context_trials.py).
@@ -491,22 +486,34 @@ def trial_metadata(trial):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run one trial through the Claude API.")
+    parser = argparse.ArgumentParser(description="Run one trial through a model provider.")
     parser.add_argument("trial_id", help="The trial_id to run, e.g. single__gilbert__ai__critique")
     parser.add_argument("--trials-file", default=TRIALS_FILE, help=f"Trials manifest to read (default: {TRIALS_FILE})")
     parser.add_argument("--results-file", default=RESULTS_FILE, help=f"Results file to append to (default: {RESULTS_FILE})")
-    parser.add_argument("--model", help="Override the model (default: $ANTHROPIC_MODEL, else claude-sonnet-5)")
+    parser.add_argument("--provider", choices=list(model_providers.PROVIDERS),
+                         help=f"Model provider (default: {DEFAULT_PROVIDER}, for backward compatibility)")
+    parser.add_argument("--model", help="Override the model (default: $ANTHROPIC_MODEL/claude-sonnet-5 for anthropic, "
+                                         "else the provider's own default -- see model_providers.DEFAULT_MODELS)")
+    parser.add_argument(
+        "--reasoning-profile",
+        choices=list(model_providers.REASONING_PROFILES_LOGICAL),
+        default=model_providers.DEFAULT_REASONING_PROFILE,
+        help=f"Provider-neutral reasoning level (default: {model_providers.DEFAULT_REASONING_PROFILE}); "
+        "mapped to each provider's own native setting -- see model_providers.REASONING_PROFILES. "
+        "Never alters the experimental prompt text.",
+    )
     parser.add_argument(
         "--sampling-regime",
         choices=list(SAMPLING_REGIMES),
         default="low_variance_primary",
         help="v0.2 context trial types only (ignored, and not recorded, for v0.1 trial types): "
-        "low_variance_primary (default; temperature=0) or provider_default_secondary",
+        "low_variance_primary (default; temperature=0, Anthropic only) or provider_default_secondary",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print the trial without calling the API")
     args = parser.parse_args()
 
-    model = resolve_model(args.model)
+    provider = resolve_provider(args.provider)
+    model = resolve_model(provider, args.model)
 
     trials = load_trials(args.trials_file)
     trial = find_trial(trials, args.trial_id)
@@ -515,16 +522,18 @@ def main():
         return
 
     sampling_params = resolve_sampling_params(trial["type"], args.sampling_regime)
+    reasoning_settings = model_providers.resolve_reasoning_settings(provider, args.reasoning_profile)
+    max_output_tokens = max_tokens_for(provider, trial.get("response_format"))
 
     if args.dry_run:
-        print(f"Model: {model}")
+        print(f"Provider: {provider}  Model: {model}  Reasoning profile: {args.reasoning_profile} (settings: {reasoning_settings})")
         if sampling_params is not None:
             print(f"Sampling regime: {args.sampling_regime}  (params: {sampling_params})")
         print("Trial:")
         print(json.dumps(trial, indent=2))
         return
 
-    api_result = call_claude(trial["prompt"], model, sampling_params, max_tokens_for(trial.get("response_format")))
+    api_result = model_providers.call_model(provider, model, trial["prompt"], max_output_tokens, args.reasoning_profile, sampling_params)
     response_text = api_result["response_text"]
     parsed_response, validation_error = parse_and_validate(
         response_text, trial["type"], trial.get("choice_mode"), trial.get("rubric", "full"), trial.get("response_format")
@@ -535,8 +544,13 @@ def main():
 
     result = {
         "trial_id": trial["trial_id"],
-        "model": model,
+        "provider": provider,
+        "requested_model": model,
+        "model": model,  # kept for backward compatibility with every existing analysis/test that reads "model"
         "response_model": api_result.get("response_model"),
+        "reasoning_profile": args.reasoning_profile,
+        "provider_reasoning_settings": reasoning_settings,
+        "execution_mode": "direct",
         "stop_reason": api_result["stop_reason"],
         "input_tokens": api_result["input_tokens"],
         "output_tokens": api_result["output_tokens"],

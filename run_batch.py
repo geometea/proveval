@@ -36,20 +36,25 @@ counts from --replicates-treatment/--replicates-neutral) is unaffected.
 import argparse
 import json
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from random import Random
+from threading import Lock
 
+import model_providers
 from run_trial import (
     CONTEXT_TRIAL_TYPES,
     DEFAULT_MODEL,
+    DEFAULT_PROVIDER,
     RESULTS_FILE,
     SAMPLING_REGIMES,
     TRIALS_FILE,
-    call_claude,
     load_trials,
     max_tokens_for,
     parse_and_validate,
     resolve_model,
+    resolve_provider,
     resolve_sampling_params,
     save_result,
     trial_metadata,
@@ -215,7 +220,7 @@ def load_existing_results(path):
     return existing
 
 
-def is_completed(records, expected_prompt_sha256=None):
+def is_completed(records, expected_prompt_sha256=None, expected_provider=None, expected_model=None, expected_reasoning_profile=None):
     """A key is done only if one of its records has a valid parsed response.
 
     expected_prompt_sha256, when given, additionally requires that record's
@@ -225,6 +230,16 @@ def is_completed(records, expected_prompt_sha256=None):
     a prompt_sha256 (every trial type except the standalone
     context-controllability experiment -- see controllability_trials.py)
     pass None here and get the exact old behavior, unaffected.
+
+    expected_provider/expected_model/expected_reasoning_profile, when
+    given, similarly require the record's own "provider"/"requested_model"/
+    "reasoning_profile" fields to match -- but ONLY when the record actually
+    carries that field. Every result saved before multi-provider support
+    was added has none of these fields at all; treating an absent field as
+    "unknown, assume compatible" (rather than "mismatch") means those
+    pre-existing completed results still count as done, exactly as before,
+    while a genuine provider/model/reasoning-profile change on results that
+    DO carry this metadata is correctly treated as incomplete.
     """
     for r in records:
         if r["parsed_response"] is None or r["validation_error"] is not None:
@@ -233,6 +248,12 @@ def is_completed(records, expected_prompt_sha256=None):
             recorded = (r.get("trial_meta") or {}).get("prompt_sha256")
             if recorded != expected_prompt_sha256:
                 continue
+        if expected_provider is not None and r.get("provider") not in (None, expected_provider):
+            continue
+        if expected_model is not None and r.get("requested_model") not in (None, expected_model):
+            continue
+        if expected_reasoning_profile is not None and r.get("reasoning_profile") not in (None, expected_reasoning_profile):
+            continue
         return True
     return False
 
@@ -244,27 +265,75 @@ def next_attempt_id(records):
     return max(r.get("attempt_id", 1) for r in records) + 1
 
 
-def run_one(trial, replicate_id, model, attempt_id, results_file, sampling_regime):
-    """Call the API for one trial, validate it, save a result row, and return a status word.
+RETRYABLE_ERROR_HINTS = ("429", "500", "502", "503", "504", "timeout", "timed out", "connection")
+
+
+def is_retryable_error(exc):
+    """429 / 5xx / network-timeout-shaped errors -- a conservative substring
+    check against the exception's own message, since each provider SDK
+    raises its own exception types. Never retries a malformed-response
+    situation (that isn't an exception at all -- see parse_and_validate)."""
+    text = str(exc).lower()
+    return any(hint in text for hint in RETRYABLE_ERROR_HINTS)
+
+
+def run_one(trial, replicate_id, model, attempt_id, results_file, sampling_regime, provider=DEFAULT_PROVIDER,
+            reasoning_profile=model_providers.DEFAULT_REASONING_PROFILE, execution_mode="direct", max_transient_retries=0):
+    """Call the provider for one trial, validate it, save a result row, and
+    return a status word.
 
     Always saves a new row, even on failure, so a failed call can still be diagnosed
     later; existing rows (from earlier attempts) are never modified or removed.
+
+    max_transient_retries (used by --concurrency execution, e.g. for
+    DeepSeek, which has no native batch endpoint) retries a 429/5xx/timeout
+    -shaped failure in place, with exponential backoff, resending the exact
+    same prompt/reasoning_profile every time -- never a "please answer
+    correctly" corrective reprompt. A non-retryable failure (or exhausting
+    the retries) still saves exactly one failed result row, same as
+    max_transient_retries=0.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
     trial_meta = trial_metadata(trial) if trial["type"] in CONTEXT_TRIAL_TYPES else None
     sampling_params = resolve_sampling_params(trial["type"], sampling_regime)
+    reasoning_settings = model_providers.resolve_reasoning_settings(provider, reasoning_profile)
+    max_output_tokens = max_tokens_for(provider, trial.get("response_format"))
 
-    try:
-        api_result = call_claude(trial["prompt"], model, sampling_params, max_tokens_for(trial.get("response_format")))
-    except Exception as e:
-        print(f"Error calling the API for {trial['trial_id']} (replicate {replicate_id}): {e}")
+    base_result = {
+        "trial_id": trial["trial_id"],
+        "provider": provider,
+        "requested_model": model,
+        "model": model,  # kept for backward compatibility with every existing analysis/test that reads "model"
+        "reasoning_profile": reasoning_profile,
+        "provider_reasoning_settings": reasoning_settings,
+        "execution_mode": execution_mode,
+        "replicate_id": replicate_id,
+        "attempt_id": attempt_id,
+        "timestamp": timestamp,
+    }
+
+    api_result = None
+    call_error = None
+    delay = 2
+    for retry in range(max_transient_retries + 1):
+        try:
+            api_result = model_providers.call_model(provider, model, trial["prompt"], max_output_tokens, reasoning_profile, sampling_params)
+            call_error = None
+            break
+        except Exception as e:
+            call_error = e
+            if retry < max_transient_retries and is_retryable_error(e):
+                time.sleep(delay)
+                delay *= 2
+                continue
+            break
+
+    if call_error is not None:
+        e = call_error
+        print(f"Error calling {provider} for {trial['trial_id']} (replicate {replicate_id}): {e}")
         result = {
-            "trial_id": trial["trial_id"],
-            "model": model,
+            **base_result,
             "response_model": None,
-            "replicate_id": replicate_id,
-            "attempt_id": attempt_id,
-            "timestamp": timestamp,
             "stop_reason": None,
             "input_tokens": None,
             "output_tokens": None,
@@ -286,12 +355,8 @@ def run_one(trial, replicate_id, model, attempt_id, results_file, sampling_regim
     )
 
     result = {
-        "trial_id": trial["trial_id"],
-        "model": model,
+        **base_result,
         "response_model": api_result.get("response_model"),
-        "replicate_id": replicate_id,
-        "attempt_id": attempt_id,
-        "timestamp": timestamp,
         "stop_reason": api_result["stop_reason"],
         "input_tokens": api_result["input_tokens"],
         "output_tokens": api_result["output_tokens"],
@@ -333,7 +398,8 @@ def group_failed_candidates_into_units(candidates):
     return units
 
 
-def select_failed_observations(existing_results, trials_by_id, model, sampling_regime, only_type, id_prefix, conditions, contrasts, evaluation_regimes, limit):
+def select_failed_observations(existing_results, trials_by_id, model, sampling_regime, only_type, id_prefix, conditions, contrasts, evaluation_regimes, limit,
+                                provider=None, reasoning_profile=None):
     """Find (trial, replicate_id) pairs that have failed attempts and no successful one.
 
     Only observations for the current model AND the current --sampling-regime
@@ -341,6 +407,8 @@ def select_failed_observations(existing_results, trials_by_id, model, sampling_r
     retried as if it belonged to the other, since a retry re-runs the API
     call under sampling_regime and would otherwise silently record a second
     regime's result under what looks like the first regime's failed slot.
+    provider/reasoning_profile, when given, are passed through to
+    is_completed()'s backward-compatible identity check.
 
     Shuffling and --limit operate on whole units (see
     group_failed_candidates_into_units) so a retry batch can't orphan part
@@ -354,7 +422,7 @@ def select_failed_observations(existing_results, trials_by_id, model, sampling_r
         trial = trials_by_id.get(trial_id)
         if trial is None:
             continue  # trial no longer exists in the trials file
-        if is_completed(records, trial.get("prompt_sha256")):
+        if is_completed(records, trial.get("prompt_sha256"), provider, model, reasoning_profile):
             continue
         if result_regime != result_sampling_regime(trial["type"], sampling_regime):
             continue
@@ -436,10 +504,28 @@ def main():
         action="store_true",
         help="Only select observations with a failed attempt and no successful one (ignores --replicates)",
     )
+    parser.add_argument("--provider", choices=list(model_providers.PROVIDERS),
+                         help=f"Model provider (default: {DEFAULT_PROVIDER}, for backward compatibility)")
+    parser.add_argument(
+        "--reasoning-profile",
+        choices=list(model_providers.REASONING_PROFILES_LOGICAL),
+        default=model_providers.DEFAULT_REASONING_PROFILE,
+        help=f"Provider-neutral reasoning level (default: {model_providers.DEFAULT_REASONING_PROFILE}); "
+        "mapped to each provider's own native setting -- see model_providers.REASONING_PROFILES. "
+        "The same profile is used for every experimental condition; never alters the prompt text.",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Bounded concurrent execution with retry/backoff on 429/5xx/timeout (default: 1, sequential). "
+        "Intended for providers with no native batch endpoint (e.g. DeepSeek).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Show what would run without calling the API")
     args = parser.parse_args()
 
-    model = resolve_model(args.model)
+    provider = resolve_provider(args.provider)
+    model = resolve_model(provider, args.model)
     existing_results = load_existing_results(args.results_file)
 
     conditions = set(args.conditions) if args.conditions else None
@@ -457,7 +543,8 @@ def main():
         trials_by_id = {t["trial_id"]: t for t in load_trials(args.trials_file)}
         observations = select_failed_observations(
             existing_results, trials_by_id, model, args.sampling_regime,
-            args.type, args.id_prefix, conditions, contrasts, evaluation_regimes, args.limit
+            args.type, args.id_prefix, conditions, contrasts, evaluation_regimes, args.limit,
+            provider, args.reasoning_profile,
         )
     else:
         trials = load_trials(args.trials_file)
@@ -466,17 +553,22 @@ def main():
 
     total = len(observations)
     counts = {"valid": 0, "invalid": 0, "error": 0, "skipped-valid": 0}
+    counts_lock = Lock()
+    to_run = []  # (label, trial, replicate_id, attempt_id) -- decided sequentially, executed per --concurrency
+
     for i, (trial, replicate_id) in enumerate(observations, start=1):
         key = (trial["trial_id"], model, replicate_id, result_sampling_regime(trial["type"], args.sampling_regime))
         label = f"{i} / {total} — {trial['trial_id']} — replicate {replicate_id}"
         records = existing_results.get(key, [])
 
-        # prompt_sha256 (see controllability_trials.py) is part of the
-        # completion check when the trial carries one: a result saved
-        # against an earlier version of this trial's prompt never counts as
-        # satisfying the current one, so a wording change re-runs it rather
-        # than silently reusing a stale result.
-        if records and is_completed(records, trial.get("prompt_sha256")):
+        # prompt_sha256/provider/model/reasoning_profile (see
+        # controllability_trials.py and model_providers.py) are all part of
+        # the completion check: a result saved against a different prompt
+        # wording, provider, requested model, or reasoning profile never
+        # counts as satisfying the current trial (backward-compatible: a
+        # pre-existing result that carries none of this metadata still
+        # counts, exactly as before -- see is_completed).
+        if records and is_completed(records, trial.get("prompt_sha256"), provider, model, args.reasoning_profile):
             print(f"{label} — skipped-valid")
             counts["skipped-valid"] += 1
             continue
@@ -492,15 +584,42 @@ def main():
         if is_retry:
             print(f"{label} — retrying-failed (attempt {attempt_id})")
 
+        to_run.append((label, trial, replicate_id, attempt_id))
+
+    if args.dry_run:
+        return
+
+    def execute(label, trial, replicate_id, attempt_id):
         try:
-            status = run_one(trial, replicate_id, model, attempt_id, args.results_file, args.sampling_regime)
+            status = run_one(
+                trial, replicate_id, model, attempt_id, args.results_file, args.sampling_regime,
+                provider, args.reasoning_profile,
+                execution_mode="concurrent" if args.concurrency > 1 else "direct",
+                max_transient_retries=4 if args.concurrency > 1 else 0,
+            )
             print(f"{label} — {status}")
-            counts[status] = counts.get(status, 0) + 1
+            with counts_lock:
+                counts[status] = counts.get(status, 0) + 1
         except Exception as e:
             print(f"{label} — error: {e}")
-            counts["error"] += 1
+            with counts_lock:
+                counts["error"] += 1
 
-    if not args.dry_run and total:
+    if args.concurrency > 1:
+        # Bounded concurrent execution (e.g. for providers with no native
+        # batch endpoint, such as DeepSeek -- see model_providers.py). Each
+        # request is still an independent call of run_one with the exact
+        # same trial/prompt/reasoning_profile as sequential execution would
+        # use; only the scheduling is concurrent.
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            futures = [pool.submit(execute, *task) for task in to_run]
+            for future in as_completed(futures):
+                future.result()  # re-raise anything execute() itself didn't catch
+    else:
+        for task in to_run:
+            execute(*task)
+
+    if total:
         print(
             f"\nDone. valid={counts['valid']} invalid={counts['invalid']} "
             f"error={counts['error']} skipped-valid={counts['skipped-valid']}"

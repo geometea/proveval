@@ -180,3 +180,140 @@ def test_select_failed_observations_does_not_cross_sampling_regimes(tmp_path):
     )
     assert len(retry_under_primary) == 1
     assert len(retry_under_secondary) == 0
+
+
+# ---------------------------------------------------------------------------
+# Multi-provider result identity: provider/requested_model/reasoning_profile
+# (see model_providers.py), backward compatible with pre-existing results
+# that carry none of this metadata.
+# ---------------------------------------------------------------------------
+
+class TestIsCompletedProviderIdentity:
+    def _valid_record(self, **overrides):
+        record = {"parsed_response": {"overall_quality": "A"}, "validation_error": None}
+        record.update(overrides)
+        return record
+
+    def test_matching_provider_model_and_profile_counts_as_complete(self):
+        record = self._valid_record(provider="anthropic", requested_model="claude-sonnet-5", reasoning_profile="low")
+        assert rb.is_completed([record], expected_provider="anthropic", expected_model="claude-sonnet-5", expected_reasoning_profile="low")
+
+    def test_different_provider_does_not_count_as_complete(self):
+        record = self._valid_record(provider="openai", requested_model="claude-sonnet-5", reasoning_profile="low")
+        assert not rb.is_completed([record], expected_provider="anthropic", expected_model="claude-sonnet-5", expected_reasoning_profile="low")
+
+    def test_different_requested_model_does_not_count_as_complete(self):
+        record = self._valid_record(provider="anthropic", requested_model="claude-opus-5", reasoning_profile="low")
+        assert not rb.is_completed([record], expected_provider="anthropic", expected_model="claude-sonnet-5", expected_reasoning_profile="low")
+
+    def test_different_reasoning_profile_does_not_count_as_complete(self):
+        record = self._valid_record(provider="anthropic", requested_model="claude-sonnet-5", reasoning_profile="high")
+        assert not rb.is_completed([record], expected_provider="anthropic", expected_model="claude-sonnet-5", expected_reasoning_profile="low")
+
+    def test_a_record_predating_multi_provider_support_still_counts_as_complete(self):
+        """No provider/requested_model/reasoning_profile fields at all --
+        absent is "unknown, assume compatible", never a mismatch."""
+        record = self._valid_record()
+        assert rb.is_completed([record], expected_provider="anthropic", expected_model="claude-sonnet-5", expected_reasoning_profile="low")
+
+
+# ---------------------------------------------------------------------------
+# Concurrent (--concurrency) execution: retry/backoff on transient errors,
+# and --dry-run makes no network/provider calls even with --concurrency set.
+# ---------------------------------------------------------------------------
+
+class TestConcurrentRetryBackoff:
+    def test_is_retryable_error_recognizes_429_5xx_and_timeout(self):
+        assert rb.is_retryable_error(Exception("HTTP 429 Too Many Requests"))
+        assert rb.is_retryable_error(Exception("503 Service Unavailable"))
+        assert rb.is_retryable_error(Exception("Request timed out"))
+        assert not rb.is_retryable_error(Exception("400 Bad Request: invalid schema"))
+
+    def test_run_one_retries_a_transient_error_and_then_succeeds(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rb.time, "sleep", lambda seconds: None)  # don't actually wait in tests
+        calls = {"n": 0}
+
+        def flaky_call_model(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise Exception("503 Service Unavailable")
+            return {"response_text": "A", "response_model": "m-1", "stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1}
+
+        monkeypatch.setattr(rb.model_providers, "call_model", flaky_call_model)
+        trial = {"trial_id": "t1", "type": "context_pairwise", "choice_mode": "forced", "response_format": "plain_ab", "prompt": "p"}
+        results_file = str(tmp_path / "results.jsonl")
+
+        status = rb.run_one(trial, 1, "deepseek-v4-pro", 1, results_file, "low_variance_primary",
+                             provider="deepseek", max_transient_retries=4)
+
+        assert status == "valid"
+        assert calls["n"] == 3
+        rows = [json.loads(line) for line in open(results_file, encoding="utf-8")]
+        assert len(rows) == 1  # only the final successful attempt is saved, not the transient failures
+
+    def test_run_one_gives_up_after_exhausting_retries_and_saves_one_error_row(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rb.time, "sleep", lambda seconds: None)
+        calls = {"n": 0}
+
+        def always_fails(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            calls["n"] += 1
+            raise Exception("429 rate limited")
+
+        monkeypatch.setattr(rb.model_providers, "call_model", always_fails)
+        trial = {"trial_id": "t1", "type": "context_pairwise", "choice_mode": "forced", "response_format": "plain_ab", "prompt": "p"}
+        results_file = str(tmp_path / "results.jsonl")
+
+        status = rb.run_one(trial, 1, "deepseek-v4-pro", 1, results_file, "low_variance_primary",
+                             provider="deepseek", max_transient_retries=2)
+
+        assert status == "error"
+        assert calls["n"] == 3  # initial attempt + 2 retries
+        rows = [json.loads(line) for line in open(results_file, encoding="utf-8")]
+        assert len(rows) == 1
+        assert "API call failed" in rows[0]["validation_error"]
+
+    def test_non_retryable_error_is_not_retried(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rb.time, "sleep", lambda seconds: None)
+        calls = {"n": 0}
+
+        def bad_request(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            calls["n"] += 1
+            raise Exception("400 Bad Request")
+
+        monkeypatch.setattr(rb.model_providers, "call_model", bad_request)
+        trial = {"trial_id": "t1", "type": "context_pairwise", "choice_mode": "forced", "response_format": "plain_ab", "prompt": "p"}
+        results_file = str(tmp_path / "results.jsonl")
+
+        status = rb.run_one(trial, 1, "deepseek-v4-pro", 1, results_file, "low_variance_primary",
+                             provider="deepseek", max_transient_retries=4)
+
+        assert status == "error"
+        assert calls["n"] == 1  # never retried
+
+    def test_concurrency_dry_run_makes_no_provider_calls(self, tmp_path, monkeypatch, capsys):
+        def must_not_be_called(*args, **kwargs):
+            pytest.fail("model_providers.call_model must never be invoked during --dry-run")
+
+        monkeypatch.setattr(rb.model_providers, "call_model", must_not_be_called)
+
+        trials = []
+        for block in ("block_a", "block_b"):
+            for assignment, position in [("forward", "story1_as_a"), ("forward", "story2_as_a"),
+                                          ("flipped", "story1_as_a"), ("flipped", "story2_as_a")]:
+                trials.append({"trial_id": f"{block}__{assignment}__{position}", "block_id": block,
+                                "type": "context_pairwise", "choice_mode": "forced", "response_format": "plain_ab",
+                                "prompt": "p"})
+        trials_file = tmp_path / "trials.jsonl"
+        with open(trials_file, "w", encoding="utf-8") as f:
+            for t in trials:
+                f.write(json.dumps(t) + "\n")
+
+        monkeypatch.setattr(
+            "sys.argv",
+            ["run_batch.py", "--trials-file", str(trials_file), "--results-file", str(tmp_path / "results.jsonl"),
+             "--provider", "deepseek", "--model", "deepseek-v4-pro", "--concurrency", "4", "--limit", "2", "--dry-run"],
+        )
+        rb.main()
+        out = capsys.readouterr().out
+        assert "planned" in out
+        assert not (tmp_path / "results.jsonl").exists()
