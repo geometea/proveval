@@ -1,0 +1,86 @@
+{
+  "corpus_id": "controllability_v2_corpus_v1",
+  "item_ids": [
+    "afterlife",
+    "buddy",
+    "charlotte_train",
+    "dana_brownies",
+    "dunnest_smoke",
+    "eyecut_lowway",
+    "gilbert",
+    "morrow_transport",
+    "prophet",
+    "qual_panic",
+    "santa",
+    "saturn"
+  ],
+  "author_group": "author_group_anon_1",
+  "naturalistic_writing": true,
+  "collection_window": {
+    "description": "approximately 18 months",
+    "approximate_duration_months": 18
+  },
+  "stories": [
+    {
+      "id": "afterlife",
+      "sha256": "2aff73f2fa786fd19792514e86252a51ec6850a27f30976f52605ee6b6789188",
+      "word_count": 2184
+    },
+    {
+      "id": "buddy",
+      "sha256": "6470eb2bd7393283d82ad223bc8c561feb6f3f7a55ac6068c7391b38ae2c935c",
+      "word_count": 2571
+    },
+    {
+      "id": "charlotte_train",
+      "sha256": "24432bcba1fd8c9bacd96922e7e0680e848a6792777b1af24ba1f166755d2d08",
+      "word_count": 1579
+    },
+    {
+      "id": "dana_brownies",
+      "sha256": "acdc5bfa7258bed7b4f13f31df89ccfe6336498c027ed0b00b4724c45f1d3631",
+      "word_count": 1269
+    },
+    {
+      "id": "dunnest_smoke",
+      "sha256": "155edcbb007fbfb70819390acf6d7b98fcbd69880c68dcfc6e7feafa5ba4aa4f",
+      "word_count": 2098
+    },
+    {
+      "id": "eyecut_lowway",
+      "sha256": "6375564501fd52b37741851328f5bda52f2b68164d1372ac5f133bb2d8357f67",
+      "word_count": 1449
+    },
+    {
+      "id": "gilbert",
+      "sha256": "1da1909aec4015d393432340bdee129bb14f8592344a0fe3fb79030353d212d1",
+      "word_count": 1509
+    },
+    {
+      "id": "morrow_transport",
+      "sha256": "cd0b83d5e737c9c822dafe8369ae974a879de959237e4b1fd85d16c8b69f05ba",
+      "word_count": 1209
+    },
+    {
+      "id": "prophet",
+      "sha256": "bc7ee325b17208d063163e558226e75d89a193aa31839a46b4a87aeb58a6b62b",
+      "word_count": 1516
+    },
+    {
+      "id": "qual_panic",
+      "sha256": "afc61e216abc40b21afc930c86e970c8047347565a437ec295457e250ec59421",
+      "word_count": 794
+    },
+    {
+      "id": "santa",
+      "sha256": "98e603b54cd55cd14c75d4f43a99e4200c801c9eb1905245f6f44ebfb799a3e7",
+      "word_count": 1564
+    },
+    {
+      "id": "saturn",
+      "sha256": "83ae87d1ba907f43e18d87fcc28a0c68c60157fd64b853f05c30ec1189e6d82b",
+      "word_count": 1422
+    }
+  ],
+  "corpus_hash": "a34fb9313cbf402440506f00fba9265da3c82cf74dba8a81704505de378a6d93"
+}

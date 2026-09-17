@@ -45,6 +45,20 @@ and isn't.
   runner, and offline analysis all exist and are exercised with dry-runs and
   synthetic fixtures — see `CONTEXT_PACKETS.md` for exactly what's built.
   No benchmark API calls have been made yet.
+- **Context-controllability v2: implemented, not yet run for real (recommended
+  implementation).** A from-scratch v2 redesign of the context-controllability
+  experiment below, living alongside it (v1 is unmodified) — standardised
+  single writing-quality question, two instruction conditions
+  (`matched_control`/`text_only`) whose prompts differ in exactly one
+  sentence, an explicit 8-cell superblock per (story pair, contrast), a
+  frozen/lockable study config, a story-level bootstrap (not per-pair
+  independent resampling) for every confidence interval, an equivalence
+  test against a pre-registered margin, a baseline-strength regression
+  (replacing a plain correlation) for the ambiguity analysis, strict
+  evaluator-identity separation, and a network-free design-planning
+  simulator. See `STUDY_PROTOCOL_V2.md` for the full protocol and
+  "Context-controllability experiment v2" below for how to run it — this is
+  the recommended implementation for any new work on this experiment.
 - **Researcher reference ranking (secondary benchmark): complete.** 31
   pairwise judgments are recorded in `data/human_pairwise.jsonl`, with no
   contradictions or cycles, and they uniquely determine a full **ordinal**
@@ -405,10 +419,19 @@ rationale; `FINAL_DESIGN.md` is not rewritten around this experiment since
 it introduces no new architecture, only a second, smaller contrast set and
 manifest layered on the existing one.
 
-## Context-controllability experiment (current experiment)
+## Context-controllability experiment v1 (superseded by v2, kept unmodified)
 
-This is the experiment actively being developed and run in this repo. The
-v0.2 broad context benchmark ("Standalone named-LLM provenance experiment"
+> **A v2 redesign of this experiment exists — see "Context-controllability
+> experiment v2" below, which is the recommended implementation for any new
+> work.** This v1 section and all of the code it describes
+> (`controllability_trials.py`, `analyze_controllability.py`,
+> `data/controllability_*.jsonl`) are left completely unmodified and remain
+> independently runnable; v2 lives alongside it under different names
+> (`controllability_v2_*.py`, `data/controllability_v2_*.jsonl`,
+> `results/controllability_v2/`) and shares no manifest or results file with
+> v1.
+
+The v0.2 broad context benchmark ("Standalone named-LLM provenance experiment"
 above, and the general `context_trials.py` manifest under "Repository
 layout") are earlier/auxiliary work: implemented, exercised with dry-runs
 and synthetic fixtures, but not the current focus.
@@ -529,3 +552,88 @@ python3 analyze_controllability.py
 See `controllability_trials.py` and `analyze_controllability.py` for the
 full rationale; `FINAL_DESIGN.md` is not rewritten around this experiment
 for the same reason as above.
+
+## Context-controllability experiment v2 (recommended)
+
+A from-scratch v2 redesign of the experiment above, generated and analyzed
+by an entirely separate set of files (`controllability_v2_*.py`,
+`run_controllability_v2.py`, `analyze_controllability_v2.py`,
+`plan_controllability_v2.py`, `data/controllability_v2_*.jsonl`,
+`results/controllability_v2/`) — v1 is completely untouched. Full protocol
+in `STUDY_PROTOCOL_V2.md`.
+
+Key differences from v1: one standardised writing-quality question used
+verbatim everywhere ("Which passage is better written overall? ... Please
+answer A or B."); two instruction conditions (`matched_control`/`text_only`)
+whose prompts differ in exactly one sentence (replacing v1's
+naturalistic/text_only_invariance regimes); an explicit `superblock_id` per
+(story pair, contrast) spanning all 8 cells (4 matched-control + 4
+text-only), with primary analysis restricted to complete superblocks;
+randomised execution order (superblocks globally shuffled, cells shuffled
+within each, reproducible from one seed); bounded retries with every
+attempt recorded and first-attempt compliance reported separately; a
+frozen/lockable study config (`freeze_controllability_v2.py`) that
+production runs are checked against; a story-level bootstrap (resampling
+the 12 stories, not the 66 pairs) for every confidence interval, used for
+the ATEs, the control-vs-text-only difference, the equivalence test, and
+the ambiguity regression's slope; an equivalence classification against a
+pre-registered probability-scale margin; a `D_pair = intercept +
+beta * baseline_strength` regression (replacing v1's plain Pearson
+correlation) against the independently-collected blind baseline; and
+strict evaluator-identity separation that never pools different providers,
+models, reasoning profiles, or resolved model versions.
+
+The 5 context contrasts keep v1's exact frozen wording
+(`data/controllability_v2_contrasts.jsonl`). Manifest sizes are unchanged:
+66 pairs × 5 contrasts × 2 instruction conditions × 4 cells = 2,640 primary
+treatment prompts (330 superblocks); 66 pairs × 2 positions = 132 baseline
+prompts, collected independently from treatment.
+
+```bash
+# generate the corpus metadata (12 story SHA-256 hashes + word counts,
+# anonymised author_group, no model-facing content), the study config
+# (draft), and both manifests
+python3 controllability_v2_corpus.py
+python3 controllability_v2_study_config.py
+python3 controllability_v2_trials.py
+
+# freeze the design: hashes the study config, contrasts, corpus metadata,
+# and both generated manifests into data/controllability_v2_frozen_lock.json,
+# and flips the study config's status to "frozen". Do this only once the
+# design is final -- it is never run automatically.
+python3 freeze_controllability_v2.py
+
+# dry-run treatment/baseline execution (randomised order, no network calls) --
+# --dry-run works whether or not the design is frozen
+python3 run_controllability_v2.py treatment --provider anthropic --model claude-sonnet-5 \
+    --reasoning-profile low --replicates 3 --seed 20260917 --dry-run
+python3 run_controllability_v2.py baseline --provider anthropic --model claude-sonnet-5 \
+    --reasoning-profile low --replicates 3 --seed 20260917 --dry-run
+
+# for real (needs ANTHROPIC_API_KEY; refuses to run unless the design is
+# frozen and matches its lock -- pass --allow-unfrozen for an exploratory
+# run that will never feed the frozen study's primary analysis)
+python3 run_controllability_v2.py treatment --provider anthropic --model claude-sonnet-5 \
+    --reasoning-profile low --replicates 3 --seed 20260917 --run-id wave1
+python3 run_controllability_v2.py baseline --provider anthropic --model claude-sonnet-5 \
+    --reasoning-profile low --replicates 3 --seed 20260917 --run-id wave1
+
+# analyze both results files -- per-evaluator CSVs/plots/headline_results.json
+# under results/controllability_v2/analysis/ (pair_context_effects.csv,
+# cue_ates.csv, controllability_effects.csv, equivalence_results.csv,
+# ambiguity_interactions.csv, position_effects.csv, leave_one_story_out.csv,
+# response_compliance.csv, cell_counts.csv, baseline_pair_strength.csv,
+# baseline_reliability.csv, evaluator_inventory.csv, headline_results.json,
+# plus 4 SVG plots per evaluator)
+python3 analyze_controllability_v2.py
+
+# design-planning simulator -- no model API calls; varies replicate counts,
+# hypothetical effect sizes, baseline decisiveness, and text-only
+# attenuation, reporting expected CI widths, baseline-strength estimate
+# stability, total model calls, and an approximate token count from the
+# real story lengths
+python3 plan_controllability_v2.py --simulations 20 --bootstrap-draws 500
+```
+
+See `STUDY_PROTOCOL_V2.md` for the full pre-registered analysis plan and
+the fixed design rules a frozen study must satisfy before production.

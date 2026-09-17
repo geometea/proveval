@@ -1,0 +1,44 @@
+{
+  "design_version": "v2",
+  "experiment_id": "context_controllability_v2",
+  "corpus_id": "controllability_v2_corpus_v1",
+  "primary_evaluator": {
+    "evaluator_id": "anthropic__claude-sonnet-5__low",
+    "provider": "anthropic",
+    "requested_model": "claude-sonnet-5",
+    "reasoning_profile": "low",
+    "role": "primary"
+  },
+  "replication_evaluators": [
+    {
+      "evaluator_id": "openai__gpt-5.6__low",
+      "provider": "openai",
+      "requested_model": "gpt-5.6",
+      "reasoning_profile": "low",
+      "role": "replication"
+    },
+    {
+      "evaluator_id": "gemini__gemini-3.8-flash__low",
+      "provider": "gemini",
+      "requested_model": "gemini-3.8-flash",
+      "reasoning_profile": "low",
+      "role": "replication"
+    }
+  ],
+  "treatment_replicate_count": 3,
+  "baseline_replicate_count": 3,
+  "random_seed": 20260917,
+  "bootstrap_draws": 10000,
+  "equivalence_margin": 0.05,
+  "alpha": 0.05,
+  "retry_limit": 3,
+  "instruction_strings": {
+    "matched_control": "For this comparison, please read both passages carefully before making your choice.",
+    "text_only": "For this comparison, please read both passages carefully and judge only the writing itself."
+  },
+  "question": "Which passage is better written overall? If they're close, choose the one you think is slightly better written. Please answer A or B.",
+  "contrast_file": "data/controllability_v2_contrasts.jsonl",
+  "treatment_manifest_file": "data/controllability_v2_trials.jsonl",
+  "baseline_manifest_file": "data/controllability_v2_baseline_trials.jsonl",
+  "status": "draft"
+}
