@@ -65,8 +65,11 @@ def test_evaluation_regime_is_required_with_no_default():
 
 
 # ---------------------------------------------------------------------------
-# rubric: "full" (default, every pre-existing experiment) vs "excerpt" (the
-# standalone context-controllability experiment)
+# rubric: "full" is the only rubric now (an "excerpt" rubric used to live
+# here for the standalone context-controllability experiment; that
+# experiment now uses its own dedicated plain-A/B prompt/response format --
+# see controllability_trials.py -- and no longer calls build_prompt() at
+# all, so "excerpt" was removed as dead code).
 # ---------------------------------------------------------------------------
 
 def test_default_rubric_is_full_and_byte_identical_to_omitting_it():
@@ -83,15 +86,6 @@ def test_full_rubric_mentions_plot_structure_and_not_narrative_effectiveness():
     assert "Narrative effectiveness" not in prompt
 
 
-def test_excerpt_rubric_drops_plot_structure_and_adds_narrative_effectiveness():
-    prompt = build_prompt("intro", "a", "b", "naturalistic", "forced", rubric="excerpt")
-    assert "plot_structure" not in prompt
-    assert "Plot structure" not in prompt
-    assert "narrative_effectiveness" in prompt
-    assert "Narrative effectiveness" in prompt
-    assert "overall_quality" in prompt  # still the primary outcome, retained
-
-
 @pytest.mark.parametrize("rubric", RUBRICS)
 @pytest.mark.parametrize("choice_mode", CHOICE_MODES)
 def test_every_rubric_json_example_is_valid_json(rubric, choice_mode):
@@ -104,8 +98,3 @@ def test_every_rubric_json_example_is_valid_json(rubric, choice_mode):
         assert "tie" in parsed.values()
 
 
-def test_excerpt_rubric_preserves_text_only_invariance_instruction():
-    naturalistic = build_prompt("intro", "a", "b", "naturalistic", "forced", rubric="excerpt")
-    invariance = build_prompt("intro", "a", "b", "text_only_invariance", "forced", rubric="excerpt")
-    assert "Judge only the two pieces of prose" in invariance
-    assert "Judge only the two pieces of prose" not in naturalistic

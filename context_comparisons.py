@@ -54,24 +54,22 @@ ITEMS_FILE = "data/items.jsonl"
 
 CHOICE_MODES = ("forced", "tie_allowed")
 
-# Rubric: which rating categories are asked about. "full" (the default,
-# used by every pre-existing experiment) includes plot_structure; "excerpt"
-# drops it, since the standalone context-controllability experiment's 12
-# corpus items are excerpts rather than necessarily complete stories, for
-# which plot_structure doesn't cleanly apply -- see
-# context_analysis_common.EXCERPT_RATING_FIELDS, which this must stay in
-# sync with. Adding "excerpt" is additive: every existing call site omits
-# `rubric` and gets exactly the previous "full" prompt text, unchanged.
-RUBRICS = ("full", "excerpt")
+# Rubric: which rating categories are asked about. "full" is the only rubric
+# every experiment that calls build_prompt() uses (an "excerpt" rubric used
+# to exist here for the standalone context-controllability experiment; that
+# experiment now uses its own dedicated plain-A/B prompt/response format --
+# see controllability_trials.py -- and no longer calls build_prompt() at
+# all, so "excerpt" was removed as dead code). The `rubric` parameter itself
+# is kept, defaulting to "full", so every existing call site's behavior is
+# unaffected.
+RUBRICS = ("full",)
 
 _CATEGORY_DISPLAY = {
     "full": ["Plot structure", "Prose style", "Characterisation", "Originality", "Overall quality"],
-    "excerpt": ["Prose style", "Characterisation", "Originality", "Narrative effectiveness", "Overall quality"],
 }
 
 _JSON_FIELDS = {
     "full": ["plot_structure", "prose_style", "characterisation", "originality", "overall_quality"],
-    "excerpt": ["prose_style", "characterisation", "originality", "narrative_effectiveness", "overall_quality"],
 }
 
 
@@ -155,7 +153,7 @@ INSTRUCTION_TEMPLATES = {
 def load_items(path=ITEMS_FILE):
     """Read a .jsonl file and return a list of dicts (one per line)."""
     items = []
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -165,7 +163,7 @@ def load_items(path=ITEMS_FILE):
 
 def load_story(path):
     """Read the story text from its .txt file."""
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return f.read().strip()
 
 

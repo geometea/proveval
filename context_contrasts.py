@@ -50,7 +50,7 @@ CONTRASTS_FILE = "data/context_contrasts.jsonl"
 def load_contrasts(path=CONTRASTS_FILE):
     """Read data/context_contrasts.jsonl into a list of contrast dicts."""
     contrasts = []
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:

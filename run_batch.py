@@ -47,6 +47,7 @@ from run_trial import (
     TRIALS_FILE,
     call_claude,
     load_trials,
+    max_tokens_for,
     parse_and_validate,
     resolve_model,
     resolve_sampling_params,
@@ -204,7 +205,7 @@ def load_existing_results(path):
     existing = {}
     if not os.path.exists(path):
         return existing
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -214,9 +215,26 @@ def load_existing_results(path):
     return existing
 
 
-def is_completed(records):
-    """A key is done only if one of its records has a valid parsed response."""
-    return any(r["parsed_response"] is not None and r["validation_error"] is None for r in records)
+def is_completed(records, expected_prompt_sha256=None):
+    """A key is done only if one of its records has a valid parsed response.
+
+    expected_prompt_sha256, when given, additionally requires that record's
+    own trial_meta.prompt_sha256 to match -- so a result saved against an
+    earlier version of a trial's prompt (e.g. after wording changed) is
+    never mistaken for satisfying the CURRENT trial. Trials that don't carry
+    a prompt_sha256 (every trial type except the standalone
+    context-controllability experiment -- see controllability_trials.py)
+    pass None here and get the exact old behavior, unaffected.
+    """
+    for r in records:
+        if r["parsed_response"] is None or r["validation_error"] is not None:
+            continue
+        if expected_prompt_sha256 is not None:
+            recorded = (r.get("trial_meta") or {}).get("prompt_sha256")
+            if recorded != expected_prompt_sha256:
+                continue
+        return True
+    return False
 
 
 def next_attempt_id(records):
@@ -237,12 +255,13 @@ def run_one(trial, replicate_id, model, attempt_id, results_file, sampling_regim
     sampling_params = resolve_sampling_params(trial["type"], sampling_regime)
 
     try:
-        api_result = call_claude(trial["prompt"], model, sampling_params)
+        api_result = call_claude(trial["prompt"], model, sampling_params, max_tokens_for(trial.get("response_format")))
     except Exception as e:
         print(f"Error calling the API for {trial['trial_id']} (replicate {replicate_id}): {e}")
         result = {
             "trial_id": trial["trial_id"],
             "model": model,
+            "response_model": None,
             "replicate_id": replicate_id,
             "attempt_id": attempt_id,
             "timestamp": timestamp,
@@ -263,12 +282,13 @@ def run_one(trial, replicate_id, model, attempt_id, results_file, sampling_regim
 
     response_text = api_result["response_text"]
     parsed_response, validation_error = parse_and_validate(
-        response_text, trial["type"], trial.get("choice_mode"), trial.get("rubric", "full")
+        response_text, trial["type"], trial.get("choice_mode"), trial.get("rubric", "full"), trial.get("response_format")
     )
 
     result = {
         "trial_id": trial["trial_id"],
         "model": model,
+        "response_model": api_result.get("response_model"),
         "replicate_id": replicate_id,
         "attempt_id": attempt_id,
         "timestamp": timestamp,
@@ -329,11 +349,13 @@ def select_failed_observations(existing_results, trials_by_id, model, sampling_r
     """
     candidates = []
     for (trial_id, result_model, replicate_id, result_regime), records in existing_results.items():
-        if result_model != model or is_completed(records):
+        if result_model != model:
             continue
         trial = trials_by_id.get(trial_id)
         if trial is None:
             continue  # trial no longer exists in the trials file
+        if is_completed(records, trial.get("prompt_sha256")):
+            continue
         if result_regime != result_sampling_regime(trial["type"], sampling_regime):
             continue
         if only_type and trial["type"] != only_type:
@@ -443,16 +465,23 @@ def main():
         observations = build_observations(trials, replicates_treatment, replicates_neutral)
 
     total = len(observations)
+    counts = {"valid": 0, "invalid": 0, "error": 0, "skipped-valid": 0}
     for i, (trial, replicate_id) in enumerate(observations, start=1):
         key = (trial["trial_id"], model, replicate_id, result_sampling_regime(trial["type"], args.sampling_regime))
         label = f"{i} / {total} — {trial['trial_id']} — replicate {replicate_id}"
         records = existing_results.get(key, [])
 
-        if records and is_completed(records):
+        # prompt_sha256 (see controllability_trials.py) is part of the
+        # completion check when the trial carries one: a result saved
+        # against an earlier version of this trial's prompt never counts as
+        # satisfying the current one, so a wording change re-runs it rather
+        # than silently reusing a stale result.
+        if records and is_completed(records, trial.get("prompt_sha256")):
             print(f"{label} — skipped-valid")
+            counts["skipped-valid"] += 1
             continue
 
-        is_retry = bool(records)  # records exist, but none of them are valid
+        is_retry = bool(records)  # records exist, but none of them satisfy this trial
         attempt_id = next_attempt_id(records)
 
         if args.dry_run:
@@ -466,8 +495,16 @@ def main():
         try:
             status = run_one(trial, replicate_id, model, attempt_id, args.results_file, args.sampling_regime)
             print(f"{label} — {status}")
+            counts[status] = counts.get(status, 0) + 1
         except Exception as e:
             print(f"{label} — error: {e}")
+            counts["error"] += 1
+
+    if not args.dry_run and total:
+        print(
+            f"\nDone. valid={counts['valid']} invalid={counts['invalid']} "
+            f"error={counts['error']} skipped-valid={counts['skipped-valid']}"
+        )
 
 
 if __name__ == "__main__":

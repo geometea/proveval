@@ -41,7 +41,7 @@ CONDITION_AI_SIDE = {
 def load_jsonl(path):
     """Read a .jsonl file into a list of dicts."""
     rows = []
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -398,7 +398,7 @@ def analyze_rating_effects(observations, condition_x, condition_y, swap_name):
 # ---------------------------------------------------------------------------
 
 def write_csv(rows, fieldnames, path):
-    with open(path, "w", newline="") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:

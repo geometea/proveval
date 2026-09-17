@@ -72,7 +72,7 @@ NEUTRAL_PAIRWISE_INTRO = "Hi! Can you give me some feedback on these two stories
 def load_items(path=ITEMS_FILE):
     """Read a .jsonl file and return a list of dicts (one per line)."""
     items = []
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -83,7 +83,7 @@ def load_items(path=ITEMS_FILE):
 def load_prompt_contrasts(path=PROMPT_CONTRASTS_FILE):
     """Read data/context_prompt_contrasts.jsonl into a list of contrast dicts."""
     contrasts = []
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -335,7 +335,7 @@ def main():
         prompt_trials += build_context_prompt_trials(dimensions, items, regime)
     all_trials = single_trials + pairwise_trials + prompt_trials
 
-    with open(CONTEXT_TRIALS_FILE, "w") as f:
+    with open(CONTEXT_TRIALS_FILE, "w", encoding="utf-8") as f:
         for trial in all_trials:
             f.write(json.dumps(trial) + "\n")
 
@@ -354,7 +354,7 @@ def main():
     # it's written for inspection, but running it is a distinct future
     # decision (see build_context_pairwise_same_trials docstring).
     same_context_trials = build_context_pairwise_same_trials(dimensions, items)
-    with open(OPTIONAL_SAME_CONTEXT_TRIALS_FILE, "w") as f:
+    with open(OPTIONAL_SAME_CONTEXT_TRIALS_FILE, "w", encoding="utf-8") as f:
         for trial in same_context_trials:
             f.write(json.dumps(trial) + "\n")
     print(
@@ -371,7 +371,7 @@ def main():
     tie_allowed_trials = []
     for regime in EVALUATION_REGIMES:
         tie_allowed_trials += build_tie_allowed_pairwise_trials(dimensions, items, regime)
-    with open(TIE_ALLOWED_TRIALS_FILE, "w") as f:
+    with open(TIE_ALLOWED_TRIALS_FILE, "w", encoding="utf-8") as f:
         for trial in tie_allowed_trials:
             f.write(json.dumps(trial) + "\n")
     print(

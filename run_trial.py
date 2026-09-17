@@ -26,7 +26,7 @@ RATING_FIELDS = [
 def load_trials(path):
     """Read all trials from the .jsonl file into a list of dicts."""
     trials = []
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -77,20 +77,34 @@ def resolve_sampling_params(trial_type, regime_name):
     return SAMPLING_REGIMES[regime_name]
 
 
-def call_claude(prompt, model, sampling_params=None):
+DEFAULT_MAX_TOKENS = 4096
+
+# response_format="plain_ab" trials (see controllability_trials.RESPONSE_FORMAT)
+# only ever need a few tokens of output ("A", "Passage B", etc.), so they use
+# a much smaller cap -- every other trial type keeps DEFAULT_MAX_TOKENS.
+PLAIN_AB_MAX_TOKENS = 64
+
+
+def max_tokens_for(response_format):
+    return PLAIN_AB_MAX_TOKENS if response_format == "plain_ab" else DEFAULT_MAX_TOKENS
+
+
+def call_claude(prompt, model, sampling_params=None, max_tokens=DEFAULT_MAX_TOKENS):
     """Send the prompt as a single user message and return the reply text.
 
     sampling_params (e.g. {"temperature": 0}) are passed through to the API
     verbatim when truthy; None or {} (both mean "no override") send nothing
     extra, so the v0.1 pilot's original call shape is unchanged when this is
-    omitted.
+    omitted. max_tokens defaults to the original 4096 for every existing
+    trial type; see max_tokens_for/PLAIN_AB_MAX_TOKENS for the smaller cap
+    used by the plain A/B response format.
     """
     import anthropic  # imported here so --dry-run works without the package installed
 
     client = anthropic.Anthropic(api_key=get_api_key())
     create_kwargs = dict(
         model=model,
-        max_tokens=4096,  # required by the API; not a sampling parameter
+        max_tokens=max_tokens,  # required by the API; not a sampling parameter
         messages=[{"role": "user", "content": prompt}],
     )
     if sampling_params:
@@ -107,6 +121,11 @@ def call_claude(prompt, model, sampling_params=None):
         "stop_reason": response.stop_reason,
         "input_tokens": response.usage.input_tokens,
         "output_tokens": response.usage.output_tokens,
+        # The actual model version the API resolved the request to -- may
+        # differ from the requested alias (e.g. "claude-sonnet-5"). See
+        # trial/result field "response_model"; analysis must not silently
+        # pool different returned model versions together.
+        "response_model": getattr(response, "model", None),
     }
 
 
@@ -189,15 +208,14 @@ def validate_comparison_response(parsed):
 # we actually store, so downstream analysis never has to handle both.
 AB_TIE_FIELDS = ["plot_structure", "prose_style", "characterization", "originality", "overall_quality"]
 
-# EXCERPT rubric: used only by the standalone context-controllability
-# experiment (see context_comparisons.RUBRICS/context_analysis_common.
-# EXCERPT_RATING_FIELDS, which this must stay in sync with) -- drops
-# plot_structure (the 12 corpus items are excerpts, not necessarily complete
-# stories) and adds narrative_effectiveness. AB_TIE_FIELDS above (the "full"
-# rubric) is unchanged and remains every other experiment's default.
-EXCERPT_AB_TIE_FIELDS = ["prose_style", "characterization", "originality", "narrative_effectiveness", "overall_quality"]
-
-RUBRIC_FIELDS = {"full": AB_TIE_FIELDS, "excerpt": EXCERPT_AB_TIE_FIELDS}
+# RUBRIC_FIELDS keeps the rubric-keyed lookup used by _validate_ab_tie_shape
+# below general (an "excerpt" rubric used to live here for the standalone
+# context-controllability experiment; that experiment now uses its own
+# dedicated plain-A/B response format -- see
+# controllability_trials.RESPONSE_FORMAT/parse_plain_ab_response -- and no
+# longer goes through this AB/tie schema at all, so "excerpt" was removed as
+# dead code). "full" remains every other experiment's only rubric.
+RUBRIC_FIELDS = {"full": AB_TIE_FIELDS}
 
 # PRIMARY forced-choice schema: "tie" is not an allowed value. A model that
 # answers "tie" on a forced-choice trial fails validation -- it is never
@@ -298,7 +316,85 @@ def strip_code_fence(text):
     return text.strip()
 
 
-def parse_and_validate(response_text, trial_type, choice_mode=None, rubric="full"):
+# ---------------------------------------------------------------------------
+# "plain_ab" response format: the standalone context-controllability
+# experiment's single-outcome A/B judgment (see
+# controllability_trials.RESPONSE_FORMAT), normalized internally to
+# {"overall_quality": "A"} / {"overall_quality": "B"} so the existing
+# pairwise analysis (context_analysis_pairwise.py, with
+# categories=["overall_quality"]) can be reused unmodified. This is
+# conservative pattern matching, not an LLM parser: it only recognizes a
+# short, closed set of unambiguous forms, and never scans an arbitrary long
+# response for the first stray "A"/"B" it can find.
+# ---------------------------------------------------------------------------
+
+_PLAIN_AB_STRIP_CHARS = "*_`'\"“”‘’ \t\r\n"
+
+# Any of these substrings appearing anywhere in the (lowercased) response
+# means the model hedged, refused, or called it a tie -- never coerced into
+# a letter, even if the response also happens to start with "A" or "B".
+_PLAIN_AB_AMBIGUITY_MARKERS = (
+    "tie", "both", "neither", "unsure", "not sure", "no preference",
+    "can't decide", "cannot decide", "can't tell", "cannot tell",
+    "hard to say", "hard to tell", "difficult to say", "difficult to tell",
+    "difficult to choose", "hard to choose", "toss-up", "toss up",
+    "roughly equal", "about equal", "equally good", "equally strong",
+)
+
+# Structural forms accepted, in order: an optional "I prefer " and/or
+# "Passage " prefix, then the letter, then either the end of the string or a
+# word boundary followed by anything (so "A", "A.", "Passage B", "I prefer
+# Passage A", and "A -- because..." all match, but "Both" or "According to
+# ny reading..." do not, since the letter must be the very first token).
+_PLAIN_AB_PATTERNS = [
+    re.compile(r"i\s+prefer\s+passage\s+([ab])\b.*", re.IGNORECASE | re.DOTALL),
+    re.compile(r"i\s+prefer\s+([ab])\b.*", re.IGNORECASE | re.DOTALL),
+    re.compile(r"passage\s+([ab])\b.*", re.IGNORECASE | re.DOTALL),
+    re.compile(r"([ab])\b.*", re.IGNORECASE | re.DOTALL),
+]
+
+
+def parse_plain_ab_response(response_text):
+    """Parse a plain_ab response into ({"overall_quality": "A"|"B"}, None),
+    or (None, error) if the response isn't an unambiguous A/B judgment.
+
+    Tries a JSON fallback first ({"choice": "A"} or {"overall_quality": "A"},
+    in case a model unexpectedly wraps its answer in JSON), then falls back
+    to plain-text pattern matching. Never uses an LLM to parse; case
+    -insensitive; ignores surrounding whitespace and simple Markdown
+    emphasis/quote characters.
+    """
+    stripped = strip_code_fence(response_text).strip(_PLAIN_AB_STRIP_CHARS)
+
+    try:
+        candidate = json.loads(stripped)
+    except json.JSONDecodeError:
+        candidate = None
+
+    if candidate is not None:
+        if not isinstance(candidate, dict):
+            return None, "JSON response must be an object with a 'choice' or 'overall_quality' key"
+        value = candidate.get("overall_quality", candidate.get("choice"))
+        if not isinstance(value, str) or value.strip().upper() not in ("A", "B"):
+            return None, "JSON response must have 'choice' or 'overall_quality' set to exactly \"A\" or \"B\""
+        return {"overall_quality": value.strip().upper()}, None
+
+    lowered = stripped.lower()
+    for marker in _PLAIN_AB_AMBIGUITY_MARKERS:
+        if marker in lowered:
+            return None, f"Response reads as ambiguous/hedged (contains {marker!r}), not an unambiguous A or B"
+
+    for pattern in _PLAIN_AB_PATTERNS:
+        match = pattern.fullmatch(stripped)
+        if match:
+            return {"overall_quality": match.group(1).upper()}, None
+
+    return None, 'Response must be an unambiguous "A" or "B" (optionally "Passage A/B" or "I prefer A/B"), got: ' + repr(
+        response_text[:200]
+    )
+
+
+def parse_and_validate(response_text, trial_type, choice_mode=None, rubric="full", response_format=None):
     """Try to parse response_text as JSON and check it matches the expected shape.
 
     Returns (parsed_response, validation_error). On any failure, parsed_response
@@ -318,9 +414,9 @@ def parse_and_validate(response_text, trial_type, choice_mode=None, rubric="full
             only per category (PRIMARY forced-choice task; see
             validate_pairwise_context_response_forced). A response of "tie"
             fails validation here rather than being coerced into "A" or "B".
-          rubric ("full", the default, or "excerpt" -- see RUBRIC_FIELDS)
-            selects which 5 fields are expected; every existing call site
-            omits it and gets the unchanged "full" schema.
+          rubric ("full", the only rubric now -- see RUBRIC_FIELDS) selects
+            which 5 fields are expected; every existing call site omits it
+            and gets the unchanged "full" schema.
         "context_pairwise_same" is the OPTIONAL, never-run same-context
         trial family (context_trials.py); it carries choice_mode="forced"
         and is validated the same way as the primary task.
@@ -329,7 +425,17 @@ def parse_and_validate(response_text, trial_type, choice_mode=None, rubric="full
         schema (v0.1's integer -2..2 "preference" field), exactly as before
         this function grew a dispatch at all -- entirely separate from, and
         unaffected by, the A/B/tie string schema above.
+
+    response_format="plain_ab" (see controllability_trials.RESPONSE_FORMAT)
+    bypasses all of the above and every existing call site: it's checked
+    first, dispatches straight to parse_plain_ab_response, and is the only
+    thing that can turn a non-JSON response (plain "A"/"B" text) into a
+    valid result. Every existing trial omits response_format (None) and is
+    completely unaffected.
     """
+    if response_format == "plain_ab":
+        return parse_plain_ab_response(response_text)
+
     try:
         parsed = json.loads(strip_code_fence(response_text))
     except json.JSONDecodeError:
@@ -357,7 +463,7 @@ def save_result(result, results_file=RESULTS_FILE):
     folder = os.path.dirname(results_file)
     if folder:
         os.makedirs(folder, exist_ok=True)
-    with open(results_file, "a") as f:
+    with open(results_file, "a", encoding="utf-8") as f:
         f.write(json.dumps(result) + "\n")
 
 
@@ -418,10 +524,10 @@ def main():
         print(json.dumps(trial, indent=2))
         return
 
-    api_result = call_claude(trial["prompt"], model, sampling_params)
+    api_result = call_claude(trial["prompt"], model, sampling_params, max_tokens_for(trial.get("response_format")))
     response_text = api_result["response_text"]
     parsed_response, validation_error = parse_and_validate(
-        response_text, trial["type"], trial.get("choice_mode"), trial.get("rubric", "full")
+        response_text, trial["type"], trial.get("choice_mode"), trial.get("rubric", "full"), trial.get("response_format")
     )
 
     if validation_error:
@@ -430,6 +536,7 @@ def main():
     result = {
         "trial_id": trial["trial_id"],
         "model": model,
+        "response_model": api_result.get("response_model"),
         "stop_reason": api_result["stop_reason"],
         "input_tokens": api_result["input_tokens"],
         "output_tokens": api_result["output_tokens"],

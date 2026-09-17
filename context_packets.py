@@ -26,7 +26,7 @@ DIMENSION_ORDER = ["provenance", "writer_status", "source_venue", "editing_statu
 def load_dimensions(path=DIMENSIONS_FILE):
     """Read data/context_dimensions.jsonl into {dimension_id: dimension_dict}."""
     dimensions = {}
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
