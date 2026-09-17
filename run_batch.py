@@ -262,7 +262,9 @@ def run_one(trial, replicate_id, model, attempt_id, results_file, sampling_regim
         return "error"
 
     response_text = api_result["response_text"]
-    parsed_response, validation_error = parse_and_validate(response_text, trial["type"], trial.get("choice_mode"))
+    parsed_response, validation_error = parse_and_validate(
+        response_text, trial["type"], trial.get("choice_mode"), trial.get("rubric", "full")
+    )
 
     result = {
         "trial_id": trial["trial_id"],

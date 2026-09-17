@@ -161,7 +161,7 @@ def build_context_single_trials(dimensions, items, evaluation_regime):
 # context_contrasts.build_contrast_block)
 # ---------------------------------------------------------------------------
 
-def build_context_pairwise_trials(dimensions, items, evaluation_regime, choice_mode="forced", contrasts=None):
+def build_context_pairwise_trials(dimensions, items, evaluation_regime, choice_mode="forced", contrasts=None, rubric="full"):
     """Build the PRIMARY forced-choice context_pairwise family by default.
 
     choice_mode="forced" (the default) is the main experiment: every cell's
@@ -180,6 +180,12 @@ def build_context_pairwise_trials(dimensions, items, evaluation_regime, choice_m
     those contrasts, e.g. for a focused sub-experiment's own contrast file
     (see llm_provenance_trials.py) -- dependency injection, not a second
     trial-generation implementation.
+
+    rubric ("full", the default, or "excerpt" -- see
+    context_comparisons.RUBRICS) is forwarded to build_contrast_block
+    unchanged; every existing caller omits it and keeps generating "full"
+    -rubric trials with byte-identical block_id/trial_id/prompt output (see
+    controllability_trials.py for the "excerpt" caller).
     """
     if contrasts is None:
         contrasts = load_contrasts()
@@ -187,7 +193,7 @@ def build_context_pairwise_trials(dimensions, items, evaluation_regime, choice_m
 
     for story_1, story_2 in story_pairs(items):
         for contrast in contrasts:
-            for cell in build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regime, choice_mode):
+            for cell in build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regime, choice_mode, rubric):
                 trials.append({**cell, "type": "context_pairwise"})
     return trials
 

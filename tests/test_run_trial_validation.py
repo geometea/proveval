@@ -29,6 +29,14 @@ AB_RESPONSE = {
 
 TIE_RESPONSE = {**AB_RESPONSE, "originality": "tie"}
 
+EXCERPT_AB_RESPONSE = {
+    "prose_style": "B",
+    "characterization": "A",
+    "originality": "B",
+    "narrative_effectiveness": "A",
+    "overall_quality": "B",
+}
+
 V1_RATINGS = {"plot_structure": 3, "prose_style": 3, "characterization": 3, "originality": 3, "overall_quality": 3}
 V02_RATINGS = {"plot_structure": 7.3, "prose_style": 6.0, "characterization": 8.5, "originality": 5.5, "overall_quality": 7.0}
 
@@ -77,6 +85,54 @@ class TestTieAllowedSecondary:
         parsed, err = parse_and_validate(json.dumps(TIE_RESPONSE), "context_pairwise", "tie_allowed")
         assert err is None
         assert parsed == TIE_RESPONSE
+
+
+class TestExcerptRubric:
+    """The standalone context-controllability experiment's rubric (see
+    context_comparisons.RUBRICS/context_analysis_common.EXCERPT_RATING_FIELDS):
+    drops plot_structure, adds narrative_effectiveness. Additive -- every
+    existing call site above keeps validating the "full" rubric unchanged."""
+
+    def test_accepts_the_excerpt_field_set(self):
+        parsed, err = validate_pairwise_context_response_forced(EXCERPT_AB_RESPONSE, rubric="excerpt")
+        assert err is None
+        assert parsed == EXCERPT_AB_RESPONSE
+
+    def test_default_rubric_is_full_and_rejects_the_excerpt_field_set(self):
+        parsed, err = validate_pairwise_context_response_forced(EXCERPT_AB_RESPONSE)
+        assert parsed is None
+        assert err is not None
+
+    def test_full_rubric_response_is_rejected_under_excerpt_rubric(self):
+        parsed, err = validate_pairwise_context_response_forced(AB_RESPONSE, rubric="excerpt")
+        assert parsed is None
+        assert err is not None
+
+    def test_excerpt_rubric_still_rejects_tie_under_forced_choice(self):
+        tie_excerpt = {**EXCERPT_AB_RESPONSE, "originality": "tie"}
+        parsed, err = validate_pairwise_context_response_forced(tie_excerpt, rubric="excerpt")
+        assert parsed is None and err is not None
+
+    def test_tie_allowed_excerpt_rubric_accepts_tie(self):
+        tie_excerpt = {**EXCERPT_AB_RESPONSE, "originality": "tie"}
+        parsed, err = validate_pairwise_context_response_tie_allowed(tie_excerpt, rubric="excerpt")
+        assert err is None
+        assert parsed == tie_excerpt
+
+    def test_normalizes_british_spelling_under_excerpt_rubric_too(self):
+        british = {k.replace("characterization", "characterisation"): v for k, v in EXCERPT_AB_RESPONSE.items()}
+        parsed, err = validate_pairwise_context_response_forced(british, rubric="excerpt")
+        assert err is None
+        assert parsed["characterization"] == EXCERPT_AB_RESPONSE["characterization"]
+
+    def test_parse_and_validate_forwards_rubric_from_trial_metadata(self):
+        parsed, err = parse_and_validate(json.dumps(EXCERPT_AB_RESPONSE), "context_pairwise", "forced", "excerpt")
+        assert err is None
+        assert parsed == EXCERPT_AB_RESPONSE
+
+    def test_parse_and_validate_default_rubric_is_full(self):
+        parsed, err = parse_and_validate(json.dumps(EXCERPT_AB_RESPONSE), "context_pairwise", "forced")
+        assert parsed is None and err is not None
 
 
 class TestV1SchemaUnaffected:

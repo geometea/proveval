@@ -189,6 +189,16 @@ def validate_comparison_response(parsed):
 # we actually store, so downstream analysis never has to handle both.
 AB_TIE_FIELDS = ["plot_structure", "prose_style", "characterization", "originality", "overall_quality"]
 
+# EXCERPT rubric: used only by the standalone context-controllability
+# experiment (see context_comparisons.RUBRICS/context_analysis_common.
+# EXCERPT_RATING_FIELDS, which this must stay in sync with) -- drops
+# plot_structure (the 12 corpus items are excerpts, not necessarily complete
+# stories) and adds narrative_effectiveness. AB_TIE_FIELDS above (the "full"
+# rubric) is unchanged and remains every other experiment's default.
+EXCERPT_AB_TIE_FIELDS = ["prose_style", "characterization", "originality", "narrative_effectiveness", "overall_quality"]
+
+RUBRIC_FIELDS = {"full": AB_TIE_FIELDS, "excerpt": EXCERPT_AB_TIE_FIELDS}
+
 # PRIMARY forced-choice schema: "tie" is not an allowed value. A model that
 # answers "tie" on a forced-choice trial fails validation -- it is never
 # silently coerced into "A" or "B" (see validate_pairwise_context_response_forced).
@@ -214,32 +224,35 @@ def normalize_ab_tie_keys(parsed):
     return normalized
 
 
-def _validate_ab_tie_shape(parsed, allowed_values, allowed_values_label):
+def _validate_ab_tie_shape(parsed, allowed_values, allowed_values_label, rubric="full"):
+    fields = RUBRIC_FIELDS[rubric]
     parsed = normalize_ab_tie_keys(parsed)
-    if not isinstance(parsed, dict) or set(parsed.keys()) != set(AB_TIE_FIELDS):
+    if not isinstance(parsed, dict) or set(parsed.keys()) != set(fields):
         return None, (
-            "Response must contain exactly plot_structure, prose_style, characterization "
-            "(or characterisation), originality, and overall_quality"
+            f"Response must contain exactly {', '.join(fields[:-1])} "
+            "(characterization may also be spelled characterisation), "
+            f"and {fields[-1]}"
         )
-    for field in AB_TIE_FIELDS:
+    for field in fields:
         if parsed[field] not in allowed_values:
             return None, f"{field} must be exactly {allowed_values_label}"
     return parsed, None
 
 
-def validate_pairwise_context_response_forced(parsed):
+def validate_pairwise_context_response_forced(parsed, rubric="full"):
     """Check a PRIMARY forced-choice context_pairwise/context_prompt response.
 
     5 fields, each exactly "A" or "B" -- "tie" fails validation here rather
     than being coerced into either letter (requirement: never silently treat
     a declined choice as a real preference). Normalizes "characterisation"
-    -> "characterization" first (see normalize_ab_tie_keys). Returns
-    (normalized_parsed_or_None, error_or_None).
+    -> "characterization" first (see normalize_ab_tie_keys). rubric selects
+    which 5 fields are expected ("full", the default, or "excerpt" -- see
+    RUBRIC_FIELDS). Returns (normalized_parsed_or_None, error_or_None).
     """
-    return _validate_ab_tie_shape(parsed, FORCED_CHOICE_VALUES, '"A" or "B"')
+    return _validate_ab_tie_shape(parsed, FORCED_CHOICE_VALUES, '"A" or "B"', rubric)
 
 
-def validate_pairwise_context_response_tie_allowed(parsed):
+def validate_pairwise_context_response_tie_allowed(parsed, rubric="full"):
     """Check a SECONDARY tie-allowed hedging-diagnostic response.
 
     5 fields, each "A"/"B"/"tie". Used only for choice_mode="tie_allowed"
@@ -247,7 +260,7 @@ def validate_pairwise_context_response_tie_allowed(parsed):
     legacy "context_pairwise_same" optional family. Returns
     (normalized_parsed_or_None, error_or_None).
     """
-    return _validate_ab_tie_shape(parsed, TIE_ALLOWED_VALUES, '"A", "B", or "tie"')
+    return _validate_ab_tie_shape(parsed, TIE_ALLOWED_VALUES, '"A", "B", or "tie"', rubric)
 
 
 def validate_pairwise_context_response(parsed):
@@ -285,7 +298,7 @@ def strip_code_fence(text):
     return text.strip()
 
 
-def parse_and_validate(response_text, trial_type, choice_mode=None):
+def parse_and_validate(response_text, trial_type, choice_mode=None, rubric="full"):
     """Try to parse response_text as JSON and check it matches the expected shape.
 
     Returns (parsed_response, validation_error). On any failure, parsed_response
@@ -305,6 +318,9 @@ def parse_and_validate(response_text, trial_type, choice_mode=None):
             only per category (PRIMARY forced-choice task; see
             validate_pairwise_context_response_forced). A response of "tie"
             fails validation here rather than being coerced into "A" or "B".
+          rubric ("full", the default, or "excerpt" -- see RUBRIC_FIELDS)
+            selects which 5 fields are expected; every existing call site
+            omits it and gets the unchanged "full" schema.
         "context_pairwise_same" is the OPTIONAL, never-run same-context
         trial family (context_trials.py); it carries choice_mode="forced"
         and is validated the same way as the primary task.
@@ -329,8 +345,8 @@ def parse_and_validate(response_text, trial_type, choice_mode=None):
 
     if trial_type in ("context_pairwise", "context_prompt", "context_pairwise_same"):
         if choice_mode == "tie_allowed":
-            return validate_pairwise_context_response_tie_allowed(parsed)
-        return validate_pairwise_context_response_forced(parsed)
+            return validate_pairwise_context_response_tie_allowed(parsed, rubric)
+        return validate_pairwise_context_response_forced(parsed, rubric)
 
     error = validate_comparison_response(parsed)
     return (None, error) if error else (parsed, None)
@@ -404,7 +420,9 @@ def main():
 
     api_result = call_claude(trial["prompt"], model, sampling_params)
     response_text = api_result["response_text"]
-    parsed_response, validation_error = parse_and_validate(response_text, trial["type"], trial.get("choice_mode"))
+    parsed_response, validation_error = parse_and_validate(
+        response_text, trial["type"], trial.get("choice_mode"), trial.get("rubric", "full")
+    )
 
     if validation_error:
         print(f"Warning: invalid response for {trial['trial_id']}: {validation_error}")

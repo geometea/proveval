@@ -20,6 +20,11 @@ data/context_trials_tie_allowed.jsonl
 # with `python3 llm_provenance_trials.py`; same regeneratable build-artifact
 # concern as the other generated trial files above.
 data/llm_provenance_trials.jsonl
+# Standalone context-controllability experiment manifests -- regenerate
+# locally with `python3 controllability_trials.py`; same regeneratable
+# build-artifact concern as the other generated trial files above.
+data/controllability_trials.jsonl
+data/controllability_baseline_trials.jsonl
 # Results are never committed (see README.md) -- this project's own runs,
 # not a fixture.
 results/

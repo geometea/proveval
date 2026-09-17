@@ -55,7 +55,7 @@ def index_pairwise_by_assignment_fixed_position(observations, position="story1_a
     return index
 
 
-def analyze_pairwise_changed_diagnostic(observations, position="story1_as_a"):
+def analyze_pairwise_changed_diagnostic(observations, position="story1_as_a", categories=RATING_FIELDS):
     """SECONDARY diagnostic only -- see analyze_directional_pairwise_effects
     for the PRIMARY result. Restricted to one fixed display position (default:
     story_1 shown as Story A) so this reproduces the original "did the raw
@@ -66,6 +66,12 @@ def analyze_pairwise_changed_diagnostic(observations, position="story1_as_a"):
     are preserved here for that, but the primary answer is the function below.
     Stratified by evaluation_regime -- naturalistic and text_only_invariance
     cells are never compared against each other here.
+
+    categories defaults to the "full" rubric's RATING_FIELDS; pass
+    context_analysis_common.EXCERPT_RATING_FIELDS (or any other rubric's
+    field list) for observations using a different rubric -- see
+    context_comparisons.RUBRICS. Never duplicated per-rubric logic, just a
+    different set of parsed_response keys to read.
     """
     index = index_pairwise_by_assignment_fixed_position(observations, position)
     rows = []
@@ -73,7 +79,7 @@ def analyze_pairwise_changed_diagnostic(observations, position="story1_as_a"):
         forward, flipped = pair.get("forward"), pair.get("flipped")
         if forward is None or flipped is None:
             continue
-        for category in RATING_FIELDS:
+        for category in categories:
             forward_choice = forward["parsed_response"][category]
             flipped_choice = flipped["parsed_response"][category]
             rows.append(
@@ -129,7 +135,7 @@ def summarize_pairwise_changed_diagnostic(rows):
     summarize_grouped_change_rate(rows, lambda r: r["category"], "category")
 
 
-def analyze_directional_pairwise_effects(observations):
+def analyze_directional_pairwise_effects(observations, categories=RATING_FIELDS):
     """PRIMARY pairwise context-effect analysis, in story identity, pooling
     over the counterbalanced display position (see
     context_contrasts.build_contrast_block) and over replicates, stratified
@@ -145,12 +151,19 @@ def analyze_directional_pairwise_effects(observations):
     a single changed=True/False boolean -- two scenarios with opposite signs
     are never conflated (see offline verification item D). Naturalistic and
     text_only_invariance observations are never pooled into one estimate.
+
+    categories defaults to the "full" rubric's RATING_FIELDS; pass a
+    different rubric's field list (e.g.
+    context_analysis_common.EXCERPT_RATING_FIELDS) to analyze observations
+    recorded under that rubric instead -- see context_comparisons.RUBRICS.
+    This is the one place the set of categories is read from, so no
+    per-rubric copy of this function exists.
     """
     tallies = defaultdict(lambda: {"story_1_preferred": 0, "story_2_preferred": 0, "tie": 0, "n": 0})
     for obs in observations.values():
         if obs["type"] != "context_pairwise" or not is_forced_choice_pairwise(obs):
             continue
-        for category in RATING_FIELDS:
+        for category in categories:
             chosen = choice_to_story_id(obs, category)
             key = (obs["model"], obs["evaluation_regime"], obs["contrast_id"], obs["story_1_id"], obs["story_2_id"], category, obs["assignment"])
             t = tallies[key]
@@ -245,7 +258,7 @@ def summarize_directional_pairwise_effects(rows, by_contrast_rows):
         )
 
 
-def analyze_pairwise_cell_rates(observations):
+def analyze_pairwise_cell_rates(observations, categories=RATING_FIELDS):
     """Expose the four raw counterbalanced cells separately, never collapsed
     into the pooled directional estimate above.
 
@@ -260,12 +273,16 @@ def analyze_pairwise_cell_rates(observations):
     aggregate CSV is not the only way to see pairwise results) and the
     position/context-x-position analyses below, which are derived from
     exactly these four numbers per block.
+
+    categories defaults to the "full" rubric's RATING_FIELDS; pass a
+    different rubric's field list to analyze observations recorded under
+    that rubric instead -- see analyze_directional_pairwise_effects.
     """
     tallies = defaultdict(lambda: {"story_1_preferred": 0, "story_2_preferred": 0, "n": 0})
     for obs in observations.values():
         if obs["type"] != "context_pairwise" or not is_forced_choice_pairwise(obs):
             continue
-        for category in RATING_FIELDS:
+        for category in categories:
             chosen = choice_to_story_id(obs, category)
             key = (
                 obs["model"], obs["evaluation_regime"], obs["contrast_id"],
@@ -544,18 +561,21 @@ def compare_pairwise_regimes(directional_by_contrast_rows):
 # "hedging rate", never "uncertainty" in a strong psychological sense.
 # ---------------------------------------------------------------------------
 
-def analyze_tie_allowed_diagnostic(observations):
+def analyze_tie_allowed_diagnostic(observations, categories=RATING_FIELDS):
     """P(story_1 chosen) / P(story_2 chosen) / P(tie), in story identity, per
     (model, evaluation_regime, contrast_id, story_1_id, story_2_id, category,
     assignment) -- the tie-allowed analogue of analyze_pairwise_cell_rates,
     but reporting rates (incl. tie) rather than forced win counts, since ties
     are a real, informative outcome here rather than an excluded case.
+
+    categories defaults to the "full" rubric's RATING_FIELDS -- see
+    analyze_directional_pairwise_effects.
     """
     tallies = defaultdict(lambda: {"story_1_preferred": 0, "story_2_preferred": 0, "tie": 0, "n": 0})
     for obs in observations.values():
         if obs["type"] != "context_pairwise" or obs.get("choice_mode") != "tie_allowed":
             continue
-        for category in RATING_FIELDS:
+        for category in categories:
             chosen = choice_to_story_id(obs, category)
             key = (obs["model"], obs["evaluation_regime"], obs["contrast_id"],
                    obs["story_1_id"], obs["story_2_id"], category, obs["assignment"])
@@ -621,7 +641,9 @@ def index_prompt_by_value(observations):
     return index
 
 
-def analyze_prompt_context_effects(observations):
+def analyze_prompt_context_effects(observations, categories=RATING_FIELDS):
+    """categories defaults to the "full" rubric's RATING_FIELDS -- see
+    analyze_directional_pairwise_effects."""
     index = index_prompt_by_value(observations)
     rows = []
 
@@ -633,7 +655,7 @@ def analyze_prompt_context_effects(observations):
         for value_id, obs in values.items():
             if value_id == baseline_id:
                 continue
-            for category in RATING_FIELDS:
+            for category in categories:
                 baseline_choice = baseline_obs["parsed_response"][category]
                 treatment_choice = obs["parsed_response"][category]
                 rows.append(

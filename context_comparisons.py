@@ -54,12 +54,39 @@ ITEMS_FILE = "data/items.jsonl"
 
 CHOICE_MODES = ("forced", "tie_allowed")
 
-_CATEGORIES_BLOCK = """Categories:
-- Plot structure
-- Prose style
-- Characterisation
-- Originality
-- Overall quality"""
+# Rubric: which rating categories are asked about. "full" (the default,
+# used by every pre-existing experiment) includes plot_structure; "excerpt"
+# drops it, since the standalone context-controllability experiment's 12
+# corpus items are excerpts rather than necessarily complete stories, for
+# which plot_structure doesn't cleanly apply -- see
+# context_analysis_common.EXCERPT_RATING_FIELDS, which this must stay in
+# sync with. Adding "excerpt" is additive: every existing call site omits
+# `rubric` and gets exactly the previous "full" prompt text, unchanged.
+RUBRICS = ("full", "excerpt")
+
+_CATEGORY_DISPLAY = {
+    "full": ["Plot structure", "Prose style", "Characterisation", "Originality", "Overall quality"],
+    "excerpt": ["Prose style", "Characterisation", "Originality", "Narrative effectiveness", "Overall quality"],
+}
+
+_JSON_FIELDS = {
+    "full": ["plot_structure", "prose_style", "characterisation", "originality", "overall_quality"],
+    "excerpt": ["prose_style", "characterisation", "originality", "narrative_effectiveness", "overall_quality"],
+}
+
+
+def _categories_block(rubric):
+    return "Categories:\n" + "\n".join(f"- {c}" for c in _CATEGORY_DISPLAY[rubric])
+
+
+def _json_example(rubric, choice_mode):
+    """Illustrative example values only -- placement of "tie" doesn't need
+    to land on any particular field, just be present for tie_allowed and
+    absent for forced (see tests/test_context_comparisons.py)."""
+    example_values = {"forced": ["A", "B", "A", "B", "B"], "tie_allowed": ["A", "B", "A", "tie", "B"]}[choice_mode]
+    lines = ",\n".join(f'  "{field}": "{value}"' for field, value in zip(_JSON_FIELDS[rubric], example_values))
+    return "{\n" + lines + "\n}"
+
 
 _FORCED_INSTRUCTION = (
     "For each category, choose which story is better. "
@@ -72,22 +99,6 @@ _TIE_ALLOWED_INSTRUCTION = (
     "For each category, choose which story is better, or answer \"tie\" "
     "if you genuinely cannot distinguish them on that category."
 )
-
-_FORCED_JSON_EXAMPLE = """{
-  "plot_structure": "A",
-  "prose_style": "B",
-  "characterisation": "A",
-  "originality": "B",
-  "overall_quality": "B"
-}"""
-
-_TIE_ALLOWED_JSON_EXAMPLE = """{
-  "plot_structure": "A",
-  "prose_style": "B",
-  "characterisation": "A",
-  "originality": "tie",
-  "overall_quality": "B"
-}"""
 
 _NATURALISTIC_BODY = """{intro}
 
@@ -128,15 +139,9 @@ _REGIME_BODIES = {
     "text_only_invariance": _TEXT_ONLY_INVARIANCE_BODY,
 }
 
-_CHOICE_MODE_PARTS = {
-    "forced": {
-        "choice_instruction": _FORCED_INSTRUCTION,
-        "json_example": _FORCED_JSON_EXAMPLE,
-    },
-    "tie_allowed": {
-        "choice_instruction": _TIE_ALLOWED_INSTRUCTION,
-        "json_example": _TIE_ALLOWED_JSON_EXAMPLE,
-    },
+_CHOICE_INSTRUCTIONS = {
+    "forced": _FORCED_INSTRUCTION,
+    "tie_allowed": _TIE_ALLOWED_INSTRUCTION,
 }
 
 # Kept for backward-compatible introspection (e.g. tests/tools that enumerate
@@ -164,7 +169,7 @@ def load_story(path):
         return f.read().strip()
 
 
-def build_prompt(intro, story_a, story_b, evaluation_regime, choice_mode="forced"):
+def build_prompt(intro, story_a, story_b, evaluation_regime, choice_mode="forced", rubric="full"):
     """Fill in the comparison template with an intro sentence and two stories.
 
     intro is a complete, deterministic sentence (or two) that names the
@@ -179,14 +184,18 @@ def build_prompt(intro, story_a, story_b, evaluation_regime, choice_mode="forced
     (secondary hedging diagnostic, A/B/tie). Defaults to "forced" since that
     is the primary task; call sites building the secondary diagnostic must
     pass "tie_allowed" explicitly.
+
+    rubric selects "full" (default -- every pre-existing experiment; 5
+    categories including plot_structure) or "excerpt" (drops
+    plot_structure, adds narrative_effectiveness -- see RUBRICS). Omitting
+    it reproduces the exact previous prompt text.
     """
     body = _REGIME_BODIES[evaluation_regime]
-    parts = _CHOICE_MODE_PARTS[choice_mode]
     return body.format(
         intro=intro,
         story_a=story_a,
         story_b=story_b,
-        choice_instruction=parts["choice_instruction"],
-        categories_block=_CATEGORIES_BLOCK,
-        json_example=parts["json_example"],
+        choice_instruction=_CHOICE_INSTRUCTIONS[choice_mode],
+        categories_block=_categories_block(rubric),
+        json_example=_json_example(rubric, choice_mode),
     )

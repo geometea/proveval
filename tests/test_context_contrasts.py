@@ -93,3 +93,37 @@ def test_position_pairs_share_assignment_and_differ_only_in_position(dimensions,
     forward_b = by_key[("forward", "story2_as_a")]
     assert forward_a["context_a"]["value"] == forward_b["context_b"]["value"]
     assert forward_a["context_b"]["value"] == forward_b["context_a"]["value"]
+
+
+# ---------------------------------------------------------------------------
+# rubric threading (standalone context-controllability experiment)
+# ---------------------------------------------------------------------------
+
+def test_default_rubric_is_full_and_block_id_is_unaffected(dimensions, a_contrast):
+    default_cells = _build(dimensions, a_contrast)
+    explicit_full_cells = build_contrast_block(dimensions, a_contrast, STORY_1, STORY_2, "naturalistic", "forced", "full")
+    assert [c["block_id"] for c in default_cells] == [c["block_id"] for c in explicit_full_cells]
+    assert all(c["rubric"] == "full" for c in default_cells)
+
+
+def test_excerpt_rubric_is_recorded_on_every_cell_and_baked_into_block_id(dimensions, a_contrast):
+    full_cells = _build(dimensions, a_contrast, choice_mode="forced")
+    excerpt_cells = build_contrast_block(dimensions, a_contrast, STORY_1, STORY_2, "naturalistic", "forced", "excerpt")
+
+    assert all(c["rubric"] == "excerpt" for c in excerpt_cells)
+    full_block_ids = {c["block_id"] for c in full_cells}
+    excerpt_block_ids = {c["block_id"] for c in excerpt_cells}
+    assert full_block_ids.isdisjoint(excerpt_block_ids)
+
+
+def test_excerpt_rubric_changes_only_the_categories_not_the_contextual_framing(dimensions, a_contrast):
+    full_cells = _build(dimensions, a_contrast, choice_mode="forced")
+    excerpt_cells = build_contrast_block(dimensions, a_contrast, STORY_1, STORY_2, "naturalistic", "forced", "excerpt")
+    by_key_full = {(c["assignment"], c["position"]): c for c in full_cells}
+    by_key_excerpt = {(c["assignment"], c["position"]): c for c in excerpt_cells}
+    for key in by_key_full:
+        assert by_key_full[key]["intro"] == by_key_excerpt[key]["intro"]
+        assert by_key_full[key]["context_a"] == by_key_excerpt[key]["context_a"]
+        assert by_key_full[key]["context_b"] == by_key_excerpt[key]["context_b"]
+        assert "plot_structure" not in by_key_excerpt[key]["prompt"]
+        assert "narrative_effectiveness" in by_key_excerpt[key]["prompt"]

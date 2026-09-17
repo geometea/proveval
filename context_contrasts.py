@@ -110,7 +110,7 @@ def intro_sentence(first_clause, second_clause):
     )
 
 
-def build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regime, choice_mode="forced"):
+def build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regime, choice_mode="forced", rubric="full"):
     """Build the full 4-cell counterbalanced block for one contrast, across two
     different stories: story_1 and story_2 are the pair's fixed identities,
     crossed with BOTH of:
@@ -135,6 +135,15 @@ def build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regi
     instruction/JSON example, never the contextual framing, and is baked
     into block_id/trial_id alongside evaluation_regime so the two choice
     modes' cells never collide and are never silently pooled.
+
+    rubric ("full" or "excerpt", see context_comparisons.RUBRICS) is a
+    fifth, independent factor: it selects which 5 rating categories the
+    prompt asks about, never the contextual framing. Defaults to "full" --
+    every pre-existing experiment omits it, and block_id/trial_id are
+    byte-identical to before (the broad existing manifest must not change);
+    a non-default rubric is appended to block_id/trial_id so it can never
+    collide with a "full"-rubric block for the same contrast/pair/regime/
+    choice_mode.
 
     Earlier versions of this function held position fixed (story_1 was
     always Story A) and only varied assignment. That isolates context
@@ -166,6 +175,8 @@ def build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regi
     text_2 = load_story(story_2["path"])
     pair_id = f"{story_1['id']}_vs_{story_2['id']}"
     block_id = f"block__{contrast['id']}__{pair_id}__{evaluation_regime}__{choice_mode}"
+    if rubric != "full":
+        block_id += f"__{rubric}"
     a_clause, b_clause = contrast["a_clause"], contrast["b_clause"]
 
     # assignment -> (story_1's value/clause, story_2's value/clause)
@@ -196,10 +207,11 @@ def build_contrast_block(dimensions, contrast, story_1, story_2, evaluation_regi
                     "position": position,
                     "evaluation_regime": evaluation_regime,
                     "choice_mode": choice_mode,
+                    "rubric": rubric,
                     "context_a": {"value": value_a, "clause": clause_a},
                     "context_b": {"value": value_b, "clause": clause_b},
                     "intro": intro,
-                    "prompt": build_prompt(intro, text_a, text_b, evaluation_regime, choice_mode),
+                    "prompt": build_prompt(intro, text_a, text_b, evaluation_regime, choice_mode, rubric),
                 }
             )
     return cells

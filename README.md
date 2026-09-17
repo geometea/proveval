@@ -231,7 +231,7 @@ and deleted by hand anymore -- these run every time):
 
 ```bash
 pip install -r requirements-dev.txt
-python3 -m pytest tests/          # 166 tests, offline, no API calls, < 5s
+python3 -m pytest tests/          # 229 tests, offline, no API calls, < 5s
 ```
 
 - `test_run_trial_validation.py` — forced-choice vs. tie-allowed response
@@ -265,6 +265,17 @@ python3 -m pytest tests/          # 166 tests, offline, no API calls, < 5s
   block-level `--limit` reuse, and — via the same synthetic-fixture style as
   `test_analyze_context.py` — the antisymmetric provenance-effect matrix and
   its separation from the display-position effect.
+- `test_controllability_trials.py` / `test_analyze_controllability.py` —
+  the standalone context-controllability experiment: the 5 dedicated
+  contrasts each isolate a distinct dimension, the excerpt rubric (no
+  `plot_structure`) is threaded through correctly, both manifests' expected
+  sizes (2,640 treatment / 132 blind-baseline trials), a manual-inspection
+  checklist confirming naturalistic and text-only-invariance blocks carry
+  identical contextual framing and differ only in the ignore-context
+  instruction, `run_batch.py` block-level `--limit` reuse for both
+  manifests, and — via synthetic fixtures — the suppression-effect table,
+  the retained position-bias/leave-one-story-out diagnostics, and the
+  baseline-margin correlation.
 
 Nothing here makes an API call or reads `ANTHROPIC_API_KEY`.
 
@@ -390,3 +401,83 @@ See `llm_provenance_trials.py` and `analyze_llm_provenance.py` for the full
 rationale; `FINAL_DESIGN.md` is not rewritten around this experiment since
 it introduces no new architecture, only a second, smaller contrast set and
 manifest layered on the existing one.
+
+## Context-controllability experiment
+
+A focused sub-experiment, layered on the same v0.2 `context_pairwise`
+machinery, that asks a different question from the general benchmark: not
+just *whether* a contextual cue moves an evaluation, but *how suppressible*
+each one is. For 5 isolated context contrasts (human vs LLM provenance,
+literary-journal vs random-online source, positive vs negative reception,
+liked vs disliked user opinion, edited vs first-draft editing status —
+`data/controllability_contrasts.jsonl`), every text pair is run under both
+existing evaluation regimes, with the contextual statement *shown in both*:
+
+- `naturalistic`: the ordinary framing (`naturalistic_effect`).
+- `text_only_invariance`: the exact same contextual statement is shown, but
+  the evaluator is explicitly told to ignore it (`text_only_effect`, reusing
+  the existing instruction verbatim — no new regime is introduced).
+
+`suppression_effect = naturalistic_effect - text_only_effect` measures how
+much of the naturalistic effect the instruction removes; each trial tests
+only one context type (no combined-context trials), and every trial is an
+ordinary `"type": "context_pairwise"`, `"choice_mode": "forced"` trial built
+by the same 4-cell `build_contrast_block()` counterbalance used everywhere
+else. Trials carry `"experiment_id": "context_controllability_v1"`.
+
+Because the 12 corpus items are excerpts rather than necessarily complete
+stories, this experiment uses its own rubric (`rubric="excerpt"` — see
+`context_comparisons.RUBRICS`): `plot_structure` is dropped,
+`narrative_effectiveness` is added, and `overall_quality` is the primary
+outcome. This is additive — every other experiment keeps using the default
+`"full"` rubric, byte-identical to before.
+
+A separate blind baseline (`data/controllability_baseline_trials.jsonl`)
+shows each of the same 66 text pairs with *no* contextual framing at all,
+once in each display order (naturalistic only — there is nothing to
+instruct the evaluator to ignore). `baseline_margin = 2 * abs(p_text1_wins
+- 0.5)` measures how close to indifferent the evaluator was before any
+context was introduced, so `abs(context_effect)` can be related to it: does
+context mainly move close calls, or can it override a strong pre-existing
+textual preference? This is a plain Pearson correlation
+(`context_analysis_stats.pearson_correlation`, reused unmodified) — never a
+new statistical method, and never a Bradley-Terry/Elo ranking.
+
+```bash
+# generate both manifests: the treatment trials (66 pairs x 5 contrasts x
+# 4 cells x 2 regimes = 2,640 trials) and the blind baseline (66 pairs x
+# 2 positions = 132 trials)
+python3 controllability_trials.py
+
+# smoke test: --limit operates on whole 4-cell blocks, so --limit 2 selects
+# exactly 2 complete blocks (8 planned calls)
+python3 run_batch.py --trials-file data/controllability_trials.jsonl \
+    --results-file results/controllability/raw.jsonl \
+    --type context_pairwise --limit 2 --dry-run
+
+# the blind baseline: --limit 2 selects 2 pairs x 2 positions (4 planned calls)
+python3 run_batch.py --trials-file data/controllability_baseline_trials.jsonl \
+    --results-file results/controllability/baseline_raw.jsonl \
+    --type context_pairwise --limit 2 --dry-run
+
+# for real (needs ANTHROPIC_API_KEY; choose a deliberately small slice first)
+python3 run_batch.py --trials-file data/controllability_trials.jsonl \
+    --results-file results/controllability/raw.jsonl \
+    --type context_pairwise --limit 2
+python3 run_batch.py --trials-file data/controllability_baseline_trials.jsonl \
+    --results-file results/controllability/baseline_raw.jsonl \
+    --type context_pairwise --limit 2
+
+# analyze both results files -- console summary (the natural/text_only/
+# suppression table, position-bias and leave-one-story-out diagnostics, and
+# the baseline-margin correlation) plus tidy CSVs under
+# results/controllability/analysis/ (suppression_effects.csv,
+# pairwise_effects.csv, per_story_pair_effects.csv, position_effects.csv,
+# leave_one_story_out.csv, baseline_margin.csv,
+# context_effect_vs_baseline_margin.csv, baseline_margin_correlation.csv)
+python3 analyze_controllability.py
+```
+
+See `controllability_trials.py` and `analyze_controllability.py` for the
+full rationale; `FINAL_DESIGN.md` is not rewritten around this experiment
+for the same reason as above.
