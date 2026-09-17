@@ -53,63 +53,70 @@ PROVIDERS = tuple(DEFAULT_MODELS)
 REASONING_PROFILES_LOGICAL = ("low", "medium", "high")
 DEFAULT_REASONING_PROFILE = "low"
 
-# Default max output tokens per provider for this experiment's plain A/B
-# task. Gemini's may consume part of its output budget on internal
-# thinking even at thinking_level="low", so it gets more headroom; only the
-# VISIBLE final text is ever handed to the A/B parser.
+# Output-token budget for this experiment (controllability's plain A/B
+# task): 512 for every provider. The visible answer is still just "A"/"B" --
+# the larger cap exists so a provider's hidden/adaptive reasoning doesn't
+# consume the entire output budget before the model gets to answer (this
+# was previously 64 for three of the four providers, which is exactly the
+# failure mode: adaptive thinking can use up a 64-token cap before ever
+# emitting the visible letter).
 DEFAULT_MAX_OUTPUT_TOKENS = {
-    "anthropic": 64,
-    "openai": 64,
+    "anthropic": 512,
+    "openai": 512,
     "gemini": 512,
-    "deepseek": 64,
+    "deepseek": 512,
 }
 
 # ---------------------------------------------------------------------------
 # Reasoning profile -> provider-native settings. One table, not scattered
 # through runner code. Each provider's "low" is its own low/default-low
-# configuration (never forced to a hypothetical "zero reasoning" mode that
-# may not exist); "medium"/"high" are only mapped where the provider
-# exposes a real lever -- see each provider's inline note.
+# configuration -- never an empty {} standing in for "low reasoning" (an
+# empty settings dict is not itself a valid low-reasoning request on any of
+# these APIs; it either falls back to that provider's own default, which is
+# not necessarily "low", or -- for Claude Sonnet 5 specifically -- adaptive
+# thinking runs regardless of what `thinking` is set to, so the request
+# must still set output_config.effort explicitly to get a "low" response).
 # ---------------------------------------------------------------------------
 
 REASONING_PROFILES = {
-    # Claude Sonnet 5: "low" is the ordinary direct-judgment call with
-    # extended thinking left off (the default API behavior -- no `thinking`
-    # block sent). "medium"/"high" turn on extended thinking with a
-    # (deliberately modest, since the task itself is a one-token judgment)
-    # token budget; note this is a qualitatively different mechanism from
-    # OpenAI/Gemini's reasoning-effort levers, not a like-for-like setting.
+    # Claude Sonnet 5: thinking is ALWAYS adaptive (there is no off switch
+    # analogous to Opus 4.7/4.8's "omit thinking" behavior, and
+    # budget_tokens is REMOVED -- a 400 error -- on Sonnet 5). Depth is
+    # controlled by output_config.effort instead. Sonnet 5 also rejects
+    # temperature/top_p/top_k entirely (see run_trial.resolve_sampling_params
+    # / the provider-default sampling regime used for this experiment) --
+    # unrelated to reasoning, but a consequence of the same adaptive-thinking
+    # architecture.
     "anthropic": {
-        "low": {},
-        "medium": {"thinking": {"type": "enabled", "budget_tokens": 1024}},
-        "high": {"thinking": {"type": "enabled", "budget_tokens": 4096}},
+        "low": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}},
+        "medium": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "medium"}},
+        "high": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}},
     },
     # GPT-5.6 Responses API: reasoning.effort is the model's own documented
-    # lever. "low" is used as this experiment's default rather than
-    # assuming an effort of "none" is required/supported.
+    # lever, mapped one-to-one onto our low/medium/high.
     "openai": {
         "low": {"reasoning": {"effort": "low"}},
         "medium": {"reasoning": {"effort": "medium"}},
         "high": {"reasoning": {"effort": "high"}},
     },
-    # Gemini 3.8 Flash: thinking_level is the model's own documented lever.
+    # Gemini 3.8 Flash: generation_config.thinking_config.thinking_level is
+    # the model's own documented lever -- nested under thinking_config, not
+    # a bare top-level thinking_level (see _gemini_generation_config, used
+    # by both the direct call and the batch payload builder so they can't
+    # drift apart).
     "gemini": {
-        "low": {"thinking_level": "low"},
-        "medium": {"thinking_level": "medium"},
-        "high": {"thinking_level": "high"},
+        "low": {"thinking_config": {"thinking_level": "low"}},
+        "medium": {"thinking_config": {"thinking_level": "medium"}},
+        "high": {"thinking_config": {"thinking_level": "high"}},
     },
-    # DeepSeek V4 Pro: low/default-low reasoning mode is the plain chat
-    # completion with no extra reasoning knobs enabled. DeepSeek's
-    # higher-reasoning behavior is normally reached via a distinct model
-    # name (e.g. a "-reasoner" variant) rather than a request parameter, so
-    # "medium"/"high" are not mapped to a request-level setting here --
-    # this is exactly the "don't pretend they're equivalent" case named in
-    # the spec. Passing --reasoning-profile medium/high for deepseek keeps
-    # the request unchanged from "low" and this is recorded, not hidden.
+    # DeepSeek V4 Pro: explicitly set reasoning_effort on every request
+    # (sent via the OpenAI-compatible client's extra_body, since it isn't a
+    # parameter name the openai-python client itself defines) rather than
+    # relying on whatever DeepSeek's own default happens to be.
     "deepseek": {
-        "low": {},
-        "medium": {},
-        "high": {},
+        "low": {"reasoning_effort": "low"},
+        "medium": {"reasoning_effort": "medium"},
+        "high": {"reasoning_effort": "high"},
     },
 }
 
@@ -232,16 +239,40 @@ def _call_openai(model, prompt, max_output_tokens, reasoning_profile, settings, 
     )
 
 
+def _gemini_contents(prompt):
+    """The structured `contents` shape a native GenerateContentRequest
+    needs (a list of Content objects, each with a role and parts) -- shared
+    by the direct call and the batch payload builder so they cannot drift
+    apart. A bare string `contents=prompt` is Python-SDK-only convenience
+    sugar for the direct call; the native batch JSON format requires the
+    real structured shape, so this is used everywhere, not just in batch.
+    """
+    return [{"role": "user", "parts": [{"text": prompt}]}]
+
+
+def _gemini_generation_config(max_output_tokens, settings):
+    """generation_config, with thinking_config nested correctly (never a
+    bare top-level thinking_level) -- shared by the direct call and the
+    batch payload builder. `settings` is one of REASONING_PROFILES["gemini"]'s
+    values, e.g. {"thinking_config": {"thinking_level": "low"}}."""
+    config = {"max_output_tokens": max_output_tokens}
+    if "thinking_config" in settings:
+        config["thinking_config"] = dict(settings["thinking_config"])
+    return config
+
+
 def _call_gemini(model, prompt, max_output_tokens, reasoning_profile, settings, sampling_params=None):
     from google import genai  # lazy
-    from google.genai import types
 
     client = genai.Client(api_key=get_api_key("gemini"))
-    config = types.GenerateContentConfig(
-        max_output_tokens=max_output_tokens,
-        thinking_config=types.ThinkingConfig(thinking_level=settings.get("thinking_level")),
+    # The google-genai SDK accepts plain dicts for `contents`/`config` (it
+    # validates them the same way as its typed Content/GenerateContentConfig
+    # classes), which is exactly what lets this share _gemini_contents/
+    # _gemini_generation_config with the batch payload builder below instead
+    # of maintaining two request-building implementations.
+    response = client.models.generate_content(
+        model=model, contents=_gemini_contents(prompt), config=_gemini_generation_config(max_output_tokens, settings)
     )
-    response = client.models.generate_content(model=model, contents=prompt, config=config)
 
     usage = getattr(response, "usage_metadata", None)
     reasoning_tokens = getattr(usage, "thoughts_token_count", None) if usage is not None else None
@@ -267,18 +298,27 @@ def _call_deepseek(model, prompt, max_output_tokens, reasoning_profile, settings
     import openai  # lazy; DeepSeek uses the OpenAI-compatible client/interface
 
     client = openai.OpenAI(api_key=get_api_key("deepseek"), base_url="https://api.deepseek.com")
+    # `settings` (e.g. {"reasoning_effort": "low"}) is sent via extra_body:
+    # it isn't a parameter the openai-python client's typed signature
+    # defines, and extra_body is the documented way to pass a provider
+    # -specific field straight through into the raw request body.
     response = client.chat.completions.create(
-        model=model, messages=[{"role": "user", "content": prompt}], max_tokens=max_output_tokens
+        model=model, messages=[{"role": "user", "content": prompt}], max_tokens=max_output_tokens,
+        extra_body=dict(settings) if settings else None,
     )
     choice = response.choices[0]
     usage = getattr(response, "usage", None)
+    reasoning_tokens = None
+    if usage is not None:
+        details = getattr(usage, "completion_tokens_details", None)
+        reasoning_tokens = getattr(details, "reasoning_tokens", None) if details is not None else None
 
     return normalize_response(
         provider="deepseek", requested_model=model, response_text=choice.message.content or "",
         response_model=getattr(response, "model", None), request_id=getattr(response, "id", None),
         input_tokens=getattr(usage, "prompt_tokens", None) if usage is not None else None,
         output_tokens=getattr(usage, "completion_tokens", None) if usage is not None else None,
-        reasoning_tokens=None, stop_reason=choice.finish_reason,
+        reasoning_tokens=reasoning_tokens, stop_reason=choice.finish_reason,
         reasoning_profile=reasoning_profile, provider_reasoning_settings=settings,
         raw={"id": getattr(response, "id", None), "finish_reason": choice.finish_reason},
     )
@@ -306,6 +346,38 @@ _DIRECT_CALL_FUNCTIONS = {
 
 BATCH_SUPPORTED_PROVIDERS = ("anthropic", "openai", "gemini")
 
+# All four batch APIs (Anthropic custom_id, OpenAI custom_id, Gemini request
+# key) cap request identifiers at 64 characters and/or restrict the
+# character set. A raw "trial_id::replicate_id" string can exceed 64 chars
+# once contrast/pair/regime/rubric are baked into trial_id (see
+# controllability_trials.py's block_id scheme), so batch requests use a
+# short deterministic hash instead -- see make_short_request_id.
+SHORT_REQUEST_ID_MAX_LEN = 64
+
+
+def make_short_request_id(trial_id, replicate_id, prompt_sha256, provider, requested_model, reasoning_profile):
+    """A short (<=64 char), safe-character ("r_" + 32 hex chars = 34 chars),
+    deterministic request id for one (trial_id, replicate_id) under one
+    (provider, requested_model, reasoning_profile, prompt) identity.
+    Deterministic: the same inputs always produce the same id, so a
+    resubmission of the exact same request reuses the exact same id.
+    Unique within a batch: trial_id/replicate_id alone already uniquely
+    identify one request in any single submission, and folding in
+    prompt_sha256/provider/requested_model/reasoning_profile means an id
+    also changes if any of that identity changes (see
+    run_batch.is_completed, which requires all of these to match before a
+    saved result counts as satisfying a trial). The caller (batch_run.py)
+    keeps the local mapping from this id back to the full trial metadata --
+    this function never needs to be reversed.
+    """
+    import hashlib
+
+    basis = "\x1f".join(
+        str(part) for part in (trial_id, replicate_id, prompt_sha256, provider, requested_model, reasoning_profile)
+    )
+    digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
+    return f"r_{digest}"
+
 
 def build_batch_request_payload(provider, model, request_key, prompt, max_output_tokens, reasoning_settings):
     """Pure, network-free construction of one provider-native batch request
@@ -328,8 +400,9 @@ def build_batch_request_payload(provider, model, request_key, prompt, max_output
         return {
             "key": request_key,
             "request": {
-                "model": model, "contents": prompt,
-                "generation_config": {"max_output_tokens": max_output_tokens, **reasoning_settings},
+                "model": model,
+                "contents": _gemini_contents(prompt),
+                "generation_config": _gemini_generation_config(max_output_tokens, reasoning_settings),
             },
         }
     raise ValueError(f"{provider!r} does not support native batch submission -- supported: {BATCH_SUPPORTED_PROVIDERS}")

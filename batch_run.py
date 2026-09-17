@@ -43,6 +43,7 @@ from run_trial import (
     CONTEXT_TRIAL_TYPES,
     DEFAULT_PROVIDER,
     SAMPLING_REGIMES,
+    default_sampling_regime_for_trials,
     load_trials,
     max_tokens_for,
     parse_and_validate,
@@ -55,36 +56,115 @@ from run_trial import (
 JOB_DIR = "results/batch_jobs"
 
 
-def request_key(trial_id, replicate_id):
-    """Stable, unique per (trial_id, replicate_id) -- never derived from
-    output position, and used as the provider's custom_id/key so collected
-    results are always matched back by this, never by batch result order."""
-    return f"{trial_id}::{replicate_id}"
+def request_key(trial_id, replicate_id, prompt_sha256, provider, requested_model, reasoning_profile):
+    """Stable, unique per (trial_id, replicate_id) under one (provider,
+    requested_model, reasoning_profile, prompt) identity -- used as the
+    provider's custom_id/key so collected results are always matched back by
+    this, never by batch result order.
+
+    A short deterministic hash (see model_providers.make_short_request_id),
+    not the raw "trial_id::replicate_id" string: several provider batch APIs
+    cap request ids at 64 characters and/or restrict the character set, and a
+    raw trial_id can exceed that once contrast/pair/regime/rubric are baked
+    in (see controllability_trials.py's block_id scheme).
+    """
+    return model_providers.make_short_request_id(trial_id, replicate_id, prompt_sha256, provider, requested_model, reasoning_profile)
 
 
 def select_eligible_observations(args, provider, model):
     """Exactly the same selection run_batch.py would use: trial filters,
     block-aware --limit, replicate expansion -- then drops anything already
     completed under the current (prompt_sha256, provider, model,
-    reasoning_profile) identity. Returns (observations, existing_results)."""
+    reasoning_profile) identity. Returns (eligible, existing_results,
+    sampling_regime) -- sampling_regime is the effective regime (--sampling
+    -regime if given, else the same provider-default-for-controllability /
+    low-variance-for-everything-else default run_batch.py uses; see
+    default_sampling_regime_for_trials), applied uniformly to every trial in
+    this selection regardless of evaluation_regime."""
     trials = load_trials(args.trials_file)
     trials = select_trials(trials, args.type, args.id_prefix,
                             set(args.conditions) if args.conditions else None,
                             set(args.contrasts) if args.contrasts else None,
                             set(args.evaluation_regimes) if args.evaluation_regimes else None,
                             args.limit)
+    sampling_regime = args.sampling_regime or default_sampling_regime_for_trials(trials)
     replicates_treatment, replicates_neutral = resolve_replicate_counts(args.replicates, None, None)
     observations = build_observations(trials, replicates_treatment, replicates_neutral)
 
     existing_results = load_existing_results(args.results_file)
     eligible = []
     for trial, replicate_id in observations:
-        key = (trial["trial_id"], model, replicate_id, result_sampling_regime(trial["type"], args.sampling_regime))
+        key = (trial["trial_id"], model, replicate_id, result_sampling_regime(trial["type"], sampling_regime))
         records = existing_results.get(key, [])
         if records and is_completed(records, trial.get("prompt_sha256"), provider, model, args.reasoning_profile):
             continue
         eligible.append((trial, replicate_id))
-    return eligible, existing_results
+    return eligible, existing_results, sampling_regime
+
+
+def estimate_tokens(text):
+    """A rough, provider-independent input-token estimate for chunk sizing
+    (chars/4) -- not meant to match any provider's real tokenizer exactly,
+    only to keep --max-estimated-input-tokens-per-job in the right ballpark."""
+    return max(1, len(text) // 4)
+
+
+def group_requests_into_units(eligible):
+    """Group (trial, replicate_id) pairs sharing a block_id+replicate_id
+    together -- the same "complete experimental block" grouping run_batch.py
+    uses for selection/retries (see group_trials_into_units/
+    group_failed_candidates_into_units) -- so chunking never splits a
+    context_pairwise 4-cell block across two batch jobs while it still fits
+    in one. Trials without a block_id (context_single, context_prompt, and
+    every v0.1 trial type) are each their own singleton unit."""
+    units = []
+    block_index = {}
+    for trial, replicate_id in eligible:
+        block_id = trial.get("block_id")
+        if block_id is None:
+            units.append([(trial, replicate_id)])
+            continue
+        key = (block_id, replicate_id)
+        if key not in block_index:
+            block_index[key] = []
+            units.append(block_index[key])
+        block_index[key].append((trial, replicate_id))
+    return units
+
+
+def chunk_requests(eligible, max_requests_per_job=None, max_estimated_input_tokens_per_job=None):
+    """Split eligible (trial, replicate_id) pairs into one or more batch job
+    chunks respecting both limits (either or both may be None, meaning no
+    limit). A complete block+replicate unit (see group_requests_into_units)
+    is always kept together in one chunk where practical; a single unit that
+    alone exceeds a limit still becomes its own (oversized) chunk rather than
+    being split or dropped, since splitting a unit would violate "never
+    duplicate requests across jobs" and dropping would lose requests
+    entirely. Never duplicates or drops a request. Returns a list of chunks,
+    each chunk a list of (trial, replicate_id) pairs; an empty `eligible`
+    returns an empty list of chunks, not a list containing one empty chunk.
+    """
+    if max_requests_per_job is None and max_estimated_input_tokens_per_job is None:
+        return [eligible] if eligible else []
+
+    chunks = []
+    current = []
+    current_count = 0
+    current_tokens = 0
+    for unit in group_requests_into_units(eligible):
+        unit_count = len(unit)
+        unit_tokens = sum(estimate_tokens(trial["prompt"]) for trial, _ in unit)
+        exceeds_count = max_requests_per_job is not None and current_count + unit_count > max_requests_per_job
+        exceeds_tokens = max_estimated_input_tokens_per_job is not None and current_tokens + unit_tokens > max_estimated_input_tokens_per_job
+        if current and (exceeds_count or exceeds_tokens):
+            chunks.append(current)
+            current, current_count, current_tokens = [], 0, 0
+        current.extend(unit)
+        current_count += unit_count
+        current_tokens += unit_tokens
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def add_common_selection_arguments(parser):
@@ -95,7 +175,9 @@ def add_common_selection_arguments(parser):
     parser.add_argument("--reasoning-profile", choices=list(model_providers.REASONING_PROFILES_LOGICAL),
                          default=model_providers.DEFAULT_REASONING_PROFILE,
                          help=f"Provider-neutral reasoning level (default: {model_providers.DEFAULT_REASONING_PROFILE})")
-    parser.add_argument("--sampling-regime", choices=list(SAMPLING_REGIMES), default="low_variance_primary")
+    parser.add_argument("--sampling-regime", choices=list(SAMPLING_REGIMES), default=None,
+                         help="Default: provider_default_secondary when every selected trial is a plain_ab "
+                         "(controllability) trial, low_variance_primary otherwise -- see default_sampling_regime_for_trials.")
     parser.add_argument("--replicates", type=int, default=1)
     parser.add_argument("--type", help="Only select this trial type")
     parser.add_argument("--id-prefix", help="Only select trials whose trial_id starts with this prefix")
@@ -104,6 +186,14 @@ def add_common_selection_arguments(parser):
     parser.add_argument("--evaluation-regime", action="append", dest="evaluation_regimes",
                          choices=["naturalistic", "text_only_invariance"])
     parser.add_argument("--limit", type=int, help="Only select the first N units (whole 4-cell context_pairwise blocks, or one trial for every other type)")
+    parser.add_argument("--max-requests-per-job", type=int,
+                         help="Split eligible requests into multiple batch jobs of at most this many requests each "
+                         "(default: no limit -- one job for everything eligible). Never splits a complete "
+                         "context_pairwise block+replicate across jobs unless the block alone exceeds this.")
+    parser.add_argument("--max-estimated-input-tokens-per-job", type=int,
+                         help="Split eligible requests into multiple batch jobs whose prompts are estimated (chars/4) "
+                         "to total at most this many input tokens each (default: no limit). Combinable with "
+                         "--max-requests-per-job; a job is cut whenever either limit would be exceeded.")
     parser.add_argument("--dry-run", action="store_true", help="Select and build requests, print counts, make no network calls")
 
 
@@ -119,64 +209,88 @@ def cmd_submit(args):
             f"--concurrency 20 --trials-file {args.trials_file} --results-file {args.results_file}"
         )
 
-    eligible, _ = select_eligible_observations(args, provider, model)
+    eligible, _, sampling_regime = select_eligible_observations(args, provider, model)
     reasoning_settings = model_providers.resolve_reasoning_settings(provider, args.reasoning_profile)
     max_output_tokens = max_tokens_for(provider, eligible[0][0].get("response_format") if eligible else None)
 
-    requests = []
-    request_meta = {}
-    for trial, replicate_id in eligible:
-        key = request_key(trial["trial_id"], replicate_id)
-        if key in request_meta:
-            raise ValueError(f"Duplicate request key: {key!r}")  # (trial_id, replicate_id) must be unique per submission
-        requests.append({"request_key": key, "prompt": trial["prompt"]})
-        request_meta[key] = {
-            "trial_id": trial["trial_id"],
-            "replicate_id": replicate_id,
-            "prompt_sha256": trial.get("prompt_sha256"),
-        }
-
     print(f"Provider: {provider}  Model: {model}  Reasoning profile: {args.reasoning_profile} (settings: {reasoning_settings})")
-    print(f"Eligible requests (not already completed): {len(requests)}")
+    print(f"Sampling regime: {sampling_regime}")
+    print(f"Eligible requests (not already completed): {len(eligible)}")
 
-    if args.dry_run:
-        payloads = [
-            model_providers.build_batch_request_payload(provider, model, r["request_key"], r["prompt"], max_output_tokens, reasoning_settings)
-            for r in requests
-        ]
-        assert len({p.get("custom_id") or p.get("key") for p in payloads}) == len(payloads), "duplicate request id in batch payload"
-        print(f"Constructed {len(payloads)} provider-native request payload(s). No network calls made.")
+    # One job per chunk (see chunk_requests): --max-requests-per-job /
+    # --max-estimated-input-tokens-per-job split the eligible set into
+    # several provider batch jobs when a single job could be too large --
+    # no request is ever duplicated across chunks or dropped, and a
+    # complete context_pairwise block+replicate is kept in one chunk unless
+    # it alone exceeds a limit (see group_requests_into_units).
+    chunks = chunk_requests(eligible, args.max_requests_per_job, args.max_estimated_input_tokens_per_job)
+    if len(chunks) > 1:
+        print(f"Split into {len(chunks)} job(s) to respect the configured per-job limit(s).")
+
+    if not chunks:
+        if args.dry_run:
+            print("Constructed 0 provider-native request payload(s). No network calls made.")
+        else:
+            print("Nothing to submit.")
         return
 
-    if not requests:
-        print("Nothing to submit.")
-        return
+    created_job_paths = []
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        job_label = f"[job {chunk_index}/{len(chunks)}] " if len(chunks) > 1 else ""
 
-    submitted = model_providers.submit_batch(provider, model, requests, args.reasoning_profile, max_output_tokens)
+        requests = []
+        request_meta = {}
+        for trial, replicate_id in chunk:
+            key = request_key(trial["trial_id"], replicate_id, trial.get("prompt_sha256"), provider, model, args.reasoning_profile)
+            if key in request_meta:
+                raise ValueError(f"Duplicate request key: {key!r}")  # (trial_id, replicate_id, prompt, provider, model, reasoning_profile) must be unique per submission
+            requests.append({"request_key": key, "prompt": trial["prompt"]})
+            request_meta[key] = {
+                "trial_id": trial["trial_id"],
+                "replicate_id": replicate_id,
+                "prompt_sha256": trial.get("prompt_sha256"),
+            }
 
-    os.makedirs(JOB_DIR, exist_ok=True)
-    created_at = datetime.now(timezone.utc).isoformat()
-    job_id = f"{provider}_{submitted['provider_batch_id']}".replace("/", "_")
-    job_path = os.path.join(JOB_DIR, f"{job_id}.json")
-    job = {
-        "provider": provider,
-        "provider_batch_id": submitted["provider_batch_id"],
-        "requested_model": model,
-        "reasoning_profile": args.reasoning_profile,
-        "provider_reasoning_settings": reasoning_settings,
-        "created_at": created_at,
-        "trials_file": args.trials_file,
-        "results_file": args.results_file,
-        "sampling_regime": args.sampling_regime,
-        "request_count": len(requests),
-        "requests": request_meta,
-        "collected_request_keys": [],
-    }
-    with open(job_path, "w", encoding="utf-8") as f:
-        json.dump(job, f, indent=2)
+        if args.dry_run:
+            payloads = [
+                model_providers.build_batch_request_payload(provider, model, r["request_key"], r["prompt"], max_output_tokens, reasoning_settings)
+                for r in requests
+            ]
+            assert len({p.get("custom_id") or p.get("key") for p in payloads}) == len(payloads), "duplicate request id in batch payload"
+            print(f"{job_label}Constructed {len(payloads)} provider-native request payload(s). No network calls made.")
+            continue
 
-    print(f"Submitted batch job: {submitted['provider_batch_id']}")
-    print(f"Job file: {job_path}")
+        submitted = model_providers.submit_batch(provider, model, requests, args.reasoning_profile, max_output_tokens)
+
+        os.makedirs(JOB_DIR, exist_ok=True)
+        created_at = datetime.now(timezone.utc).isoformat()
+        job_id = f"{provider}_{submitted['provider_batch_id']}".replace("/", "_")
+        if len(chunks) > 1:
+            job_id = f"{job_id}_part{chunk_index}of{len(chunks)}"
+        job_path = os.path.join(JOB_DIR, f"{job_id}.json")
+        job = {
+            "provider": provider,
+            "provider_batch_id": submitted["provider_batch_id"],
+            "requested_model": model,
+            "reasoning_profile": args.reasoning_profile,
+            "provider_reasoning_settings": reasoning_settings,
+            "created_at": created_at,
+            "trials_file": args.trials_file,
+            "results_file": args.results_file,
+            "sampling_regime": sampling_regime,
+            "request_count": len(requests),
+            "requests": request_meta,
+            "collected_request_keys": [],
+        }
+        with open(job_path, "w", encoding="utf-8") as f:
+            json.dump(job, f, indent=2)
+
+        print(f"{job_label}Submitted batch job: {submitted['provider_batch_id']}")
+        print(f"{job_label}Job file: {job_path}")
+        created_job_paths.append(job_path)
+
+    if not args.dry_run and len(chunks) > 1:
+        print(f"Created {len(created_job_paths)} batch job(s): {created_job_paths}")
 
 
 def load_job(job_file):
@@ -200,6 +314,39 @@ def cmd_status(args):
     print(f"Collected so far: {collected} / {job['request_count']}")
 
 
+def load_results_index_by_full_key(path):
+    """Index existing result rows by (trial_id, replicate_id, provider,
+    requested_model, reasoning_profile, prompt_sha256) -- the same evaluator-
+    identity tuple is_completed() checks -- so a resubmitted/re-collected
+    request's attempt number can be computed from what's actually already
+    saved, instead of every collected result hardcoding attempt_id=1. A
+    failed request that gets resubmitted and re-collected under the same
+    identity becomes attempt 2, 3, etc.; every earlier attempt (including
+    failures) is preserved, never overwritten."""
+    index = {}
+    if not os.path.exists(path):
+        return index
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            prompt_sha256 = (row.get("trial_meta") or {}).get("prompt_sha256")
+            key = (row["trial_id"], row.get("replicate_id"), row.get("provider"),
+                   row.get("requested_model"), row.get("reasoning_profile"), prompt_sha256)
+            index.setdefault(key, []).append(row)
+    return index
+
+
+def next_attempt_id_for(index, trial_id, replicate_id, provider, requested_model, reasoning_profile, prompt_sha256):
+    key = (trial_id, replicate_id, provider, requested_model, reasoning_profile, prompt_sha256)
+    records = index.get(key, [])
+    if not records:
+        return 1
+    return max(r.get("attempt_id", 1) for r in records) + 1
+
+
 def cmd_collect(args):
     job = load_job(args.job_file)
     provider = job["provider"]
@@ -216,12 +363,18 @@ def cmd_collect(args):
         return
 
     trials_by_id = {t["trial_id"]: t for t in load_trials(job["trials_file"])}
+    attempt_index = load_results_index_by_full_key(job["results_file"])
     counts = {"valid": 0, "invalid": 0, "error": 0}
 
     for key, outcome in results.items():
         meta = job["requests"][key]
         trial = trials_by_id.get(meta["trial_id"])
         timestamp = datetime.now(timezone.utc).isoformat()
+        prompt_sha256 = meta.get("prompt_sha256")
+        attempt_id = next_attempt_id_for(
+            attempt_index, meta["trial_id"], meta["replicate_id"], provider,
+            job["requested_model"], job["reasoning_profile"], prompt_sha256,
+        )
 
         base_result = {
             "trial_id": meta["trial_id"],
@@ -232,7 +385,7 @@ def cmd_collect(args):
             "provider_reasoning_settings": job["provider_reasoning_settings"],
             "execution_mode": "batch",
             "replicate_id": meta["replicate_id"],
-            "attempt_id": 1,
+            "attempt_id": attempt_id,
             "timestamp": timestamp,
         }
         trial_meta = trial_metadata(trial) if trial is not None and trial["type"] in CONTEXT_TRIAL_TYPES else None
@@ -240,7 +393,8 @@ def cmd_collect(args):
         if "error" in outcome:
             result = {
                 **base_result, "response_model": None, "stop_reason": None,
-                "input_tokens": None, "output_tokens": None, "response_text": None,
+                "input_tokens": None, "output_tokens": None, "reasoning_tokens": None,
+                "request_id": None, "response_text": None,
                 "parsed_response": None, "validation_error": f"API call failed: {outcome['error']}",
             }
             counts["error"] += 1
@@ -255,7 +409,8 @@ def cmd_collect(args):
             result = {
                 **base_result, "response_model": outcome.get("response_model"),
                 "stop_reason": outcome.get("stop_reason"), "input_tokens": outcome.get("input_tokens"),
-                "output_tokens": outcome.get("output_tokens"), "response_text": response_text,
+                "output_tokens": outcome.get("output_tokens"), "reasoning_tokens": outcome.get("reasoning_tokens"),
+                "request_id": outcome.get("request_id"), "response_text": response_text,
                 "parsed_response": parsed_response, "validation_error": validation_error,
             }
             counts["invalid" if validation_error else "valid"] += 1
@@ -265,6 +420,9 @@ def cmd_collect(args):
         result["sampling_regime"] = job["sampling_regime"]
 
         save_result(result, job["results_file"])
+        attempt_index.setdefault(
+            (meta["trial_id"], meta["replicate_id"], provider, job["requested_model"], job["reasoning_profile"], prompt_sha256), []
+        ).append(result)
         already_collected.add(key)
 
     job["collected_request_keys"] = sorted(already_collected)

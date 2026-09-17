@@ -75,6 +75,34 @@ SAMPLING_REGIMES = {
 }
 
 
+def is_controllability_trial(trial):
+    """The standalone context-controllability experiment's plain A/B trials
+    (see controllability_trials.RESPONSE_FORMAT) -- the only trial kind that
+    uses provider-default sampling by default (see
+    default_sampling_regime_for_trials)."""
+    return trial.get("response_format") == "plain_ab"
+
+
+def default_sampling_regime_for_trials(trials):
+    """The --sampling-regime default when the flag isn't explicitly passed.
+
+    Production controllability runs (context_controllability_v1) use
+    provider-default sampling (SAMPLING_REGIMES["provider_default_secondary"])
+    rather than temperature=0: Claude Sonnet 5 rejects temperature/top_p/top_k
+    entirely (see model_providers.REASONING_PROFILES's Anthropic docstring),
+    so low_variance_primary is not just unnecessary but actively incompatible
+    with this experiment's evaluators. Every pre-existing (non-controllability)
+    trial type keeps the original low_variance_primary default, unaffected --
+    this only changes behavior when every selected trial is a plain_ab trial.
+    Applied uniformly regardless of evaluation_regime (naturalistic vs
+    text_only_invariance): both regimes for one evaluator are always selected
+    together and so always get the same default here.
+    """
+    if trials and all(is_controllability_trial(t) for t in trials):
+        return "provider_default_secondary"
+    return "low_variance_primary"
+
+
 def resolve_sampling_params(trial_type, regime_name):
     """Only v0.2 context trial types carry an explicit sampling regime. v0.1
     trial types ("single", "comparison", "comparison_control") return None,
@@ -505,9 +533,11 @@ def main():
     parser.add_argument(
         "--sampling-regime",
         choices=list(SAMPLING_REGIMES),
-        default="low_variance_primary",
+        default=None,
         help="v0.2 context trial types only (ignored, and not recorded, for v0.1 trial types): "
-        "low_variance_primary (default; temperature=0, Anthropic only) or provider_default_secondary",
+        "low_variance_primary (temperature=0, Anthropic only) or provider_default_secondary. "
+        "Default: provider_default_secondary for a plain_ab (controllability) trial, "
+        "low_variance_primary for everything else -- see default_sampling_regime_for_trials.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print the trial without calling the API")
     args = parser.parse_args()
@@ -521,14 +551,15 @@ def main():
         print(f"No trial found with trial_id: {args.trial_id}")
         return
 
-    sampling_params = resolve_sampling_params(trial["type"], args.sampling_regime)
+    sampling_regime = args.sampling_regime or default_sampling_regime_for_trials([trial])
+    sampling_params = resolve_sampling_params(trial["type"], sampling_regime)
     reasoning_settings = model_providers.resolve_reasoning_settings(provider, args.reasoning_profile)
     max_output_tokens = max_tokens_for(provider, trial.get("response_format"))
 
     if args.dry_run:
         print(f"Provider: {provider}  Model: {model}  Reasoning profile: {args.reasoning_profile} (settings: {reasoning_settings})")
         if sampling_params is not None:
-            print(f"Sampling regime: {args.sampling_regime}  (params: {sampling_params})")
+            print(f"Sampling regime: {sampling_regime}  (params: {sampling_params})")
         print("Trial:")
         print(json.dumps(trial, indent=2))
         return
@@ -554,6 +585,8 @@ def main():
         "stop_reason": api_result["stop_reason"],
         "input_tokens": api_result["input_tokens"],
         "output_tokens": api_result["output_tokens"],
+        "reasoning_tokens": api_result.get("reasoning_tokens"),
+        "request_id": api_result.get("request_id"),
         "response_text": response_text,
         "parsed_response": parsed_response,
         "validation_error": validation_error,
@@ -561,7 +594,7 @@ def main():
     if trial["type"] in CONTEXT_TRIAL_TYPES:
         result["trial_meta"] = trial_metadata(trial)
     if sampling_params is not None:
-        result["sampling_regime"] = args.sampling_regime
+        result["sampling_regime"] = sampling_regime
         result["sampling_params"] = sampling_params
 
     save_result(result, args.results_file)

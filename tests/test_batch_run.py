@@ -115,7 +115,7 @@ def write_result(results_file, trial, replicate_id=1, provider="anthropic", mode
     row = {
         "trial_id": trial["trial_id"], "model": model, "requested_model": model, "provider": provider,
         "reasoning_profile": reasoning_profile, "replicate_id": replicate_id, "attempt_id": 1,
-        "sampling_regime": "low_variance_primary",
+        "sampling_regime": "provider_default_secondary",  # these make_trial() fixtures are plain_ab (controllability) trials
         "parsed_response": {"overall_quality": "A"} if valid else None,
         "validation_error": None if valid else "invalid",
         "trial_meta": {**{k: v for k, v in trial.items() if k != "prompt"}, "prompt_sha256": prompt_sha256 or trial["prompt_sha256"]},
@@ -186,7 +186,7 @@ class TestSubmitCompletionIdentity:
         trials_path, trials = trials_file
         row = {
             "trial_id": trials[0]["trial_id"], "model": "claude-sonnet-5", "replicate_id": 1, "attempt_id": 1,
-            "sampling_regime": "low_variance_primary",
+            "sampling_regime": "provider_default_secondary",  # these make_trial() fixtures are plain_ab (controllability) trials
             "parsed_response": {"overall_quality": "A"}, "validation_error": None,
             "trial_meta": {k: v for k, v in trials[0].items() if k != "prompt"},
         }
@@ -264,7 +264,8 @@ class TestCollect:
     def _job(self, tmp_path, trials_path, results_path, trials):
         job_dir = tmp_path / "batch_jobs"
         requests = {
-            batch_run.request_key(t["trial_id"], 1): {"trial_id": t["trial_id"], "replicate_id": 1, "prompt_sha256": t["prompt_sha256"]}
+            batch_run.request_key(t["trial_id"], 1, t["prompt_sha256"], "anthropic", "claude-sonnet-5", "low"):
+                {"trial_id": t["trial_id"], "replicate_id": 1, "prompt_sha256": t["prompt_sha256"]}
             for t in trials
         }
         job = {
@@ -299,7 +300,7 @@ class TestCollect:
         trials_path, trials = trials_file
         block_a = [trials[0]]
         job_dir = tmp_path / "batch_jobs"
-        key = batch_run.request_key(block_a[0]["trial_id"], 7)
+        key = batch_run.request_key(block_a[0]["trial_id"], 7, block_a[0]["prompt_sha256"], "anthropic", "claude-sonnet-5", "low")
         job = {
             "provider": "anthropic", "provider_batch_id": "batch_xyz", "requested_model": "claude-sonnet-5",
             "reasoning_profile": "low", "provider_reasoning_settings": {}, "created_at": "now",
@@ -319,7 +320,7 @@ class TestCollect:
         trials_path, trials = trials_file
         block_a = [trials[0]]
         job_path = self._job(tmp_path, trials_path, results_file, block_a)
-        key = batch_run.request_key(block_a[0]["trial_id"], 1)
+        key = batch_run.request_key(block_a[0]["trial_id"], 1, block_a[0]["prompt_sha256"], "anthropic", "claude-sonnet-5", "low")
 
         monkeypatch.setattr(model_providers, "collect_batch", lambda p, b, keys: {key: {"error": "rate_limited"}})
         monkeypatch.setattr(sys, "argv", ["batch_run.py", "collect", "--job-file", job_path])
@@ -334,7 +335,7 @@ class TestCollect:
         trials_path, trials = trials_file
         block_a = [trials[0]]
         job_path = self._job(tmp_path, trials_path, results_file, block_a)
-        key = batch_run.request_key(block_a[0]["trial_id"], 1)
+        key = batch_run.request_key(block_a[0]["trial_id"], 1, block_a[0]["prompt_sha256"], "anthropic", "claude-sonnet-5", "low")
 
         call_count = {"n": 0}
 
@@ -358,7 +359,7 @@ class TestCollect:
         trials_path, trials = trials_file
         block_a = [trials[0]]
         job_path = self._job(tmp_path, trials_path, results_file, block_a)
-        key = batch_run.request_key(block_a[0]["trial_id"], 1)
+        key = batch_run.request_key(block_a[0]["trial_id"], 1, block_a[0]["prompt_sha256"], "anthropic", "claude-sonnet-5", "low")
 
         monkeypatch.setattr(model_providers, "collect_batch", lambda p, b, keys: {key: model_providers.normalize_response("anthropic", "claude-sonnet-5", "I really can't decide")})
         monkeypatch.setattr(sys, "argv", ["batch_run.py", "collect", "--job-file", job_path])
@@ -367,3 +368,217 @@ class TestCollect:
         rows = [json.loads(line) for line in open(results_file, encoding="utf-8")]
         assert rows[0]["parsed_response"] is None
         assert rows[0]["validation_error"] is not None
+
+    def test_reasoning_tokens_and_request_id_survive_collection(self, monkeypatch, tmp_path, trials_file, results_file):
+        trials_path, trials = trials_file
+        block_a = [trials[0]]
+        job_path = self._job(tmp_path, trials_path, results_file, block_a)
+        key = batch_run.request_key(block_a[0]["trial_id"], 1, block_a[0]["prompt_sha256"], "anthropic", "claude-sonnet-5", "low")
+
+        outcome = model_providers.normalize_response("anthropic", "claude-sonnet-5", "A", reasoning_tokens=None, request_id="msg_xyz")
+        monkeypatch.setattr(model_providers, "collect_batch", lambda p, b, keys: {key: outcome})
+        monkeypatch.setattr(sys, "argv", ["batch_run.py", "collect", "--job-file", job_path])
+        batch_run.main()
+
+        rows = [json.loads(line) for line in open(results_file, encoding="utf-8")]
+        assert rows[0]["request_id"] == "msg_xyz"
+        assert rows[0]["reasoning_tokens"] is None  # absence never fabricated as a value
+
+    def test_error_outcome_records_null_usage_metadata(self, monkeypatch, tmp_path, trials_file, results_file):
+        trials_path, trials = trials_file
+        block_a = [trials[0]]
+        job_path = self._job(tmp_path, trials_path, results_file, block_a)
+        key = batch_run.request_key(block_a[0]["trial_id"], 1, block_a[0]["prompt_sha256"], "anthropic", "claude-sonnet-5", "low")
+
+        monkeypatch.setattr(model_providers, "collect_batch", lambda p, b, keys: {key: {"error": "rate_limited"}})
+        monkeypatch.setattr(sys, "argv", ["batch_run.py", "collect", "--job-file", job_path])
+        batch_run.main()
+
+        rows = [json.loads(line) for line in open(results_file, encoding="utf-8")]
+        assert rows[0]["reasoning_tokens"] is None
+        assert rows[0]["request_id"] is None
+
+
+def make_job(tmp_path, trials_path, results_path, trials, reasoning_profile="low"):
+    job_dir = tmp_path / "batch_jobs"
+    requests = {
+        batch_run.request_key(t["trial_id"], 1, t["prompt_sha256"], "anthropic", "claude-sonnet-5", reasoning_profile):
+            {"trial_id": t["trial_id"], "replicate_id": 1, "prompt_sha256": t["prompt_sha256"]}
+        for t in trials
+    }
+    job = {
+        "provider": "anthropic", "provider_batch_id": "batch_xyz", "requested_model": "claude-sonnet-5",
+        "reasoning_profile": reasoning_profile, "provider_reasoning_settings": {}, "created_at": "now",
+        "trials_file": trials_path, "results_file": results_path, "sampling_regime": "provider_default_secondary",
+        "request_count": len(requests), "requests": requests, "collected_request_keys": [],
+    }
+    return write_job_file(job_dir, job)
+
+
+# ---------------------------------------------------------------------------
+# Attempt bookkeeping: a resubmitted/re-collected failure must become
+# attempt 2, 3, ... -- never hardcoded to 1 -- scoped to the full evaluator
+# identity (trial_id, replicate_id, provider, requested_model,
+# reasoning_profile, prompt_sha256).
+# ---------------------------------------------------------------------------
+
+class TestCollectAttemptBookkeeping:
+    def test_resubmitted_failure_becomes_attempt_2(self, monkeypatch, tmp_path, trials_file, results_file):
+        trials_path, trials = trials_file
+        block_a = [trials[0]]
+        key = batch_run.request_key(block_a[0]["trial_id"], 1, block_a[0]["prompt_sha256"], "anthropic", "claude-sonnet-5", "low")
+
+        job_path_1 = make_job(tmp_path, trials_path, results_file, block_a)
+        monkeypatch.setattr(model_providers, "collect_batch", lambda p, b, keys: {key: {"error": "rate_limited"}})
+        monkeypatch.setattr(sys, "argv", ["batch_run.py", "collect", "--job-file", job_path_1])
+        batch_run.main()
+
+        rows = [json.loads(line) for line in open(results_file, encoding="utf-8")]
+        assert len(rows) == 1
+        assert rows[0]["attempt_id"] == 1
+
+        # a brand-new job for the exact same evaluator identity, as if the
+        # failed request had been resubmitted in a fresh batch
+        job_path_2 = make_job(tmp_path, trials_path, results_file, block_a)
+        monkeypatch.setattr(model_providers, "collect_batch", lambda p, b, keys: {key: model_providers.normalize_response("anthropic", "claude-sonnet-5", "A")})
+        monkeypatch.setattr(sys, "argv", ["batch_run.py", "collect", "--job-file", job_path_2])
+        batch_run.main()
+
+        rows = [json.loads(line) for line in open(results_file, encoding="utf-8")]
+        assert len(rows) == 2  # both attempts preserved, never overwritten
+        assert rows[1]["attempt_id"] == 2
+        assert rows[1]["parsed_response"] == {"overall_quality": "A"}
+
+    def test_attempt_counter_is_scoped_to_the_full_evaluator_identity(self, monkeypatch, tmp_path, trials_file, results_file):
+        """A failed attempt under reasoning_profile=low must never bump the
+        attempt counter for a distinct reasoning_profile=high evaluator of
+        the same trial/replicate -- they're different evaluators, not
+        retries of each other."""
+        trials_path, trials = trials_file
+        block_a = [trials[0]]
+
+        key_low = batch_run.request_key(block_a[0]["trial_id"], 1, block_a[0]["prompt_sha256"], "anthropic", "claude-sonnet-5", "low")
+        job_low = make_job(tmp_path, trials_path, results_file, block_a, reasoning_profile="low")
+        monkeypatch.setattr(model_providers, "collect_batch", lambda p, b, keys: {key_low: {"error": "rate_limited"}})
+        monkeypatch.setattr(sys, "argv", ["batch_run.py", "collect", "--job-file", job_low])
+        batch_run.main()
+
+        key_high = batch_run.request_key(block_a[0]["trial_id"], 1, block_a[0]["prompt_sha256"], "anthropic", "claude-sonnet-5", "high")
+        job_high = make_job(tmp_path, trials_path, results_file, block_a, reasoning_profile="high")
+        monkeypatch.setattr(model_providers, "collect_batch", lambda p, b, keys: {key_high: model_providers.normalize_response("anthropic", "claude-sonnet-5", "A")})
+        monkeypatch.setattr(sys, "argv", ["batch_run.py", "collect", "--job-file", job_high])
+        batch_run.main()
+
+        rows = [json.loads(line) for line in open(results_file, encoding="utf-8")]
+        high_row = next(r for r in rows if r["reasoning_profile"] == "high")
+        assert high_row["attempt_id"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Batch job chunking (--max-requests-per-job / --max-estimated-input-tokens
+# -per-job): never duplicates or drops a request, keeps a whole
+# context_pairwise block+replicate in one chunk where practical.
+# ---------------------------------------------------------------------------
+
+class TestChunkRequests:
+    def test_no_limits_returns_a_single_chunk(self):
+        eligible = [(t, 1) for t in make_block("block_a")]
+        assert batch_run.chunk_requests(eligible) == [eligible]
+
+    def test_empty_eligible_returns_no_chunks(self):
+        assert batch_run.chunk_requests([]) == []
+        assert batch_run.chunk_requests([], max_requests_per_job=4) == []
+
+    def test_max_requests_per_job_splits_but_keeps_each_block_whole(self):
+        eligible = [(t, 1) for t in make_block("block_a") + make_block("block_b")]
+        chunks = batch_run.chunk_requests(eligible, max_requests_per_job=4)
+        assert len(chunks) == 2
+        assert all(len(chunk) == 4 for chunk in chunks)
+        assert len({t["block_id"] for t, _ in chunks[0]}) == 1
+        assert len({t["block_id"] for t, _ in chunks[1]}) == 1
+
+    def test_never_duplicates_or_drops_requests(self):
+        eligible = [(t, 1) for t in make_block("block_a") + make_block("block_b")]
+        chunks = batch_run.chunk_requests(eligible, max_requests_per_job=3)
+        flattened = [pair for chunk in chunks for pair in chunk]
+        assert len(flattened) == len(eligible)
+        assert [t["trial_id"] for t, _ in flattened] == [t["trial_id"] for t, _ in eligible]  # no reordering either
+
+    def test_oversized_single_unit_becomes_its_own_chunk_rather_than_split_or_dropped(self):
+        eligible = [(t, 1) for t in make_block("block_a")]  # one 4-cell unit
+        chunks = batch_run.chunk_requests(eligible, max_requests_per_job=1)
+        assert len(chunks) == 1
+        assert len(chunks[0]) == 4
+
+    def test_token_limit_alone_also_splits(self):
+        eligible = [(t, 1) for t in make_block("block_a") + make_block("block_b")]
+        chunks = batch_run.chunk_requests(eligible, max_estimated_input_tokens_per_job=1)
+        assert len(chunks) == 2
+        flattened = [pair for chunk in chunks for pair in chunk]
+        assert len(flattened) == len(eligible)
+
+
+class TestSubmitChunking:
+    def test_dry_run_chunks_without_any_network_calls(self, monkeypatch, tmp_path, trials_file, results_file, capsys):
+        trials_path, _ = trials_file
+        monkeypatch.setattr(model_providers, "submit_batch", lambda *a, **k: pytest.fail("submit_batch must not be called during --dry-run"))
+        run_cli(monkeypatch, tmp_path, [
+            "submit", "--provider", "anthropic", "--model", "claude-sonnet-5",
+            "--trials-file", trials_path, "--results-file", results_file,
+            "--max-requests-per-job", "4", "--dry-run",
+        ])
+        out = capsys.readouterr().out
+        assert "Split into 2 job(s)" in out
+        assert out.count("Constructed 4 provider-native request payload(s)") == 2
+
+    def test_real_submit_creates_one_job_file_per_chunk_with_no_overlapping_requests(self, monkeypatch, tmp_path, trials_file, results_file):
+        trials_path, trials = trials_file
+        call_count = {"n": 0}
+
+        def fake_submit(provider, model, requests, reasoning_profile, max_output_tokens):
+            call_count["n"] += 1
+            return {"provider_batch_id": f"batch_{call_count['n']}", "raw": {}}
+
+        monkeypatch.setattr(model_providers, "submit_batch", fake_submit)
+        job_dir = run_cli(monkeypatch, tmp_path, [
+            "submit", "--provider", "anthropic", "--model", "claude-sonnet-5",
+            "--trials-file", trials_path, "--results-file", results_file,
+            "--max-requests-per-job", "4",
+        ])
+        job_files = sorted(job_dir.glob("*.json"))
+        assert len(job_files) == 2
+
+        all_keys = []
+        for jf in job_files:
+            job = json.loads(jf.read_text(encoding="utf-8"))
+            assert job["request_count"] == 4
+            all_keys.extend(job["requests"])
+        assert len(all_keys) == len(set(all_keys)) == 8  # no request duplicated across jobs
+
+    def test_collection_works_independently_for_each_chunk(self, monkeypatch, tmp_path, trials_file, results_file):
+        trials_path, trials = trials_file
+        call_count = {"n": 0}
+
+        def fake_submit(provider, model, requests, reasoning_profile, max_output_tokens):
+            call_count["n"] += 1
+            return {"provider_batch_id": f"batch_{call_count['n']}", "raw": {}}
+
+        monkeypatch.setattr(model_providers, "submit_batch", fake_submit)
+        job_dir = run_cli(monkeypatch, tmp_path, [
+            "submit", "--provider", "anthropic", "--model", "claude-sonnet-5",
+            "--trials-file", trials_path, "--results-file", results_file,
+            "--max-requests-per-job", "4",
+        ])
+        job_files = sorted(job_dir.glob("*.json"))
+
+        def fake_collect(provider, batch_id, request_keys):
+            return {k: model_providers.normalize_response("anthropic", "claude-sonnet-5", "A") for k in request_keys}
+
+        monkeypatch.setattr(model_providers, "collect_batch", fake_collect)
+        for jf in job_files:
+            monkeypatch.setattr(sys, "argv", ["batch_run.py", "collect", "--job-file", str(jf)])
+            batch_run.main()
+
+        rows = [json.loads(line) for line in open(results_file, encoding="utf-8")]
+        assert len(rows) == 8
+        assert all(r["parsed_response"] == {"overall_quality": "A"} for r in rows)

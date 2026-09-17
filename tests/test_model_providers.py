@@ -36,28 +36,38 @@ class TestReasoningProfiles:
     def test_low_is_the_default_profile(self):
         assert mp.DEFAULT_REASONING_PROFILE == "low"
 
-    def test_anthropic_low_sends_no_thinking_block(self):
-        assert mp.resolve_reasoning_settings("anthropic", "low") == {}
+    def test_anthropic_uses_adaptive_thinking_and_effort_not_budget_tokens(self):
+        """Claude Sonnet 5: budget_tokens is removed (400) and thinking is
+        always adaptive -- an empty {} is never treated as "low reasoning",
+        since depth is controlled by output_config.effort instead."""
+        for profile in ("low", "medium", "high"):
+            settings = mp.resolve_reasoning_settings("anthropic", profile)
+            assert settings["thinking"] == {"type": "adaptive"}
+            assert settings["output_config"] == {"effort": profile}
+            assert "budget_tokens" not in str(settings)
 
-    def test_anthropic_high_enables_thinking_with_a_budget(self):
-        settings = mp.resolve_reasoning_settings("anthropic", "high")
-        assert settings["thinking"]["type"] == "enabled"
-        assert settings["thinking"]["budget_tokens"] > 0
+    def test_anthropic_settings_are_never_empty(self):
+        for profile in mp.REASONING_PROFILES_LOGICAL:
+            assert mp.resolve_reasoning_settings("anthropic", profile) != {}
 
     def test_openai_maps_profile_to_reasoning_effort(self):
+        assert mp.resolve_reasoning_settings("openai", "low") == {"reasoning": {"effort": "low"}}
         assert mp.resolve_reasoning_settings("openai", "medium") == {"reasoning": {"effort": "medium"}}
+        assert mp.resolve_reasoning_settings("openai", "high") == {"reasoning": {"effort": "high"}}
 
-    def test_gemini_maps_profile_to_thinking_level(self):
-        assert mp.resolve_reasoning_settings("gemini", "high") == {"thinking_level": "high"}
+    def test_gemini_maps_profile_to_nested_thinking_config(self):
+        """thinking_level must be nested under thinking_config, matching the
+        real generation_config shape -- never a bare top-level thinking_level."""
+        assert mp.resolve_reasoning_settings("gemini", "high") == {"thinking_config": {"thinking_level": "high"}}
+        assert mp.resolve_reasoning_settings("gemini", "low") == {"thinking_config": {"thinking_level": "low"}}
 
-    def test_deepseek_medium_and_high_do_not_pretend_to_differ_from_low(self):
-        """DeepSeek's higher-reasoning behavior isn't reached via a request
-        parameter this table can set -- medium/high are recorded as
-        requested but the actual request settings stay the same as low,
-        which is the honest "don't pretend they're equivalent" outcome."""
-        assert mp.resolve_reasoning_settings("deepseek", "low") == {}
-        assert mp.resolve_reasoning_settings("deepseek", "medium") == {}
-        assert mp.resolve_reasoning_settings("deepseek", "high") == {}
+    def test_deepseek_reasoning_effort_is_explicitly_set_for_every_profile(self):
+        """DeepSeek must not rely on its provider default -- reasoning_effort
+        is sent explicitly and does vary by profile (unlike a provider with
+        no real lever, DeepSeek's OpenAI-compatible API does expose one)."""
+        assert mp.resolve_reasoning_settings("deepseek", "low") == {"reasoning_effort": "low"}
+        assert mp.resolve_reasoning_settings("deepseek", "medium") == {"reasoning_effort": "medium"}
+        assert mp.resolve_reasoning_settings("deepseek", "high") == {"reasoning_effort": "high"}
 
     def test_unknown_provider_raises(self):
         with pytest.raises(ValueError):
@@ -67,11 +77,12 @@ class TestReasoningProfiles:
         with pytest.raises(ValueError):
             mp.resolve_reasoning_settings("anthropic", "extreme")
 
-    def test_default_max_output_tokens_matches_spec(self):
-        assert mp.default_max_output_tokens("anthropic") == 64
-        assert mp.default_max_output_tokens("openai") == 64
-        assert mp.default_max_output_tokens("gemini") == 512
-        assert mp.default_max_output_tokens("deepseek") == 64
+    def test_default_max_output_tokens_is_512_for_every_provider(self):
+        """The controllability experiment's visible answer is still just
+        A/B -- the 512 cap exists so hidden/adaptive reasoning can't consume
+        the whole output budget before any provider emits the letter."""
+        for provider in mp.PROVIDERS:
+            assert mp.default_max_output_tokens(provider) == 512
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +121,7 @@ class TestAnthropicDirectCall:
         assert result["requested_model"] == "claude-sonnet-5"
         assert result["response_model"] == "claude-sonnet-5-20250929"
         assert result["reasoning_profile"] == "low"
-        assert result["provider_reasoning_settings"] == {}
+        assert result["provider_reasoning_settings"] == {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}
         assert result["input_tokens"] == 42 and result["output_tokens"] == 3
 
     def test_high_reasoning_profile_sends_thinking_but_not_the_prompt_text(self, monkeypatch):
@@ -119,7 +130,8 @@ class TestAnthropicDirectCall:
 
         mp.call_model("anthropic", "claude-sonnet-5", "the experimental prompt", max_output_tokens=64, reasoning_profile="high")
         kwargs = captured["kwargs"]
-        assert kwargs["thinking"]["type"] == "enabled"
+        assert kwargs["thinking"]["type"] == "adaptive"
+        assert kwargs["output_config"]["effort"] == "high"
         assert kwargs["messages"] == [{"role": "user", "content": "the experimental prompt"}]
 
     def test_reasoning_profile_never_alters_the_prompt(self, monkeypatch):
@@ -266,7 +278,7 @@ class TestGeminiDirectCall:
         assert result["provider"] == "gemini"
         assert result["response_model"] == "gemini-3.8-flash-002"
         assert result["reasoning_tokens"] == 8
-        assert captured["config"].thinking_config.thinking_level == "low"
+        assert captured["config"]["thinking_config"]["thinking_level"] == "low"
 
     def test_prompt_passed_through_unchanged_across_profiles(self, monkeypatch):
         fake_google_pkg, fake_genai, fake_types, captured = _fake_gemini_module()
@@ -275,7 +287,7 @@ class TestGeminiDirectCall:
         monkeypatch.setitem(sys.modules, "google.genai.types", fake_types)
         for profile in mp.REASONING_PROFILES_LOGICAL:
             mp.call_model("gemini", "gemini-3.8-flash", "fixed prompt", reasoning_profile=profile)
-            assert captured["contents"] == "fixed prompt"
+            assert captured["contents"] == [{"role": "user", "parts": [{"text": "fixed prompt"}]}]
 
 
 # ---------------------------------------------------------------------------
@@ -372,9 +384,20 @@ class TestBuildBatchRequestPayload:
         assert payload["body"]["input"] == "hi"
 
     def test_gemini_payload_shape(self):
-        payload = mp.build_batch_request_payload("gemini", "gemini-3.8-flash", "req-1", "hi", 512, {"thinking_level": "low"})
+        payload = mp.build_batch_request_payload("gemini", "gemini-3.8-flash", "req-1", "hi", 512, {"thinking_config": {"thinking_level": "low"}})
         assert payload["key"] == "req-1"
-        assert payload["request"]["contents"] == "hi"
+        assert payload["request"]["contents"] == [{"role": "user", "parts": [{"text": "hi"}]}]
+        assert payload["request"]["generation_config"]["thinking_config"]["thinking_level"] == "low"
+        assert payload["request"]["generation_config"]["max_output_tokens"] == 512
+
+    def test_gemini_batch_and_direct_settings_match(self):
+        """Direct and batch Gemini calls must share the same request-building
+        code (see _gemini_contents / _gemini_generation_config) so they
+        cannot drift apart."""
+        settings = mp.resolve_reasoning_settings("gemini", "high")
+        payload = mp.build_batch_request_payload("gemini", "gemini-3.8-flash", "req-1", "hi", 512, settings)
+        assert payload["request"]["contents"] == mp._gemini_contents("hi")
+        assert payload["request"]["generation_config"] == mp._gemini_generation_config(512, settings)
 
     def test_deepseek_is_not_batch_supported(self):
         with pytest.raises(ValueError, match="does not support native batch"):
@@ -383,3 +406,38 @@ class TestBuildBatchRequestPayload:
     def test_unique_request_ids_across_a_batch(self):
         payloads = [mp.build_batch_request_payload("anthropic", "m", f"req-{i}", "p", 64, {}) for i in range(5)]
         assert len({p["custom_id"] for p in payloads}) == 5
+
+
+# ---------------------------------------------------------------------------
+# Short deterministic batch request ids (provider custom_id / key)
+# ---------------------------------------------------------------------------
+
+class TestMakeShortRequestId:
+    def test_within_length_and_charset_limit(self):
+        request_id = mp.make_short_request_id(
+            "some::very::long::trial::id::with::lots::of::components::baked::in",
+            "rep-3", "a" * 64, "anthropic", "claude-sonnet-5", "high",
+        )
+        assert len(request_id) <= mp.SHORT_REQUEST_ID_MAX_LEN
+        assert all(c.isalnum() or c in "_-" for c in request_id)
+
+    def test_deterministic(self):
+        args = ("trial-1", "rep-1", "abc123", "openai", "gpt-5.6", "low")
+        assert mp.make_short_request_id(*args) == mp.make_short_request_id(*args)
+
+    def test_unique_across_replicates_and_trials(self):
+        base = ("trial-1", "rep-1", "abc123", "openai", "gpt-5.6", "low")
+        ids = {
+            mp.make_short_request_id(*base),
+            mp.make_short_request_id("trial-2", "rep-1", "abc123", "openai", "gpt-5.6", "low"),
+            mp.make_short_request_id("trial-1", "rep-2", "abc123", "openai", "gpt-5.6", "low"),
+        }
+        assert len(ids) == 3
+
+    def test_changes_when_evaluator_identity_changes(self):
+        """A different provider/model/reasoning_profile/prompt must yield a
+        different id, since run_batch.is_completed keys on all of these."""
+        base = mp.make_short_request_id("trial-1", "rep-1", "abc123", "anthropic", "claude-sonnet-5", "low")
+        assert base != mp.make_short_request_id("trial-1", "rep-1", "abc123", "anthropic", "claude-sonnet-5", "high")
+        assert base != mp.make_short_request_id("trial-1", "rep-1", "abc123", "openai", "claude-sonnet-5", "low")
+        assert base != mp.make_short_request_id("trial-1", "rep-1", "def456", "anthropic", "claude-sonnet-5", "low")

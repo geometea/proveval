@@ -145,6 +145,46 @@ class TestCollapseAttempts:
         assert list(kept) == ["a"]
         assert excluded == 1
 
+    def test_execution_identity_fields_survive_into_the_observation(self):
+        """provider/requested_model/response_model/reasoning_profile/
+        provider_reasoning_settings/execution_mode/request_id/reasoning_tokens
+        must never be dropped by collapse_attempts -- downstream analysis
+        relies on them to detect (and refuse to silently pool) results from
+        different evaluator configurations that happen to share a
+        trial_id/replicate_id."""
+        rows = [{
+            "trial_id": "t1", "model": "m", "replicate_id": 1, "attempt_id": 1,
+            "parsed_response": {"x": 1}, "validation_error": None, "sampling_regime": "low_variance_primary",
+            "provider": "anthropic", "requested_model": "claude-sonnet-5", "response_model": "claude-sonnet-5-20250929",
+            "reasoning_profile": "low", "provider_reasoning_settings": {"thinking": {"type": "adaptive"}},
+            "execution_mode": "direct", "request_id": "msg_abc", "reasoning_tokens": None,
+        }]
+        observations, *_ = ac.collapse_attempts(rows, self._trials_by_id())
+        obs = next(iter(observations.values()))
+        assert obs["provider"] == "anthropic"
+        assert obs["requested_model"] == "claude-sonnet-5"
+        assert obs["response_model"] == "claude-sonnet-5-20250929"
+        assert obs["reasoning_profile"] == "low"
+        assert obs["provider_reasoning_settings"] == {"thinking": {"type": "adaptive"}}
+        assert obs["execution_mode"] == "direct"
+        assert obs["request_id"] == "msg_abc"
+        assert obs["reasoning_tokens"] is None
+
+    def test_execution_identity_fields_default_to_none_when_absent(self):
+        """Pre-existing rows saved before multi-provider support have none
+        of these fields -- collapse_attempts must not raise, and the
+        observation just carries None for each, same as before this field
+        set existed."""
+        rows = [{
+            "trial_id": "t1", "model": "m", "replicate_id": 1, "attempt_id": 1,
+            "parsed_response": {"x": 1}, "validation_error": None, "sampling_regime": "low_variance_primary",
+        }]
+        observations, *_ = ac.collapse_attempts(rows, self._trials_by_id())
+        obs = next(iter(observations.values()))
+        for field in ("provider", "requested_model", "response_model", "reasoning_profile",
+                      "execution_mode", "request_id", "reasoning_tokens"):
+            assert obs[field] is None
+
 
 # ---------------------------------------------------------------------------
 # Pairwise cell-rate / directional-effect fixtures

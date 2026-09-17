@@ -317,3 +317,114 @@ class TestConcurrentRetryBackoff:
         out = capsys.readouterr().out
         assert "planned" in out
         assert not (tmp_path / "results.jsonl").exists()
+
+
+# ---------------------------------------------------------------------------
+# Production sampling regime: controllability's plain_ab trials default to
+# provider-default sampling (never temperature=0, which Claude Sonnet 5
+# rejects entirely when combined with its always-on adaptive thinking).
+# ---------------------------------------------------------------------------
+
+class TestDefaultSamplingRegimeForTrials:
+    def test_all_plain_ab_trials_default_to_provider_default_secondary(self):
+        trials = [{"response_format": "plain_ab"}, {"response_format": "plain_ab"}]
+        assert rb.default_sampling_regime_for_trials(trials) == "provider_default_secondary"
+
+    def test_legacy_trials_without_response_format_default_to_low_variance_primary(self):
+        trials = [{"type": "context_single"}, {"type": "context_pairwise"}]
+        assert rb.default_sampling_regime_for_trials(trials) == "low_variance_primary"
+
+    def test_empty_selection_defaults_to_low_variance_primary(self):
+        assert rb.default_sampling_regime_for_trials([]) == "low_variance_primary"
+
+    def test_mixed_selection_defaults_to_low_variance_primary(self):
+        """A selection isn't entirely plain_ab -- the safer legacy default
+        is used rather than guessing which trial's regime should win."""
+        trials = [{"response_format": "plain_ab"}, {"type": "context_single"}]
+        assert rb.default_sampling_regime_for_trials(trials) == "low_variance_primary"
+
+    def test_main_selects_provider_default_secondary_for_controllability_without_the_flag(self, tmp_path, monkeypatch, capsys):
+        """End-to-end: running main() against plain_ab trials without
+        --sampling-regime must resolve to provider_default_secondary and
+        send no temperature parameter to the (anthropic) provider."""
+        captured = {}
+
+        def fake_call_model(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            captured["sampling_params"] = sampling_params
+            return {"response_text": "A", "response_model": "m", "stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1}
+
+        monkeypatch.setattr(rb.model_providers, "call_model", fake_call_model)
+        trial = {"trial_id": "t1", "type": "context_pairwise", "choice_mode": "forced",
+                 "response_format": "plain_ab", "prompt": "p"}
+        trials_file = tmp_path / "trials.jsonl"
+        with open(trials_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps(trial) + "\n")
+        results_file = tmp_path / "results.jsonl"
+
+        monkeypatch.setattr("sys.argv", [
+            "run_batch.py", "--trials-file", str(trials_file), "--results-file", str(results_file),
+            "--provider", "anthropic", "--model", "claude-sonnet-5",
+        ])
+        rb.main()
+
+        assert captured["sampling_params"] == {}  # provider_default_secondary, never temperature=0
+        rows = [json.loads(line) for line in open(results_file, encoding="utf-8")]
+        assert rows[0]["sampling_regime"] == "provider_default_secondary"
+
+    def test_explicit_sampling_regime_flag_still_overrides_the_default(self, tmp_path, monkeypatch):
+        captured = {}
+
+        def fake_call_model(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            captured["sampling_params"] = sampling_params
+            return {"response_text": "A", "response_model": "m", "stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1}
+
+        monkeypatch.setattr(rb.model_providers, "call_model", fake_call_model)
+        trial = {"trial_id": "t1", "type": "context_pairwise", "choice_mode": "forced",
+                 "response_format": "plain_ab", "prompt": "p"}
+        trials_file = tmp_path / "trials.jsonl"
+        with open(trials_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps(trial) + "\n")
+        results_file = tmp_path / "results.jsonl"
+
+        monkeypatch.setattr("sys.argv", [
+            "run_batch.py", "--trials-file", str(trials_file), "--results-file", str(results_file),
+            "--provider", "anthropic", "--model", "claude-sonnet-5", "--sampling-regime", "low_variance_primary",
+        ])
+        rb.main()
+
+        assert captured["sampling_params"] == {"temperature": 0}
+
+
+# ---------------------------------------------------------------------------
+# Provider usage metadata (reasoning_tokens, request_id) survives run_one()
+# ---------------------------------------------------------------------------
+
+class TestRunOnePreservesUsageMetadata:
+    def test_reasoning_tokens_and_request_id_are_saved_on_success(self, tmp_path, monkeypatch):
+        def fake_call_model(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            return {"response_text": "A", "response_model": "m", "stop_reason": "end_turn",
+                    "input_tokens": 1, "output_tokens": 1, "reasoning_tokens": 7, "request_id": "req_123"}
+
+        monkeypatch.setattr(rb.model_providers, "call_model", fake_call_model)
+        trial = {"trial_id": "t1", "type": "context_pairwise", "choice_mode": "forced", "response_format": "plain_ab", "prompt": "p"}
+        results_file = str(tmp_path / "results.jsonl")
+
+        rb.run_one(trial, 1, "claude-sonnet-5", 1, results_file, "provider_default_secondary", provider="anthropic")
+
+        rows = [json.loads(line) for line in open(results_file, encoding="utf-8")]
+        assert rows[0]["reasoning_tokens"] == 7
+        assert rows[0]["request_id"] == "req_123"
+
+    def test_reasoning_tokens_and_request_id_are_null_on_api_error(self, tmp_path, monkeypatch):
+        def always_fails(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            raise Exception("400 Bad Request")
+
+        monkeypatch.setattr(rb.model_providers, "call_model", always_fails)
+        trial = {"trial_id": "t1", "type": "context_pairwise", "choice_mode": "forced", "response_format": "plain_ab", "prompt": "p"}
+        results_file = str(tmp_path / "results.jsonl")
+
+        rb.run_one(trial, 1, "claude-sonnet-5", 1, results_file, "provider_default_secondary", provider="anthropic")
+
+        rows = [json.loads(line) for line in open(results_file, encoding="utf-8")]
+        assert rows[0]["reasoning_tokens"] is None
+        assert rows[0]["request_id"] is None

@@ -390,3 +390,63 @@ def test_attach_context_name_uses_structured_display_names_not_parsed_ids():
     rows = [{"contrast_id": "editing_edited_vs_first_draft"}]
     acb.attach_context_name(rows)
     assert rows[0]["context"] == "edited vs first draft"
+
+
+# ---------------------------------------------------------------------------
+# warn_if_pooling_evaluator_identity: never silently pool results from
+# different providers/requested_models/reasoning_profiles/response_models
+# ---------------------------------------------------------------------------
+
+class TestWarnIfPoolingEvaluatorIdentity:
+    def test_no_warning_when_every_observation_shares_one_identity(self, capsys):
+        observations = {
+            "a": {"provider": "anthropic", "requested_model": "claude-sonnet-5", "reasoning_profile": "low", "response_model": "claude-sonnet-5-20250929"},
+            "b": {"provider": "anthropic", "requested_model": "claude-sonnet-5", "reasoning_profile": "low", "response_model": "claude-sonnet-5-20250929"},
+        }
+        acb.warn_if_pooling_evaluator_identity(observations, "treatment")
+        assert "WARNING" not in capsys.readouterr().out
+
+    def test_warns_on_mixed_provider(self, capsys):
+        observations = {
+            "a": {"provider": "anthropic", "requested_model": "m", "reasoning_profile": "low"},
+            "b": {"provider": "openai", "requested_model": "m", "reasoning_profile": "low"},
+        }
+        acb.warn_if_pooling_evaluator_identity(observations, "treatment")
+        out = capsys.readouterr().out
+        assert "WARNING" in out and "provider" in out
+
+    def test_warns_on_mixed_requested_model(self, capsys):
+        observations = {
+            "a": {"provider": "anthropic", "requested_model": "claude-sonnet-5", "reasoning_profile": "low"},
+            "b": {"provider": "anthropic", "requested_model": "claude-opus-5", "reasoning_profile": "low"},
+        }
+        acb.warn_if_pooling_evaluator_identity(observations, "treatment")
+        out = capsys.readouterr().out
+        assert "WARNING" in out and "requested_model" in out
+
+    def test_warns_on_mixed_reasoning_profile(self, capsys):
+        observations = {
+            "a": {"provider": "anthropic", "requested_model": "m", "reasoning_profile": "low"},
+            "b": {"provider": "anthropic", "requested_model": "m", "reasoning_profile": "high"},
+        }
+        acb.warn_if_pooling_evaluator_identity(observations, "treatment")
+        out = capsys.readouterr().out
+        assert "WARNING" in out and "reasoning_profile" in out
+
+    def test_warns_on_mixed_response_model_but_this_alone_never_blocks_pooling(self, capsys):
+        """A response_model mismatch within one evaluator run (e.g. a dated
+        snapshot changing mid-run) must still be surfaced -- never merged
+        silently -- even though it's a softer flag than a provider/model/
+        reasoning_profile mismatch."""
+        observations = {
+            "a": {"provider": "anthropic", "requested_model": "m", "reasoning_profile": "low", "response_model": "m-20250101"},
+            "b": {"provider": "anthropic", "requested_model": "m", "reasoning_profile": "low", "response_model": "m-20250601"},
+        }
+        acb.warn_if_pooling_evaluator_identity(observations, "treatment")
+        out = capsys.readouterr().out
+        assert "WARNING" in out and "response_model" in out
+
+    def test_backward_compatible_alias_still_works(self, capsys):
+        observations = {"a": {"response_model": "x"}, "b": {"response_model": "y"}}
+        acb.warn_if_pooling_response_models(observations, "treatment")
+        assert "WARNING" in capsys.readouterr().out

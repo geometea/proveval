@@ -50,6 +50,7 @@ from run_trial import (
     RESULTS_FILE,
     SAMPLING_REGIMES,
     TRIALS_FILE,
+    default_sampling_regime_for_trials,
     load_trials,
     max_tokens_for,
     parse_and_validate,
@@ -337,6 +338,8 @@ def run_one(trial, replicate_id, model, attempt_id, results_file, sampling_regim
             "stop_reason": None,
             "input_tokens": None,
             "output_tokens": None,
+            "reasoning_tokens": None,
+            "request_id": None,
             "response_text": None,
             "parsed_response": None,
             "validation_error": f"API call failed: {e}",
@@ -360,6 +363,8 @@ def run_one(trial, replicate_id, model, attempt_id, results_file, sampling_regim
         "stop_reason": api_result["stop_reason"],
         "input_tokens": api_result["input_tokens"],
         "output_tokens": api_result["output_tokens"],
+        "reasoning_tokens": api_result.get("reasoning_tokens"),
+        "request_id": api_result.get("request_id"),
         "response_text": response_text,
         "parsed_response": parsed_response,
         "validation_error": validation_error,
@@ -453,9 +458,11 @@ def main():
     parser.add_argument(
         "--sampling-regime",
         choices=list(SAMPLING_REGIMES),
-        default="low_variance_primary",
+        default=None,
         help="v0.2 context trial types only (ignored, and not recorded, for v0.1 trial types): "
-        "low_variance_primary (default; temperature=0) or provider_default_secondary",
+        "low_variance_primary (temperature=0) or provider_default_secondary. Default: "
+        "provider_default_secondary when every selected trial is a plain_ab (controllability) "
+        "trial, low_variance_primary otherwise -- see default_sampling_regime_for_trials.",
     )
     parser.add_argument("--replicates", type=int, default=1, help="Replicate count for all trials (fallback for --replicates-treatment)")
     parser.add_argument(
@@ -541,14 +548,16 @@ def main():
 
     if args.retry_failed:
         trials_by_id = {t["trial_id"]: t for t in load_trials(args.trials_file)}
+        sampling_regime = args.sampling_regime or default_sampling_regime_for_trials(list(trials_by_id.values()))
         observations = select_failed_observations(
-            existing_results, trials_by_id, model, args.sampling_regime,
+            existing_results, trials_by_id, model, sampling_regime,
             args.type, args.id_prefix, conditions, contrasts, evaluation_regimes, args.limit,
             provider, args.reasoning_profile,
         )
     else:
         trials = load_trials(args.trials_file)
         trials = select_trials(trials, args.type, args.id_prefix, conditions, contrasts, evaluation_regimes, args.limit)
+        sampling_regime = args.sampling_regime or default_sampling_regime_for_trials(trials)
         observations = build_observations(trials, replicates_treatment, replicates_neutral)
 
     total = len(observations)
@@ -557,7 +566,7 @@ def main():
     to_run = []  # (label, trial, replicate_id, attempt_id) -- decided sequentially, executed per --concurrency
 
     for i, (trial, replicate_id) in enumerate(observations, start=1):
-        key = (trial["trial_id"], model, replicate_id, result_sampling_regime(trial["type"], args.sampling_regime))
+        key = (trial["trial_id"], model, replicate_id, result_sampling_regime(trial["type"], sampling_regime))
         label = f"{i} / {total} — {trial['trial_id']} — replicate {replicate_id}"
         records = existing_results.get(key, [])
 
@@ -592,7 +601,7 @@ def main():
     def execute(label, trial, replicate_id, attempt_id):
         try:
             status = run_one(
-                trial, replicate_id, model, attempt_id, args.results_file, args.sampling_regime,
+                trial, replicate_id, model, attempt_id, args.results_file, sampling_regime,
                 provider, args.reasoning_profile,
                 execution_mode="concurrent" if args.concurrency > 1 else "direct",
                 max_transient_retries=4 if args.concurrency > 1 else 0,

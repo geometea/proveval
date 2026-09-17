@@ -450,11 +450,37 @@ def load_raw_and_observations(results_file, trials_file, sampling_regime, experi
     return raw_rows, experiment_observations
 
 
-def warn_if_pooling_response_models(observations, label):
-    distinct = {o.get("response_model") for o in observations.values() if o.get("response_model")}
-    if len(distinct) > 1:
-        print(f"WARNING: {label} observations were served by more than one response_model: {sorted(distinct)} "
+# Evaluator-identity fields whose diversity within one label's observations
+# must be surfaced, not silently pooled: results below always group by the
+# requested `model` string, so a mix of provider/requested_model/
+# reasoning_profile within that one `model` value would otherwise merge
+# distinct evaluator configurations into what looks like a single evaluator.
+# response_model is separate: it can legitimately vary between retries of
+# the *same* evaluator (e.g. a dated snapshot change mid-run), so it's still
+# just a flag to double-check, not necessarily a configuration error.
+_POOLING_IDENTITY_FIELDS = ("provider", "requested_model", "reasoning_profile")
+
+
+def warn_if_pooling_evaluator_identity(observations, label):
+    """Print one WARNING per evaluator-identity field (provider,
+    requested_model, reasoning_profile, response_model) that varies within
+    `observations` -- see _POOLING_IDENTITY_FIELDS. Every analysis table
+    below still pools by requested `model` alone; this is a surfaced flag to
+    split results manually, never an automatic split."""
+    for field in _POOLING_IDENTITY_FIELDS:
+        distinct = {o.get(field) for o in observations.values() if o.get(field)}
+        if len(distinct) > 1:
+            print(f"WARNING: {label} observations were run under more than one {field}: {sorted(distinct)} "
+                  f"-- results below still pool by requested `model`; treat this as a flag to split them manually.")
+
+    distinct_response_models = {o.get("response_model") for o in observations.values() if o.get("response_model")}
+    if len(distinct_response_models) > 1:
+        print(f"WARNING: {label} observations were served by more than one response_model: {sorted(distinct_response_models)} "
               f"-- results below still pool by requested `model`; treat this as a flag to split them manually.")
+
+
+# Kept as an alias: existing callers/tests importing this exact name keep working.
+warn_if_pooling_response_models = warn_if_pooling_evaluator_identity
 
 
 def main():
@@ -500,7 +526,7 @@ def main():
     loo_rows = []
     n_complete_units = n_incomplete_units = 0
     if observations:
-        warn_if_pooling_response_models(observations, "treatment")
+        warn_if_pooling_evaluator_identity(observations, "treatment")
         complete_observations, n_complete_units, n_incomplete_units = filter_complete_treatment_units(observations)
         print(f"Complete treatment blocks (all 4 cells valid): {n_complete_units}  incomplete/excluded: {n_incomplete_units}")
 
@@ -557,7 +583,7 @@ def main():
     correlation_rows = []
     n_complete_baseline_units = n_incomplete_baseline_units = 0
     if baseline_observations:
-        warn_if_pooling_response_models(baseline_observations, "baseline")
+        warn_if_pooling_evaluator_identity(baseline_observations, "baseline")
         complete_baseline_observations, n_complete_baseline_units, n_incomplete_baseline_units = filter_complete_baseline_units(baseline_observations)
         print(f"Complete baseline pairs (both positions valid): {n_complete_baseline_units}  incomplete/excluded: {n_incomplete_baseline_units}")
 

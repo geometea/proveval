@@ -82,6 +82,19 @@ def collapse_attempts(raw_rows, trials_by_id):
             "parsed_response": row["parsed_response"],
             "sampling_regime": sampling_regime,
             "sampling_params": row.get("sampling_params"),
+            # Execution identity (see model_providers.py / run_batch.py):
+            # preserved on every observation, never collapsed away, so
+            # downstream analysis can detect (and refuse to silently pool)
+            # results from different providers/models/reasoning profiles/
+            # execution modes that happen to share a trial_id+replicate_id.
+            "provider": row.get("provider"),
+            "requested_model": row.get("requested_model"),
+            "response_model": row.get("response_model"),
+            "reasoning_profile": row.get("reasoning_profile"),
+            "provider_reasoning_settings": row.get("provider_reasoning_settings"),
+            "execution_mode": row.get("execution_mode"),
+            "request_id": row.get("request_id"),
+            "reasoning_tokens": row.get("reasoning_tokens"),
         }
         # Only the failed attempts before the eventual success count as
         # "absorbed" -- if more than one attempt for this key happened to
