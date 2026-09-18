@@ -122,3 +122,42 @@ def test_the_real_repo_draft_config_was_never_frozen_by_these_tests():
     config = load_study_config(STUDY_CONFIG_FILE)
     assert config["status"] == "draft"
     assert not os.path.exists(fz.LOCK_FILE)
+
+
+def test_the_real_repo_files_still_freeze_and_verify_cleanly(tmp_path):
+    """The DeepSeek off-peak pricing guard touches only run_controllability_v2.py
+    and the new controllability_v2_deepseek_pricing.py module -- neither is
+    a freeze input (see compute_lock_hashes: study config, contrasts,
+    corpus, baseline manifest, treatment manifest). Freezing a SCRATCH copy
+    of the real, currently-unfrozen repo files must still succeed and
+    verify cleanly, proving this change never altered anything the lock
+    covers. The real on-disk study config is never touched here."""
+    import shutil
+
+    from controllability_v2_corpus import CORPUS_FILE
+    from controllability_v2_study_config import STUDY_CONFIG_FILE, load_study_config
+
+    scratch = tmp_path / "data"
+    scratch.mkdir()
+    config = load_study_config(STUDY_CONFIG_FILE)
+
+    contrasts_path = scratch / "contrasts.jsonl"
+    shutil.copy(config["contrast_file"], contrasts_path)
+    treatment_path = scratch / "treatment.jsonl"
+    shutil.copy(config["treatment_manifest_file"], treatment_path)
+    baseline_path = scratch / "baseline.jsonl"
+    shutil.copy(config["baseline_manifest_file"], baseline_path)
+    corpus_path = scratch / "corpus.json"
+    shutil.copy(CORPUS_FILE, corpus_path)
+
+    config["contrast_file"] = str(contrasts_path)
+    config["treatment_manifest_file"] = str(treatment_path)
+    config["baseline_manifest_file"] = str(baseline_path)
+    config_path = scratch / "study_config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    lock_path = scratch / "lock.json"
+    fz.freeze(str(config_path), str(corpus_path), str(lock_path))
+    ok, reason = fz.verify_frozen(str(config_path), str(corpus_path), str(lock_path))
+    assert ok is True
+    assert reason is None

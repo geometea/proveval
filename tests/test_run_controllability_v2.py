@@ -10,6 +10,7 @@ redirects the module's file-path constants at tmp_path first.
 
 import argparse
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -74,7 +75,7 @@ def fake_call(monkeypatch):
 def base_args(**overrides):
     defaults = dict(provider="deepseek", model="deepseek-flash", reasoning_profile="low", replicates=2, seed=1,
                      retry_limit=1, run_id="wave_test", limit=None, concurrency=4, production=False,
-                     allow_unfrozen=True, dry_run=False)
+                     allow_unfrozen=True, allow_peak_pricing=True, dry_run=False)
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
 
@@ -310,3 +311,202 @@ class TestPreflight:
         ok, checks, context = rv2.run_preflight(config, {}, {}, concurrency=32)
         checks_by_name = {n: o for n, o, d in checks}
         assert checks_by_name["production_output_has_no_duplicate_observation_ids"] is False
+
+    def test_preflight_reports_pricing_state_and_makes_no_api_calls_either_way(self, monkeypatch, tmp_path):
+        from controllability_v2_trials import BASELINE_TRIALS_FILE, TRIALS_FILE
+
+        def must_not_be_called(*a, **k):
+            pytest.fail("preflight must never call a provider SDK")
+
+        monkeypatch.setattr(model_providers, "call_model", must_not_be_called)
+        config = make_study_config(TRIALS_FILE, BASELINE_TRIALS_FILE)
+        monkeypatch.setattr(rv2, "TREATMENT_RESULTS_FILE", str(tmp_path / "t.jsonl"))
+        monkeypatch.setattr(rv2, "BASELINE_RESULTS_FILE", str(tmp_path / "b.jsonl"))
+
+        for allow_peak in (False, True):
+            ok, checks, context = rv2.run_preflight(config, {}, {}, concurrency=32, allow_peak_pricing=allow_peak)
+            assert context["allow_peak_pricing"] is allow_peak
+            assert isinstance(context["pricing_window_off_peak"], bool)
+            if not context["pricing_window_off_peak"]:
+                assert context["pricing_window_next_off_peak"] is not None
+            # pricing state must never gate the overall preflight result
+            checks_by_name = {n: o for n, o, d in checks}
+            assert "pricing" not in "".join(checks_by_name).lower() or True  # no pricing entry in `checks` at all
+            assert not any("pricing" in name for name in checks_by_name)
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek off-peak pricing guard wiring (production dispatch guard)
+# ---------------------------------------------------------------------------
+
+class RecordingGate:
+    def __init__(self, allow_peak=False):
+        self.allow_peak = allow_peak
+        self.wait_calls = 0
+
+    def wait_until_dispatch_allowed(self):
+        self.wait_calls += 1
+
+
+class TestMakeCallFnPricingGateWiring:
+    def test_deepseek_checks_the_gate_before_every_dispatch(self, monkeypatch):
+        order = []
+        gate = RecordingGate()
+
+        def fake_call_model(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            order.append("dispatched")
+            return {"response_text": "A"}
+
+        monkeypatch.setattr(model_providers, "call_model", fake_call_model)
+        original_wait = gate.wait_until_dispatch_allowed
+
+        def recording_wait():
+            order.append("waited")
+            original_wait()
+
+        gate.wait_until_dispatch_allowed = recording_wait
+        call_fn = rv2.make_call_fn("deepseek", "deepseek-flash", "low", 512, {}, gate)
+        call_fn({"prompt": "p"})
+
+        assert order == ["waited", "dispatched"]  # gate consulted BEFORE dispatch
+        assert gate.wait_calls == 1
+
+    def test_other_providers_never_consult_the_gate(self, monkeypatch):
+        gate = RecordingGate()
+
+        def fake_call_model(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            return {"response_text": "A"}
+
+        monkeypatch.setattr(model_providers, "call_model", fake_call_model)
+        for provider in ("anthropic", "openai", "gemini"):
+            call_fn = rv2.make_call_fn(provider, "some-model", "low", 512, {}, gate)
+            call_fn({"prompt": "p"})
+        assert gate.wait_calls == 0
+
+    def test_gate_is_checked_on_every_retry_attempt(self, monkeypatch):
+        from controllability_v2_execution import run_one_observation
+
+        gate = RecordingGate()
+
+        def fake_call_model(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            return {"response_text": "A"}
+
+        monkeypatch.setattr(model_providers, "call_model", fake_call_model)
+        call_fn = rv2.make_call_fn("deepseek", "deepseek-flash", "low", 512, {}, gate)
+        # force 3 attempts by making the first two invalid
+        responses = iter(["not a valid answer", "still not valid", "A"])
+
+        def flaky_call_model(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            return {"response_text": next(responses)}
+
+        monkeypatch.setattr(model_providers, "call_model", flaky_call_model)
+        run_one_observation({"prompt": "p", "trial_id": "t1"}, call_fn, retry_limit=2)
+        assert gate.wait_calls == 3  # once per attempt, never skipped on a retry
+
+    def test_run_uses_a_single_shared_gate_instance_for_the_whole_plan(self, tmp_path, monkeypatch, fake_call):
+        """Every worker in the concurrent pool must consult the SAME gate --
+        otherwise a peak-window transition wouldn't correctly pause every
+        queued worker, only whichever ones happened to share an instance."""
+        created = []
+
+        class CountingGate(RecordingGate):
+            def __init__(self, allow_peak=False):
+                super().__init__(allow_peak)
+                created.append(self)
+
+        monkeypatch.setattr(rv2, "DeepSeekPricingGate", CountingGate)
+        results_path = tmp_path / "treatment_raw.jsonl"
+        monkeypatch.setattr(rv2, "EXPLORATORY_TREATMENT_RESULTS_FILE", str(results_path))
+        trials_file = tmp_path / "treatment.jsonl"
+        write_jsonl(trials_file, make_superblock_trials("sb1") + make_superblock_trials("sb2"))
+
+        rv2._run(base_args(concurrency=8, replicates=1, allow_peak_pricing=False),
+                  str(trials_file), "superblock_id", plan_treatment_execution_order, "treatment")
+
+        assert len(created) == 1  # exactly one gate constructed for the entire run
+        assert created[0].wait_calls == 16  # every one of the 16 dispatches consulted it
+
+
+class TestDeepSeekPeakGuardIntegration:
+    """End-to-end: a real DeepSeekPricingGate wired into _run() with an
+    injected fake clock, so these never actually sleep or depend on the
+    real wall-clock time."""
+
+    def _install_fake_clock(self, monkeypatch, start):
+        import controllability_v2_deepseek_pricing as pricing
+
+        clock = {"now": start}
+
+        def now_fn():
+            return clock["now"]
+
+        def sleep_fn(seconds):
+            clock["now"] = clock["now"] + timedelta(seconds=seconds)
+
+        def gate_factory(allow_peak=False):
+            return pricing.DeepSeekPricingGate(allow_peak=allow_peak, now_fn=now_fn, sleep_fn=sleep_fn)
+
+        monkeypatch.setattr(rv2, "DeepSeekPricingGate", gate_factory)
+        return clock
+
+    def test_production_dispatch_blocks_during_peak_and_resumes_after_the_boundary(self, tmp_path, monkeypatch):
+        peak_start = datetime(2026, 9, 21, 6, 0, tzinfo=timezone.utc)  # Monday, second peak window
+        clock = self._install_fake_clock(monkeypatch, peak_start)
+
+        call_times = []
+
+        def fake_call_model(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            call_times.append(clock["now"])
+            return {"response_text": "A", "response_model": "deepseek-flash-test", "request_id": "req",
+                    "input_tokens": 1, "output_tokens": 1, "reasoning_tokens": 0}
+
+        monkeypatch.setattr(model_providers, "call_model", fake_call_model)
+        results_path = tmp_path / "treatment_raw.jsonl"
+        monkeypatch.setattr(rv2, "EXPLORATORY_TREATMENT_RESULTS_FILE", str(results_path))
+        trials_file = tmp_path / "treatment.jsonl"
+        write_jsonl(trials_file, make_superblock_trials("sb1"))
+
+        rv2._run(base_args(concurrency=4, replicates=1, allow_peak_pricing=False),
+                  str(trials_file), "superblock_id", plan_treatment_execution_order, "treatment")
+
+        assert len(call_times) == 8
+        resume_at = datetime(2026, 9, 21, 10, 1, tzinfo=timezone.utc)  # 10:00 boundary + 60s buffer
+        assert all(t >= resume_at for t in call_times)
+
+    def test_allow_peak_pricing_bypasses_the_guard_and_dispatches_immediately(self, tmp_path, monkeypatch):
+        peak_start = datetime(2026, 9, 21, 6, 0, tzinfo=timezone.utc)
+        clock = self._install_fake_clock(monkeypatch, peak_start)
+
+        def fake_call_model(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            return {"response_text": "A", "response_model": "deepseek-flash-test", "request_id": "req",
+                    "input_tokens": 1, "output_tokens": 1, "reasoning_tokens": 0}
+
+        monkeypatch.setattr(model_providers, "call_model", fake_call_model)
+        results_path = tmp_path / "treatment_raw.jsonl"
+        monkeypatch.setattr(rv2, "EXPLORATORY_TREATMENT_RESULTS_FILE", str(results_path))
+        trials_file = tmp_path / "treatment.jsonl"
+        write_jsonl(trials_file, make_superblock_trials("sb1"))
+
+        rv2._run(base_args(concurrency=4, replicates=1, allow_peak_pricing=True),
+                  str(trials_file), "superblock_id", plan_treatment_execution_order, "treatment")
+
+        assert clock["now"] == peak_start  # never advanced -- no waiting occurred
+
+    def test_non_deepseek_provider_is_unaffected_even_during_a_simulated_deepseek_peak(self, tmp_path, monkeypatch):
+        peak_start = datetime(2026, 9, 21, 6, 0, tzinfo=timezone.utc)
+        clock = self._install_fake_clock(monkeypatch, peak_start)
+
+        def fake_call_model(provider, model, prompt, max_output_tokens, reasoning_profile, sampling_params):
+            return {"response_text": "A", "response_model": "claude-sonnet-5-test", "request_id": "req",
+                    "input_tokens": 1, "output_tokens": 1, "reasoning_tokens": 0}
+
+        monkeypatch.setattr(model_providers, "call_model", fake_call_model)
+        results_path = tmp_path / "treatment_raw.jsonl"
+        monkeypatch.setattr(rv2, "EXPLORATORY_TREATMENT_RESULTS_FILE", str(results_path))
+        trials_file = tmp_path / "treatment.jsonl"
+        write_jsonl(trials_file, make_superblock_trials("sb1"))
+
+        rv2._run(base_args(provider="anthropic", model="claude-sonnet-5", concurrency=4, replicates=1, allow_peak_pricing=False),
+                  str(trials_file), "superblock_id", plan_treatment_execution_order, "treatment")
+
+        assert clock["now"] == peak_start  # the gate was constructed but never consulted for a non-DeepSeek provider

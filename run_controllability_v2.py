@@ -49,6 +49,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import model_providers
+from controllability_v2_deepseek_pricing import DeepSeekPricingGate, format_utc_z, is_deepseek_off_peak, next_off_peak_boundary
 from controllability_v2_execution import (
     attach_observation_ids,
     build_evaluator_identity,
@@ -184,8 +185,18 @@ def build_result_row(entry, evaluator_identity, observation, unit_id_field):
     }
 
 
-def make_call_fn(provider, model, reasoning_profile, max_output_tokens, sampling_params):
+def make_call_fn(provider, model, reasoning_profile, max_output_tokens, sampling_params, pricing_gate=None):
+    """pricing_gate (see controllability_v2_deepseek_pricing.DeepSeekPricingGate)
+    is consulted immediately before every dispatch, but ONLY for provider
+    "deepseek" -- every other provider is completely unaffected, even when a
+    gate object is passed in. The check happens on every attempt (a
+    retried observation calls call_fn again, and each call re-checks), and
+    happens before dispatch, never during an in-flight request -- a request
+    already past this point always runs to completion even if a peak
+    window begins mid-call."""
     def call_fn(trial):
+        if provider == "deepseek" and pricing_gate is not None:
+            pricing_gate.wait_until_dispatch_allowed()
         return model_providers.call_model(provider, model, trial["prompt"], max_output_tokens, reasoning_profile, sampling_params)
     return call_fn
 
@@ -220,13 +231,22 @@ def run_plan(plan, evaluator_identity, call_fn, retry_limit, writer, unit_id_fie
 # Production preflight (item 11)
 # ---------------------------------------------------------------------------
 
-def run_preflight(study_config, cli_overrides_treatment, cli_overrides_baseline, concurrency):
+def run_preflight(study_config, cli_overrides_treatment, cli_overrides_baseline, concurrency, allow_peak_pricing=False):
     """Runs every check item 11 requires and returns (ok, checks, context).
     `checks` is a list of (name, ok, detail) tuples; `context` carries the
     loaded manifests and resolved settings for the caller (and for
-    print_preflight_summary) so nothing is loaded twice."""
+    print_preflight_summary) so nothing is loaded twice.
+
+    The DeepSeek pricing-window state (peak/off-peak, and the override flag)
+    is informational only -- it is never added to `checks` and never
+    affects `ok`: preflight must pass regardless of the current time."""
     checks = []
     context = {}
+
+    now = datetime.now(timezone.utc)
+    context["pricing_window_off_peak"] = is_deepseek_off_peak(now)
+    context["pricing_window_next_off_peak"] = None if context["pricing_window_off_peak"] else next_off_peak_boundary(now)
+    context["allow_peak_pricing"] = allow_peak_pricing
 
     is_frozen, reason = verify_frozen()
     checks.append(("study_lock_exists_and_hashes_validate", is_frozen, reason or "ok"))
@@ -306,10 +326,17 @@ def print_preflight_summary(study_config, context):
     print(f"Concurrency: {context['concurrency']}")
     print(f"Output directory: {PRODUCTION_DIR}")
 
+    if context["pricing_window_off_peak"]:
+        print("DeepSeek pricing window: OFF-PEAK")
+    else:
+        print("DeepSeek pricing window: PEAK")
+        print(f"Next off-peak: {format_utc_z(context['pricing_window_next_off_peak'])}")
+    print(f"Peak-pricing override: {'enabled' if context['allow_peak_pricing'] else 'disabled'}")
+
 
 def cmd_preflight(args):
     study_config = load_study_config()
-    ok, checks, context = run_preflight(study_config, {}, {}, args.concurrency)
+    ok, checks, context = run_preflight(study_config, {}, {}, args.concurrency, args.allow_peak_pricing)
     for name, check_ok, detail in checks:
         print(f"[{'OK' if check_ok else 'FAIL'}] {name}: {detail}")
     print_preflight_summary(study_config, context)
@@ -362,6 +389,7 @@ def _run(args, trials_file, unit_id_field, plan_fn, unit_kind):
                 cli_overrides if unit_kind == "treatment" else {},
                 cli_overrides if unit_kind == "baseline" else {},
                 args.concurrency,
+                args.allow_peak_pricing,
             )
             for name, check_ok, detail in checks:
                 print(f"[{'OK' if check_ok else 'FAIL'}] {name}: {detail}")
@@ -419,7 +447,11 @@ def _run(args, trials_file, unit_id_field, plan_fn, unit_kind):
         provider_reasoning_settings=reasoning_settings, sampling_settings=sampling_params, run_id=args.run_id,
         max_output_tokens=settings["max_output_tokens"], retry_limit=settings["retry_limit"],
     )
-    call_fn = make_call_fn(provider, model, reasoning_profile, settings["max_output_tokens"], sampling_params)
+    # The gate is only ever consulted for provider == "deepseek" (see
+    # make_call_fn); constructing it unconditionally here is harmless and
+    # keeps the wiring simple for every other provider.
+    pricing_gate = DeepSeekPricingGate(allow_peak=args.allow_peak_pricing)
+    call_fn = make_call_fn(provider, model, reasoning_profile, settings["max_output_tokens"], sampling_params, pricing_gate)
     progress = ProgressTracker(total=len(remaining_plan), already_completed=len(plan) - len(remaining_plan))
 
     with SafeJsonlWriter(results_file) as writer:
@@ -450,6 +482,9 @@ def add_common_arguments(parser):
     parser.add_argument("--allow-unfrozen", action="store_true",
                          help="Exploratory real run: no frozen-design check; writes to "
                               "results/controllability_v2/exploratory/, never into the production results.")
+    parser.add_argument("--allow-peak-pricing", action="store_true",
+                         help="Bypass the DeepSeek off-peak pricing guard (default: false). Applies only to the "
+                              "DeepSeek provider; every other provider is unaffected either way.")
     parser.add_argument("--dry-run", action="store_true", help="Select and plan, print counts, make no network calls (default-safe mode)")
 
 
@@ -467,6 +502,8 @@ def main():
 
     preflight_parser = subparsers.add_parser("preflight", help="Run every production preflight check and print a summary; makes no API calls")
     preflight_parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
+    preflight_parser.add_argument("--allow-peak-pricing", action="store_true",
+                                   help="Reflects what a subsequent production run's override would be; preflight itself never dispatches.")
     preflight_parser.set_defaults(func=cmd_preflight)
 
     args = parser.parse_args()
