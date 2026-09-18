@@ -48,5 +48,5 @@
   "contrast_file": "data/controllability_v2_contrasts.jsonl",
   "treatment_manifest_file": "data/controllability_v2_trials.jsonl",
   "baseline_manifest_file": "data/controllability_v2_baseline_trials.jsonl",
-  "status": "draft"
+  "status": "frozen"
 }

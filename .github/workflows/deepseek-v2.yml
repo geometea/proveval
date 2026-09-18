@@ -1,0 +1,96 @@
+name: DeepSeek v2 production experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What should this run do?
+        required: true
+        default: preflight
+        type: choice
+        options:
+          - preflight
+          - production
+
+  schedule:
+    - cron: '7 3 18 9 *'
+      timezone: 'America/Los_Angeles'
+
+permissions:
+  contents: read
+
+# Prevent two production workflows from running at the same time.
+concurrency:
+  group: proveval-v2-production
+  cancel-in-progress: false
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # If a previous production run stopped partway through,
+      # restore its result files so the repo's observation_id
+      # resume logic can skip calls already completed.
+      - name: Restore previous production state
+        if: ${{ github.event_name == 'schedule' || inputs.mode == 'production' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: results/controllability_v2/production
+          key: proveval-v2-production-${{ github.run_id }}
+          restore-keys: |
+            proveval-v2-production-
+
+      - name: Production preflight
+        run: python3 run_controllability_v2.py preflight --concurrency 32
+
+      - name: Run baseline
+        if: ${{ github.event_name == 'schedule' || inputs.mode == 'production' }}
+        timeout-minutes: 60
+        run: python3 run_controllability_v2.py baseline --production --concurrency 32
+
+      - name: Run treatment
+        if: ${{ github.event_name == 'schedule' || inputs.mode == 'production' }}
+        timeout-minutes: 270
+        run: python3 run_controllability_v2.py treatment --production --concurrency 32
+
+      - name: Analyze completed experiment
+        if: ${{ success() && (github.event_name == 'schedule' || inputs.mode == 'production') }}
+        run: python3 analyze_controllability_v2.py
+
+      # Preserve state for an automatic resume if this run was incomplete.
+      - name: Save resumable production state
+        if: ${{ always() && (github.event_name == 'schedule' || inputs.mode == 'production') }}
+        uses: actions/cache/save@v4
+        with:
+          path: results/controllability_v2/production
+          key: proveval-v2-production-${{ github.run_id }}
+
+      # Also keep a normal downloadable copy of everything.
+      - name: Upload results
+        if: ${{ always() && (github.event_name == 'schedule' || inputs.mode == 'production') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: proveval-v2-results-${{ github.run_id }}
+          path: |
+            results/controllability_v2/production/
+            results/controllability_v2/analysis/
+          if-no-files-found: warn
+          retention-days: 30
