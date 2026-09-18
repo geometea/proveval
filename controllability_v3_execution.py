@@ -33,13 +33,15 @@ from datetime import datetime, timezone
 
 from controllability_v2_execution import build_evaluator_identity, classify_attempt  # pure helpers, re-used verbatim
 from controllability_v3_design import EXPERIMENT, EXPERIMENT_ID, V2_ID_PREFIX
+from controllability_v3_evaluator_profiles import PRIMARY_PROFILE_ID, make_evaluation_observation_id, profile_id_from_row
 from controllability_v3_trials import make_planned_observation_id
 from run_trial import parse_plain_ab_response
 
 __all__ = [
     "build_evaluator_identity", "classify_attempt", "plan_execution_order", "attach_observation_ids",
     "run_one_observation", "load_valid_completed_ids", "find_duplicate_valid_ids", "filter_unresumed_plan",
-    "build_result_row", "resolve_production_settings", "limit_to_first_n_units", "count_rows",
+    "build_result_row", "resolve_production_settings", "resolve_profile_settings", "limit_to_first_n_units", "count_rows",
+    "evaluation_id_of",
 ]
 
 
@@ -85,11 +87,16 @@ def plan_execution_order(trials, replicate_count, seed):
     return plan
 
 
-def attach_observation_ids(plan):
+def attach_observation_ids(plan, profile_id=PRIMARY_PROFILE_ID, id_maker=make_planned_observation_id):
+    """Stamp the scientific planned_observation_id (model-independent) and
+    the evaluation_observation_id (planned id + evaluator profile) onto
+    every entry. `id_maker` lets stress families use their own id grammar."""
     for entry in plan:
-        entry["planned_observation_id"] = make_planned_observation_id(entry["trial_id"], entry["replicate_number"])
+        entry["planned_observation_id"] = id_maker(entry["trial_id"], entry["replicate_number"])
         if entry["planned_observation_id"].startswith(V2_ID_PREFIX):
             raise ValueError("a v3 plan entry produced a v2-prefixed id")
+        entry["evaluator_profile_id"] = profile_id
+        entry["evaluation_observation_id"] = make_evaluation_observation_id(entry["planned_observation_id"], profile_id)
     return plan
 
 
@@ -176,8 +183,10 @@ def build_result_row(entry, evaluator_identity, observation, prompt_sha256, run_
     resolving = observation["attempts"][-1]
     return {
         "planned_observation_id": entry["planned_observation_id"],
+        "evaluator_profile_id": entry.get("evaluator_profile_id", PRIMARY_PROFILE_ID),
+        "evaluation_observation_id": entry.get("evaluation_observation_id") or make_evaluation_observation_id(entry["planned_observation_id"], PRIMARY_PROFILE_ID),
         "experiment": EXPERIMENT,
-        "experiment_id": EXPERIMENT_ID,
+        "experiment_id": trial.get("experiment_id", EXPERIMENT_ID),
         "collection": collection,                # "pilot" | "production" | "exploratory"
         "family": entry["family"],
         "trial_id": entry["trial_id"],
@@ -197,6 +206,11 @@ def build_result_row(entry, evaluator_identity, observation, prompt_sha256, run_
         "held_out_cue_id": trial.get("held_out_cue_id"),
         "source_trial_id": trial.get("source_trial_id"),
         "pilot_stratum": trial.get("pilot_stratum"),
+        "variant": trial.get("variant"),
+        "attack_id": trial.get("attack_id"),
+        "attack_family": trial.get("attack_family"),
+        "dose": trial.get("dose"),
+        "dose_logit": trial.get("dose_logit"),
         "context_present": trial["context_present"],
         "replicate": entry["replicate_number"],
         "execution_order_index": entry["execution_order_index"],
@@ -247,38 +261,57 @@ def count_rows(results_file):
     return sum(1 for _ in iter_rows(results_file))
 
 
-def load_valid_completed_ids(results_file):
-    """Ids with at least one row whose recorded raw_response genuinely
-    re-parses to the recorded parsed_choice. A row claiming
-    parsing_status=resolved that does not re-parse is NOT counted."""
+def evaluation_id_of(row):
+    """A row's evaluation_observation_id; rows written before evaluator
+    profiles existed are attributed to the profile their evaluator fields
+    identify (the frozen primary for historical primary rows)."""
+    if row.get("evaluation_observation_id"):
+        return row["evaluation_observation_id"]
+    return make_evaluation_observation_id(row["planned_observation_id"], profile_id_from_row(row))
+
+
+def load_valid_completed_ids(results_file, profile_id=None):
+    """Observations with at least one row whose recorded raw_response
+    genuinely re-parses to the recorded parsed_choice. A row claiming
+    parsing_status=resolved that does not re-parse is NOT counted.
+
+    With profile_id=None returns planned_observation_ids (legacy callers);
+    with a profile returns evaluation_observation_ids for THAT profile
+    only, so a file holding several profiles never lets one profile's
+    answer satisfy another profile's plan."""
     ids = set()
     for row in iter_rows(results_file):
         if row.get("parsing_status") != "resolved":
             continue
         parsed, _ = parse_plain_ab_response(row.get("raw_response") or "")
-        if parsed and parsed["overall_quality"] == row.get("parsed_choice"):
+        if not (parsed and parsed["overall_quality"] == row.get("parsed_choice")):
+            continue
+        if profile_id is None:
             ids.add(row["planned_observation_id"])
+        elif profile_id_from_row(row) == profile_id:
+            ids.add(evaluation_id_of(row))
     return ids
 
 
 def find_duplicate_valid_ids(results_file):
-    counts = Counter(row["planned_observation_id"] for row in iter_rows(results_file) if row.get("parsing_status") == "resolved")
+    counts = Counter(evaluation_id_of(row) for row in iter_rows(results_file) if row.get("parsing_status") == "resolved")
     return sorted(oid for oid, n in counts.items() if n > 1)
 
 
-def find_foreign_ids(results_file, allowed_families):
+def find_foreign_ids(results_file, allowed_families, id_prefixes=("v3::",)):
     """Ids in `results_file` whose family isn't one of `allowed_families`
-    (e.g. a pilot row in the production file) or that are not v3 ids."""
+    (e.g. a pilot row in the production file) or whose id prefix is not
+    one of `id_prefixes` (primary "v3::", stress "v3s::")."""
     foreign = []
     for row in iter_rows(results_file):
         oid = row.get("planned_observation_id", "")
-        if not oid.startswith("v3::") or row.get("family") not in allowed_families:
+        if not oid.startswith(tuple(id_prefixes)) or row.get("family") not in allowed_families:
             foreign.append(oid)
     return foreign
 
 
-def filter_unresumed_plan(plan, completed_ids):
-    return [entry for entry in plan if entry["planned_observation_id"] not in completed_ids]
+def filter_unresumed_plan(plan, completed_ids, key="planned_observation_id"):
+    return [entry for entry in plan if entry[key] not in completed_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -314,3 +347,18 @@ def resolve_production_settings(cli_overrides, study_config, run_kind):
     resolved = dict(frozen)
     resolved["evaluator_id"] = primary["evaluator_id"]
     return resolved
+
+
+def resolve_profile_settings(profile, replicates, seed, retry_limit, cli_overrides=None):
+    """Settings for a run under an evaluator PROFILE (multi-model
+    execution): provider/model/reasoning/max_output_tokens come from the
+    profile, replicates/seed/retry_limit from the (frozen) design config.
+    A CLI value that is present and disagrees with the profile is a hard
+    error, exactly as for the frozen primary evaluator."""
+    frozen = {"provider": profile["provider"], "model": profile["model"], "reasoning_profile": profile["reasoning_profile"],
+              "replicates": replicates, "seed": seed, "retry_limit": retry_limit, "max_output_tokens": profile["max_output_tokens"]}
+    mismatches = [f"{k}: got {cli_overrides[k]!r}, profile {profile['profile_id']!r} requires {v!r}"
+                  for k, v in frozen.items() if (cli_overrides or {}).get(k) is not None and cli_overrides[k] != v]
+    if mismatches:
+        raise ValueError("Settings conflict with the evaluator profile -- " + "; ".join(mismatches))
+    return {**frozen, "evaluator_id": f"{profile['provider']}__{profile['model']}__{profile['reasoning_profile']}", "evaluator_profile_id": profile["profile_id"]}

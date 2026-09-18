@@ -1,0 +1,208 @@
+name: Proveval v3 stress experiments
+
+# Separate from proveval-v3-selective-suppression.yml (the frozen primary
+# run) and from deepseek-v2.yml. Only ever invokes run_controllability_v3.py
+# stress-* / profile-preflight commands; only ever caches/uploads
+# results/controllability_v3/stress_* directories; never the primary raw
+# files. NO schedule trigger. Every step that can dispatch a paid call is
+# gated on the exact mode string that pays for it.
+#
+# Modes:
+#   preflight            stress + profile preflight; zero API calls
+#   adversarial-generate ATTACKER model writes candidate re-framings (uploads
+#                        the candidates file + dev manifest as an artifact to
+#                        commit into data/)
+#   adversarial-search   judge evaluates candidates on DEVELOPMENT pairs, then
+#                        selects top-K and builds the held-out manifest (uploaded
+#                        as an artifact to commit + freeze before adversarial-eval)
+#   adversarial-eval     judge evaluates the frozen attacks on HELD-OUT pairs
+#   dose-response        judge evaluates the dose-response manifest
+#   analysis-only        stress analysis on cached results; zero API calls
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What should this run do?
+        required: true
+        default: preflight
+        type: choice
+        options:
+          - preflight
+          - adversarial-generate
+          - adversarial-search
+          - adversarial-eval
+          - dose-response
+          - analysis-only
+      evaluator_profile:
+        description: Evaluator profile (model-side identity; the scientific manifests never change)
+        required: true
+        default: deepseek_flash_low
+        type: choice
+        options:
+          - deepseek_flash_low
+          - deepseek_flash_medium
+          - deepseek_flash_high
+          - anthropic_claude_sonnet_5_low
+          - openai_gpt_5_6_low
+          - gemini_3_8_flash_low
+      attacker_profile:
+        description: Attacker profile for adversarial-generate only
+        required: false
+        default: attacker_deepseek_flash_high
+        type: string
+      time_budget_minutes:
+        description: Paid steps stop submitting new calls after this many minutes (in-flight calls complete; re-dispatch to resume)
+        required: false
+        default: "290"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proveval-v3-stress
+  cancel-in-progress: false
+
+jobs:
+  stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore previous stress state
+        if: ${{ inputs.mode != 'preflight' && inputs.mode != 'adversarial-generate' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            results/controllability_v3/stress_adversarial
+            results/controllability_v3/stress_dose_response
+          key: proveval-v3-stress-${{ inputs.evaluator_profile }}-${{ github.run_id }}
+          restore-keys: |
+            proveval-v3-stress-${{ inputs.evaluator_profile }}-
+
+      # The primary raw file of the same profile is READ by selection and by
+      # the stress analysis (ordinary-wording effects, matched control, blind
+      # baseline). Restore it read-only from the primary workflow's cache; it
+      # is never written or re-saved by this workflow.
+      - name: Restore primary production results (read-only reference)
+        if: ${{ inputs.mode == 'adversarial-search' || inputs.mode == 'analysis-only' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: results/controllability_v3/production
+          key: proveval-v3-production-never-matches-${{ github.run_id }}
+          restore-keys: |
+            proveval-v3-production-
+
+      - name: Evaluator profile preflight (zero API calls)
+        if: ${{ inputs.mode != 'analysis-only' }}
+        run: python3 run_controllability_v3.py profile-preflight --profiles ${{ inputs.evaluator_profile }}
+
+      - name: Stress preflight (zero API calls)
+        if: ${{ inputs.mode != 'analysis-only' }}
+        run: python3 run_controllability_v3.py stress-preflight --evaluator-profile ${{ inputs.evaluator_profile }} --concurrency 32
+
+      # ----------------------------------------------------------------
+      - name: Generate candidate attacks (ATTACKER model)
+        if: ${{ inputs.mode == 'adversarial-generate' }}
+        timeout-minutes: 60
+        run: python3 run_controllability_v3.py stress-adversarial-generate --attacker-profile ${{ inputs.attacker_profile }}
+
+      - name: Upload generated attack candidates (commit into data/ before searching)
+        if: ${{ always() && inputs.mode == 'adversarial-generate' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: proveval-v3-stress-attack-candidates-${{ github.run_id }}
+          path: |
+            data/controllability_v3_stress_adversarial_candidates.jsonl
+            data/controllability_v3_stress_adversarial_dev_trials.jsonl
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ----------------------------------------------------------------
+      - name: Attack search on development pairs (judge)
+        if: ${{ inputs.mode == 'adversarial-search' }}
+        timeout-minutes: 300
+        run: |
+          python3 run_controllability_v3.py stress-adversarial-search --production --concurrency 32 \
+            --evaluator-profile ${{ inputs.evaluator_profile }} \
+            --run-id "v3-stress-search-${{ github.run_id }}" \
+            --time-budget-minutes ${{ inputs.time_budget_minutes }}
+
+      - name: Select top-K attacks and build the held-out manifest (zero API calls)
+        if: ${{ inputs.mode == 'adversarial-search' }}
+        run: python3 run_controllability_v3.py stress-adversarial-select --evaluator-profile ${{ inputs.evaluator_profile }}
+
+      - name: Upload selected attacks (commit into data/ and freeze stage "attacks" before adversarial-eval)
+        if: ${{ always() && inputs.mode == 'adversarial-search' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: proveval-v3-stress-selected-attacks-${{ github.run_id }}
+          path: |
+            data/controllability_v3_stress_adversarial_selected.json
+            data/controllability_v3_stress_adversarial_eval_trials.jsonl
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ----------------------------------------------------------------
+      - name: Held-out attack evaluation (judge)
+        if: ${{ inputs.mode == 'adversarial-eval' }}
+        timeout-minutes: 300
+        run: |
+          python3 run_controllability_v3.py stress-adversarial-run --production --concurrency 32 \
+            --evaluator-profile ${{ inputs.evaluator_profile }} \
+            --run-id "v3-stress-eval-${{ github.run_id }}" \
+            --time-budget-minutes ${{ inputs.time_budget_minutes }}
+
+      - name: Dose-response run (judge)
+        if: ${{ inputs.mode == 'dose-response' }}
+        timeout-minutes: 300
+        run: |
+          python3 run_controllability_v3.py stress-dose-run --production --concurrency 32 \
+            --evaluator-profile ${{ inputs.evaluator_profile }} \
+            --run-id "v3-stress-dose-${{ github.run_id }}" \
+            --time-budget-minutes ${{ inputs.time_budget_minutes }}
+
+      - name: Stress analysis (zero API calls)
+        if: ${{ inputs.mode == 'adversarial-eval' || inputs.mode == 'dose-response' || inputs.mode == 'analysis-only' }}
+        run: python3 run_controllability_v3.py stress-analysis --evaluator-profile ${{ inputs.evaluator_profile }}
+
+      - name: Save resumable stress state
+        if: ${{ always() && (inputs.mode == 'adversarial-search' || inputs.mode == 'adversarial-eval' || inputs.mode == 'dose-response') }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            results/controllability_v3/stress_adversarial
+            results/controllability_v3/stress_dose_response
+          key: proveval-v3-stress-${{ inputs.evaluator_profile }}-${{ github.run_id }}
+
+      - name: Upload stress results
+        if: ${{ always() && inputs.mode != 'preflight' && inputs.mode != 'adversarial-generate' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: proveval-v3-stress-results-${{ inputs.evaluator_profile }}-${{ github.run_id }}
+          path: |
+            results/controllability_v3/stress_adversarial/
+            results/controllability_v3/stress_dose_response/
+            results/controllability_v3/analysis/stress/
+          if-no-files-found: warn
+          retention-days: 30

@@ -27,6 +27,7 @@ from collections import defaultdict
 from analyze import load_jsonl, write_csv
 from controllability_v2_cost import compute_cost_summary
 from controllability_v3_design import CUE_ORDER, HEADLINE_CONTRASTS, INTERVENTION_IDS, MATCHED_CONTROL_ID, holdout_instruction_id
+from controllability_v3_evaluator_profiles import PRIMARY_PROFILE_ID, profile_id_from_row
 from controllability_v3_study_config import STUDY_CONFIG_FILE, load_study_config
 from controllability_v3_trials import FAMILY_HOLDOUT, FAMILY_PRIMARY_CONTEXT, FAMILY_PRIMARY_NOCONTEXT, REQUIRED_CONTEXT_CELLS
 from freeze_controllability_v3 import verify_frozen
@@ -96,23 +97,36 @@ def evaluator_matches(row, study_config):
     )
 
 
-def include_rows(rows, allowed_families, study_config):
-    """Returns (by_id, exclusions) -- exclusions is a list of {reason, n}."""
+def include_rows(rows, allowed_families, study_config, profile_id=None, id_prefix="v3::"):
+    """Returns (by_id, exclusions) -- exclusions is a list of {reason, n}.
+    With profile_id=None (legacy) rows must match the study config's
+    primary evaluator; with a profile they must have been judged under
+    exactly that evaluator profile (profiles are never pooled)."""
     exclusions = defaultdict(int)
     kept = []
     for row in rows:
         oid = row.get("planned_observation_id", "")
-        if not oid.startswith("v3::"):
-            exclusions["not_a_v3_id"] += 1
+        if not oid.startswith(id_prefix):
+            exclusions[f"not_a_{id_prefix.rstrip(':')}_id"] += 1
         elif row.get("family") not in allowed_families:
             exclusions[f"family_not_allowed:{row.get('family')}"] += 1
         elif row.get("collection") == "pilot":
             exclusions["pilot_collection"] += 1
-        elif not evaluator_matches(row, study_config):
+        elif profile_id is not None and profile_id_from_row(row) != profile_id:
+            exclusions[f"evaluator_profile_mismatch:{profile_id_from_row(row)}"] += 1
+        elif profile_id is None and not evaluator_matches(row, study_config):
             exclusions["evaluator_mismatch"] += 1
         else:
             kept.append(row)
     return dedupe_rows(kept), [{"reason": r, "n_rows": n} for r, n in sorted(exclusions.items())]
+
+
+def partition_by_profile(rows):
+    """{evaluator_profile_id: [rows]} -- profiles are analysed separately, never pooled."""
+    parts = defaultdict(list)
+    for row in rows:
+        parts[profile_id_from_row(row)].append(row)
+    return dict(parts)
 
 
 def story1_chosen(row):
@@ -272,14 +286,15 @@ def token_diagnostics(by_id, max_output_tokens):
 # The analysis
 # ---------------------------------------------------------------------------
 
-def analyze(primary_rows, holdout_rows, study_config, is_frozen, n_draws, seed):
+def analyze(primary_rows, holdout_rows, study_config, is_frozen, n_draws, seed, profile_id=None):
     tag = {"experiment_id": study_config["experiment_id"], "corpus_id": study_config["corpus_id"],
-           "evaluator_id": study_config["primary_evaluator"]["evaluator_id"], "study_frozen": is_frozen}
+           "evaluator_id": study_config["primary_evaluator"]["evaluator_id"] if profile_id in (None, PRIMARY_PROFILE_ID) else profile_id,
+           "evaluator_profile_id": profile_id or PRIMARY_PROFILE_ID, "study_frozen": is_frozen}
     min_denominator = study_config.get("relative_suppression_min_denominator", 0.02)
     results = {}
 
-    by_id, exclusions = include_rows(primary_rows, PRIMARY_FAMILIES, study_config)
-    holdout_by_id, holdout_exclusions = include_rows(holdout_rows, (FAMILY_HOLDOUT,), study_config)
+    by_id, exclusions = include_rows(primary_rows, PRIMARY_FAMILIES, study_config, profile_id)
+    holdout_by_id, holdout_exclusions = include_rows(holdout_rows, (FAMILY_HOLDOUT,), study_config, profile_id)
     results["exclusions"] = [{**tag, "file": "primary", **e} for e in exclusions] + [{**tag, "file": "holdout", **e} for e in holdout_exclusions]
 
     valid_context = [e["valid"] for e in by_id.values() if e["valid"] is not None and e["valid"]["family"] == FAMILY_PRIMARY_CONTEXT]
@@ -526,6 +541,7 @@ def analyze(primary_rows, holdout_rows, study_config, is_frozen, n_draws, seed):
     all_rows_for_cost = [e["valid"] if e["valid"] is not None else e["first"] for e in all_by_id.values()]
     results["cost_summary"] = [{**tag, **compute_cost_summary(all_rows_for_cost, study_config["primary_evaluator"]["provider"], study_config["primary_evaluator"]["requested_model"])}]
 
+    results["nocontext_rates_by_intervention"] = rates_by_intervention  # kept for cross-evaluator baseline disagreement (not written as a table)
     results["completeness"] = {
         "n_planned_primary": study_config["expected_unique_cells"]["primary_context"] * study_config["replicate_count"] + study_config["expected_unique_cells"]["primary_nocontext"] * study_config["replicate_count"],
         "n_planned_holdout": study_config["expected_unique_cells"]["holdout"] * study_config["holdout_replicate_count"],
@@ -582,7 +598,7 @@ def write_outputs(results, study_config, is_frozen, analysis_dir):
     with open(os.path.join(analysis_dir, "headline_results.json"), "w", encoding="utf-8") as f:
         json.dump(headline, f, indent=2)
     with open(os.path.join(analysis_dir, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump({k: v for k, v in results.items()}, f, indent=2)
+        json.dump({k: v for k, v in results.items() if k != "nocontext_rates_by_intervention"}, f, indent=2)
     written += ["headline_results.json", "summary.json"]
 
     from controllability_v3_plots import write_all_plots
@@ -591,7 +607,9 @@ def write_outputs(results, study_config, is_frozen, analysis_dir):
 
 
 def run_analysis(primary_results_file, holdout_results_file=None, bootstrap_draws=None, analysis_dir=ANALYSIS_DIR,
-                 study_config_file=STUDY_CONFIG_FILE):
+                 study_config_file=STUDY_CONFIG_FILE, extra_profile_files=None):
+    """extra_profile_files: [{"primary": path, "holdout": path}] for result
+    files of other evaluator profiles; every profile is analysed separately."""
     study_config = load_study_config(study_config_file)
     is_frozen, reason = verify_frozen(study_config_file)
     if not is_frozen:
@@ -599,18 +617,65 @@ def run_analysis(primary_results_file, holdout_results_file=None, bootstrap_draw
     n_draws = bootstrap_draws or study_config["bootstrap_draws"]
     primary_rows = load_rows(primary_results_file)
     holdout_rows = load_rows(holdout_results_file)
+    for extra in extra_profile_files or []:
+        primary_rows += load_rows(extra.get("primary"))
+        holdout_rows += load_rows(extra.get("holdout"))
     print(f"Raw primary rows: {len(primary_rows)}  Raw holdout rows: {len(holdout_rows)}")
-    results = analyze(primary_rows, holdout_rows, study_config, is_frozen, n_draws, study_config["random_seed"])
-    c = results["completeness"]
-    print(f"Complete units: context={c['n_complete_context_units']}/{c['expected_complete_context_units']}  "
-          f"nocontext={c['n_complete_nocontext_units']}/{c['expected_complete_nocontext_units']}  "
-          f"holdout={c['n_complete_holdout_units']}/{c['expected_complete_holdout_units']}  "
-          f"primary_complete={c['primary_complete']}  holdout_complete={c['holdout_complete']}")
-    for e in results["exclusions"]:
-        print(f"Excluded ({e['file']}): {e['reason']}: {e['n_rows']} row(s)")
-    written = write_outputs(results, study_config, is_frozen, analysis_dir)
-    print(f"Wrote {len(written)} output file(s) to {analysis_dir}")
-    return results
+
+    profiles = sorted(set(partition_by_profile(primary_rows)) | set(partition_by_profile(holdout_rows)) | {PRIMARY_PROFILE_ID})
+    per_profile = {}
+    for pid in profiles:
+        results = analyze(primary_rows, holdout_rows, study_config, is_frozen, n_draws, study_config["random_seed"], profile_id=pid)
+        c = results["completeness"]
+        print(f"[{pid}] Complete units: context={c['n_complete_context_units']}/{c['expected_complete_context_units']}  "
+              f"nocontext={c['n_complete_nocontext_units']}/{c['expected_complete_nocontext_units']}  "
+              f"holdout={c['n_complete_holdout_units']}/{c['expected_complete_holdout_units']}  "
+              f"primary_complete={c['primary_complete']}  holdout_complete={c['holdout_complete']}")
+        for e in results["exclusions"]:
+            print(f"[{pid}] Excluded ({e['file']}): {e['reason']}: {e['n_rows']} row(s)")
+        out_dir = analysis_dir if pid == PRIMARY_PROFILE_ID else os.path.join(analysis_dir, "profiles", pid)
+        written = write_outputs(results, study_config, is_frozen, out_dir)
+        print(f"[{pid}] Wrote {len(written)} output file(s) to {out_dir}")
+        per_profile[pid] = results
+
+    if len([p for p in per_profile if per_profile[p]["completeness"]["n_valid_primary"] > 0]) > 1:
+        write_cross_evaluator_outputs(per_profile, study_config, analysis_dir, n_draws)
+    return per_profile[PRIMARY_PROFILE_ID]
+
+
+def write_cross_evaluator_outputs(per_profile, study_config, analysis_dir, n_draws):
+    """Cross-evaluator tables: one row per (profile, intervention) for
+    suppression and drift (never pooled), plus baseline disagreement
+    between every pair of profiles -- the 'different underlying judge'
+    measure that must be read alongside any cross-model suppression
+    difference."""
+    os.makedirs(analysis_dir, exist_ok=True)
+    active = {p: r for p, r in per_profile.items() if r["completeness"]["n_valid_primary"] > 0}
+    sup = [row for r in active.values() for row in r["suppression_by_intervention"]]
+    drift = [row for r in active.values() for row in r["no_context_drift_by_intervention"]]
+    disagreement = []
+    story_ids = sorted({s for r in active.values() for rates in r["nocontext_rates_by_intervention"].values() for pair in rates for s in pair})
+    rng = random.Random(study_config["random_seed"])
+    resamples = st.make_story_resamples(story_ids, n_draws, rng) if story_ids else []
+    pids = sorted(active)
+    for i, a in enumerate(pids):
+        for b in pids[i + 1:]:
+            for iid in INTERVENTION_IDS:
+                ra, rb = active[a]["nocontext_rates_by_intervention"].get(iid), active[b]["nocontext_rates_by_intervention"].get(iid)
+                if not ra or not rb:
+                    continue
+                d = st.drift_estimates(ra, rb, resamples)
+                if d:
+                    disagreement.append({"profile_a": a, "profile_b": b, "intervention_id": iid, **d})
+    for name, rows in (("cross_evaluator_suppression.csv", sup), ("cross_evaluator_drift.csv", drift), ("cross_evaluator_baseline_disagreement.csv", disagreement)):
+        if rows:
+            fieldnames = []
+            for row in rows:
+                for k in row:
+                    if k not in fieldnames:
+                        fieldnames.append(k)
+            write_csv(rows, fieldnames, os.path.join(analysis_dir, name))
+    print(f"Wrote cross-evaluator tables for profiles {pids} to {analysis_dir}")
 
 
 def main():

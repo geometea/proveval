@@ -143,7 +143,7 @@ class TestResume:
             {"planned_observation_id": "v3::p", "parsing_status": "resolved", "family": "pilot"},
             {"planned_observation_id": "context_controllability_v2::x", "parsing_status": "resolved", "family": "primary_context"},
         ])
-        assert ex.find_duplicate_valid_ids(str(path)) == ["v3::a"]
+        assert ex.find_duplicate_valid_ids(str(path)) == ["v3::a@deepseek_flash_low"]  # keyed by evaluation id; legacy rows = primary profile
         assert ex.find_foreign_ids(str(path), ("primary_context", "primary_nocontext")) == ["v3::p", "context_controllability_v2::x"]
         assert ex.count_rows(str(path)) == 4
 

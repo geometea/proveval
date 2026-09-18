@@ -205,7 +205,7 @@ class TestRuns:
         # limit selects the first N blocks of context+nocontext concatenation; use a larger limit via a custom loader
         real = rv3._load_trials_for
 
-        def small(run_kind, config):
+        def small(run_kind, config, stress_config=None):
             trials = real(run_kind, config)
             ctx = [t for t in trials if t["family"] == "primary_context"][:8]
             noctx = [t for t in trials if t["family"] == "primary_nocontext"][:4]

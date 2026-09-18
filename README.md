@@ -586,6 +586,21 @@ python3 run_controllability_v3.py holdout --production --concurrency 32         
 python3 run_controllability_v3.py analysis         # results/controllability_v3/analysis/
 ```
 
+### v3 stress experiments and evaluator profiles (implemented, not yet run)
+
+Two additive stress families (`STUDY_PROTOCOL_V3_STRESS.md`), separate
+from the frozen primary: **adversarial re-framing** (an attacker model
+re-phrases an irrelevant cue; candidates are searched on 22 development
+pairs, the top-3 per cue × intervention are frozen and evaluated on 44
+held-out pairs) and **numeric dose response** (51/60/70/80/90/99 of 100
+readers, 8 interventions, 5 replicates = 63,360 judgments). Any v3 family
+can run under an **evaluator profile** (`--evaluator-profile`, see
+`controllability_v3_evaluator_profiles.py`) without touching a manifest;
+analyses stratify by profile and never pool. Workflow: *Proveval v3 stress
+experiments* (manual only). Commands: `stress-preflight`, `profile-preflight`,
+`stress-adversarial-generate/-search/-select/-run`, `stress-dose-run`,
+`stress-analysis`.
+
 ## Context-controllability experiment v2 (recommended)
 
 A from-scratch v2 redesign of the experiment above, generated and analyzed

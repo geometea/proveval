@@ -1,0 +1,15 @@
+{
+  "experiment_id": "context_controllability_v3_stress",
+  "stages": {
+    "design": {
+      "frozen_at": "2026-09-18T21:37:05.309755+00:00",
+      "hashes": {
+        "stress_config_sha256": "12851c2e5c1333de2b90310de85169928295496386a920bbfd338be1559b7aea",
+        "split_sha256": "4c9f1ec1446061ea667f9bd63b010f218d0c40758b0717891fb9d4d70a5075fa",
+        "dose_manifest_sha256": "ae5cea1ebebf067bc63c5be9d363e61b9c06ae881bfb3293c32f4ed0ac47d780",
+        "primary_lock_sha256": "204ffa729cf409e8a54de704868dd1155bdb023ce5087875be7dc64a691a94cb",
+        "v2_snapshot_sha256": "67c51a22d5b430b5098343e8024180e72a81684091c63e70b350c4863c9490d9"
+      }
+    }
+  }
+}
