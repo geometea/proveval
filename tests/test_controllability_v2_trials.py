@@ -224,3 +224,56 @@ class TestBaseline:
         by_block = t.assert_baseline_trials_are_well_formed(baseline_trials)
         assert len(by_block) == 66
         assert all(len(cells) == 2 for cells in by_block.values())
+
+
+@pytest.fixture(scope="module")
+def baseline_text_only_trials(items):
+    return t.build_baseline_text_only_trials(items)
+
+
+class TestBaselineTextOnly:
+    """The Wave 2 recovery's second no-context baseline condition -- see
+    controllability_v2_recovery.py. Must be structurally identical to the
+    original matched_control baseline except for the instruction sentence."""
+
+    def test_exactly_132_baseline_text_only_prompts(self, baseline_text_only_trials):
+        assert len(baseline_text_only_trials) == 132
+
+    def test_baseline_text_only_contains_no_contextual_clauses(self, baseline_text_only_trials):
+        for trial in baseline_text_only_trials:
+            assert "assignment" not in trial
+            assert "contrast_id" not in trial
+            assert "context_a" not in trial and "context_b" not in trial
+
+    def test_baseline_text_only_uses_the_text_only_instruction(self, baseline_text_only_trials):
+        for trial in baseline_text_only_trials:
+            assert trial["instruction_condition"] == "text_only"
+            assert t.TEXT_ONLY_INSTRUCTION in trial["prompt"]
+            assert t.MATCHED_CONTROL_INSTRUCTION not in trial["prompt"]
+
+    def test_baseline_text_only_blocks_have_exactly_two_positions_and_132_cells_across_66_pairs(self, baseline_text_only_trials):
+        by_block = t.assert_baseline_trials_are_well_formed(baseline_text_only_trials, expected_instruction_condition="text_only")
+        assert len(by_block) == 66
+        assert all(len(cells) == 2 for cells in by_block.values())
+
+    def test_asserting_text_only_trials_with_the_default_matched_control_expectation_fails(self, baseline_text_only_trials):
+        with pytest.raises(ValueError, match="matched_control"):
+            t.assert_baseline_trials_are_well_formed(baseline_text_only_trials)
+
+    def test_matched_control_and_text_only_baselines_differ_only_in_the_instruction_sentence(self, baseline_trials, baseline_text_only_trials):
+        matched_by_key = {(tr["story_1_id"], tr["story_2_id"], tr["position"]): tr for tr in baseline_trials}
+        text_only_by_key = {(tr["story_1_id"], tr["story_2_id"], tr["position"]): tr for tr in baseline_text_only_trials}
+        assert set(matched_by_key) == set(text_only_by_key)
+        for key, matched in matched_by_key.items():
+            text_only = text_only_by_key[key]
+            expected = matched["prompt"].replace(t.MATCHED_CONTROL_INSTRUCTION, t.TEXT_ONLY_INSTRUCTION)
+            assert text_only["prompt"] == expected
+
+    def test_baseline_text_only_trial_ids_are_disjoint_from_the_original_baseline(self, baseline_trials, baseline_text_only_trials):
+        original_ids = {tr["trial_id"] for tr in baseline_trials}
+        text_only_ids = {tr["trial_id"] for tr in baseline_text_only_trials}
+        assert original_ids.isdisjoint(text_only_ids)
+
+    def test_baseline_text_only_carries_its_own_experiment_id(self, baseline_text_only_trials):
+        assert all(tr["experiment_id"] == t.BASELINE_TEXT_ONLY_EXPERIMENT_ID for tr in baseline_text_only_trials)
+        assert t.BASELINE_TEXT_ONLY_EXPERIMENT_ID != t.BASELINE_EXPERIMENT_ID

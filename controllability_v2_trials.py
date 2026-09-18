@@ -48,9 +48,16 @@ CONTRASTS_FILE = "data/controllability_v2_contrasts.jsonl"
 TRIALS_FILE = "data/controllability_v2_trials.jsonl"
 MINIMAL_TRIALS_FILE = "data/controllability_v2_minimal_trials.jsonl"
 BASELINE_TRIALS_FILE = "data/controllability_v2_baseline_trials.jsonl"
+# Wave 2 recovery addition (see controllability_v2_recovery.py): a SECOND,
+# independent no-context baseline condition -- same 66 pairs/2 positions,
+# but the text_only instruction sentence instead of matched_control. This is
+# a NEW experimental condition, generated and validated alongside the
+# original (unchanged) baseline above, never merged into or replacing it.
+BASELINE_TEXT_ONLY_TRIALS_FILE = "data/controllability_v2_baseline_text_only_trials.jsonl"
 
 EXPERIMENT_ID = "context_controllability_v2"
 BASELINE_EXPERIMENT_ID = "context_controllability_baseline_v2"
+BASELINE_TEXT_ONLY_EXPERIMENT_ID = "context_controllability_baseline_text_only_v2"
 MINIMAL_EXPERIMENT_ID = "context_controllability_minimal_v2"
 
 RESPONSE_FORMAT = "plain_ab"
@@ -228,7 +235,12 @@ def assert_superblocks_are_well_formed(treatment_trials):
     return by_superblock
 
 
-def assert_baseline_trials_are_well_formed(trials):
+def assert_baseline_trials_are_well_formed(trials, expected_instruction_condition="matched_control"):
+    """`expected_instruction_condition` defaults to "matched_control" (the
+    original, frozen baseline) -- pass "text_only" to validate the Wave 2
+    recovery's second no-context baseline condition instead. Every other
+    structural rule (no contextual clause/assignment/contrast_id, exactly 2
+    cells per block, both display positions) applies identically to both."""
     trial_ids = [t["trial_id"] for t in trials]
     if len(trial_ids) != len(set(trial_ids)):
         duplicates = sorted({tid for tid in trial_ids if trial_ids.count(tid) > 1})
@@ -244,8 +256,8 @@ def assert_baseline_trials_are_well_formed(trials):
             raise ValueError(f"{trial['trial_id']}: expected response_format {RESPONSE_FORMAT!r}, got {trial['response_format']!r}")
         if "assignment" in trial or "contrast_id" in trial:
             raise ValueError(f"{trial['trial_id']}: baseline trial must not carry any contextual clause/assignment/contrast_id")
-        if trial["instruction_condition"] != "matched_control":
-            raise ValueError(f"{trial['trial_id']}: baseline must use matched_control, got {trial['instruction_condition']!r}")
+        if trial["instruction_condition"] != expected_instruction_condition:
+            raise ValueError(f"{trial['trial_id']}: baseline must use {expected_instruction_condition!r}, got {trial['instruction_condition']!r}")
         if trial["prompt_sha256"] != sha256_hex(trial["prompt"]):
             raise ValueError(f"{trial['trial_id']}: prompt_sha256 does not match its own prompt")
         by_block.setdefault(trial["block_id"], []).append(trial)
@@ -360,6 +372,48 @@ def build_baseline_trials(items):
     return trials
 
 
+def build_baseline_text_only_trials(items):
+    """The Wave 2 recovery's SECOND no-context baseline condition (66 pairs x
+    2 display positions = 132 trials): identical in every respect to
+    build_baseline_trials -- same pairs, same positions, same BASELINE_INTRO,
+    same QUESTION -- except the instruction sentence is TEXT_ONLY_INSTRUCTION
+    instead of MATCHED_CONTROL_INSTRUCTION. Its prompts therefore differ from
+    the original baseline's ONLY in that one sentence, the same guarantee
+    build_prompt already gives the treatment matched_control/text_only pair.
+    Its purpose is to estimate the instruction-only effect in the absence of
+    any context to suppress -- it is a NEW condition, never a replacement for
+    (or an input to) the original baseline's baseline_strength."""
+    trials = []
+    for story_1, story_2 in story_pairs(items):
+        text_1 = load_story(story_1["path"])
+        text_2 = load_story(story_2["path"])
+        pair_id = f"{story_1['id']}_vs_{story_2['id']}"
+        block_id = f"baseline_text_only_superblock__{pair_id}"
+        stories = {"story1_as_a": (story_1, story_2, text_1, text_2), "story2_as_a": (story_2, story_1, text_2, text_1)}
+        for position, (story_a, story_b, text_a, text_b) in stories.items():
+            prompt = build_prompt(BASELINE_INTRO, text_a, text_b, "text_only")
+            trials.append(
+                {
+                    "trial_id": f"{block_id}__{position}",
+                    "block_id": block_id,
+                    "type": "context_pairwise",
+                    "choice_mode": "forced",
+                    "response_format": RESPONSE_FORMAT,
+                    "instruction_condition": "text_only",
+                    "story_1_id": story_1["id"],
+                    "story_2_id": story_2["id"],
+                    "story_a_id": story_a["id"],
+                    "story_b_id": story_b["id"],
+                    "position": position,
+                    "intro": BASELINE_INTRO,
+                    "prompt": prompt,
+                    "prompt_sha256": sha256_hex(prompt),
+                    "experiment_id": BASELINE_TEXT_ONLY_EXPERIMENT_ID,
+                }
+            )
+    return trials
+
+
 def build_all_treatment_trials(contrasts, items, instruction_conditions):
     """One superblock_id per (story pair, contrast); one 4-cell block per
     instruction_condition within it."""
@@ -403,6 +457,16 @@ def main():
         for trial in baseline_trials:
             f.write(json.dumps(trial) + "\n")
 
+    # Wave 2 recovery addition: a second, independent no-context baseline
+    # condition (text_only instruction instead of matched_control) -- see
+    # controllability_v2_recovery.py. Generated alongside, never in place
+    # of, the original (unchanged) baseline above.
+    baseline_text_only_trials = build_baseline_text_only_trials(items)
+    by_baseline_text_only_block = assert_baseline_trials_are_well_formed(baseline_text_only_trials, expected_instruction_condition="text_only")
+    with open(BASELINE_TEXT_ONLY_TRIALS_FILE, "w", encoding="utf-8") as f:
+        for trial in baseline_text_only_trials:
+            f.write(json.dumps(trial) + "\n")
+
     n_stories = len(items)
     n_pairs = n_stories * (n_stories - 1) // 2
     n_contrasts = len(contrasts)
@@ -415,6 +479,8 @@ def main():
     assert len(by_baseline_block) == n_pairs
     assert len(baseline_trials) == n_pairs * 2
     assert len(baseline_trials) == 132, f"expected exactly 132 baseline prompts, got {len(baseline_trials)}"
+    assert len(by_baseline_text_only_block) == n_pairs
+    assert len(baseline_text_only_trials) == 132, f"expected exactly 132 baseline_text_only prompts, got {len(baseline_text_only_trials)}"
 
     print(f"Context controllability experiment v2: {EXPERIMENT_ID}")
     print(f"Stories: {n_stories}")
@@ -434,6 +500,10 @@ def main():
     print(f"Baseline pairs: {n_pairs}")
     print(f"Baseline trials: {len(baseline_trials)} ({n_pairs} pairs x 2 positions, matched_control instruction)")
     print(f"Output: {BASELINE_TRIALS_FILE}")
+    print()
+    print(f"Blind baseline (text_only, Wave 2 recovery addition): {BASELINE_TEXT_ONLY_EXPERIMENT_ID}")
+    print(f"Baseline text_only trials: {len(baseline_text_only_trials)} ({n_pairs} pairs x 2 positions, text_only instruction)")
+    print(f"Output: {BASELINE_TEXT_ONLY_TRIALS_FILE}")
 
 
 if __name__ == "__main__":

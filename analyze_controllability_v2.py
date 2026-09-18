@@ -31,7 +31,7 @@ from controllability_v2_corpus import CORPUS_FILE
 from controllability_v2_study_config import STUDY_CONFIG_FILE, load_study_config
 from controllability_v2_trials import BASELINE_TRIALS_FILE, TRIALS_FILE
 from freeze_controllability_v2 import verify_frozen
-from run_controllability_v2 import BASELINE_RESULTS_FILE, TREATMENT_RESULTS_FILE
+from run_controllability_v2 import BASELINE_RESULTS_FILE, BASELINE_TEXT_ONLY_RESULTS_FILE, TREATMENT_RESULTS_FILE
 import controllability_v2_cost as cost
 import controllability_v2_stats as st
 
@@ -243,6 +243,63 @@ def pair_values_for(pair_rows, contrast_id, instruction_condition):
 # Baseline: independent pair stats + split-half reliability
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Wave 2 recovery: instruction-only effect (no-context text_only vs.
+# no-context matched_control) -- see controllability_v2_recovery.py for the
+# manifest and STUDY_PROTOCOL_V2.md addendum. This NEVER feeds into
+# baseline_strength (build_baseline_pair_table below is untouched and is
+# still computed from the matched_control baseline rows only) and its
+# result is never mechanically subtracted from any context-effect estimator
+# -- it is reported purely as its own, separate estimate.
+# ---------------------------------------------------------------------------
+
+def build_instruction_only_pair_rate_table(rows):
+    """{(story_1_id, story_2_id): rate} -- the story1-chosen rate for one
+    no-context baseline condition, averaged across BOTH display positions
+    (the same position-counterbalancing the original baseline already
+    relies on: every pair contributes one observation at each position)."""
+    lists = defaultdict(list)
+    for row in rows:
+        chosen = story1_chosen(row)
+        if chosen is None:
+            continue
+        meta = row["trial_meta"]
+        lists[(meta["story_1_id"], meta["story_2_id"])].append(chosen)
+    return {key: sum(vals) / len(vals) for key, vals in lists.items() if vals}
+
+
+def build_instruction_only_effects(matched_control_rows, text_only_rows, story_ids, n_bootstrap_draws, rng):
+    """Returns (pair_rows, overall_row). `overall_row` is None if no story
+    pair has both a matched_control and a text_only rate available."""
+    matched_rates = build_instruction_only_pair_rate_table(matched_control_rows)
+    text_only_rates = build_instruction_only_pair_rate_table(text_only_rows)
+    common_pairs = sorted(set(matched_rates) & set(text_only_rates))
+    if not common_pairs:
+        return [], None
+
+    pair_effect = {pair: text_only_rates[pair] - matched_rates[pair] for pair in common_pairs}
+    pair_rows = [
+        {
+            "story_1_id": s1, "story_2_id": s2,
+            "matched_control_rate": matched_rates[(s1, s2)],
+            "text_only_rate": text_only_rates[(s1, s2)],
+            "instruction_only_effect": pair_effect[(s1, s2)],
+        }
+        for (s1, s2) in common_pairs
+    ]
+
+    overall_point = st.ate_from_pair_values(pair_effect)
+    draws = [d["effect"] for d in st.story_bootstrap_joint_draws({"effect": pair_effect}, story_ids, n_bootstrap_draws, rng)]
+    ci = st.bootstrap_ci_from_draws(draws, conf_levels=(0.95,))[0.95]
+    overall_row = {
+        "n_story_pairs": len(pair_effect),
+        "instruction_only_effect_probability_points": overall_point,
+        "instruction_only_effect_percentage_points": overall_point * 100 if overall_point is not None else None,
+        "ci_95_lo": ci[0], "ci_95_hi": ci[1], "n_bootstrap_draws_used": len(draws),
+    }
+    return pair_rows, overall_row
+
+
 def build_baseline_pair_table(rows):
     counts = defaultdict(lambda: [0, 0])
     per_pair_replicate_choices = defaultdict(list)
@@ -321,10 +378,17 @@ def analyze_one_evaluator(evaluator_id, partition, study_config, is_frozen, n_bo
     tag = evaluator_tag(evaluator_id, config, study_config)
 
     treatment_rows = [r for r in partition["rows"] if "superblock_id" in r]
-    baseline_rows = [r for r in partition["rows"] if "block_id" in r and "superblock_id" not in r]
+    baseline_rows_all = [r for r in partition["rows"] if "block_id" in r and "superblock_id" not in r]
+    # The original (frozen) baseline is matched_control-only; the Wave 2
+    # recovery's new no-context/text_only condition is split out separately
+    # here so it can NEVER be mistaken for, or pooled into, the original --
+    # baseline_strength (below) is computed exclusively from baseline_rows.
+    baseline_rows = [r for r in baseline_rows_all if r["trial_meta"].get("instruction_condition") == "matched_control"]
+    baseline_text_only_rows = [r for r in baseline_rows_all if r["trial_meta"].get("instruction_condition") == "text_only"]
 
     kept_treatment, n_complete_sb, n_incomplete_sb, incomplete_sb_diag = filter_complete_superblocks(treatment_rows)
     kept_baseline, n_complete_bu, n_incomplete_bu, incomplete_bu_diag = filter_complete_baseline_units(baseline_rows)
+    kept_baseline_text_only, n_complete_bto, n_incomplete_bto, incomplete_bto_diag = filter_complete_baseline_units(baseline_text_only_rows)
 
     cell_rates = build_treatment_cell_rates(kept_treatment)
     pair_rows = build_pair_context_effects(cell_rates)
@@ -334,7 +398,13 @@ def analyze_one_evaluator(evaluator_id, partition, study_config, is_frozen, n_bo
     for row in pair_rows:
         row["baseline_strength"] = baseline_strength_by_pair.get((row["story_1_id"], row["story_2_id"]))
 
-    story_ids = sorted({s for r in pair_rows for s in (r["story_1_id"], r["story_2_id"])})
+    def _row_story_ids(rows):
+        return {row["trial_meta"][key] for row in rows for key in ("story_1_id", "story_2_id")}
+
+    story_ids = sorted(
+        {s for r in pair_rows for s in (r["story_1_id"], r["story_2_id"])}
+        | _row_story_ids(kept_baseline) | _row_story_ids(kept_baseline_text_only)
+    )
     rng = random.Random(bootstrap_seed)
 
     cue_ate_rows, controllability_rows, equivalence_rows, ambiguity_rows, position_rows, loo_rows = [], [], [], [], [], []
@@ -414,16 +484,26 @@ def analyze_one_evaluator(evaluator_id, partition, study_config, is_frozen, n_bo
                 "predicted_effect_at_p75": predictions[75],
             })
 
+    # --- instruction-only effect: no-context text_only vs. no-context
+    # matched_control (Wave 2 recovery addition). Independent of, and never
+    # subtracted from, any context-effect estimator above.
+    instruction_only_pair_rows, instruction_only_summary = build_instruction_only_effects(
+        kept_baseline, kept_baseline_text_only, story_ids, n_bootstrap_draws, rng,
+    )
+
     tagged_pair_rows = [{**tag, **row} for row in pair_rows]
     tagged_baseline_rows = [{**tag, **row} for row in baseline_table]
     reliability_row = {**tag, **reliability}
+    tagged_instruction_only_pair_rows = [{**tag, **row} for row in instruction_only_pair_rows]
+    tagged_instruction_only_summary_rows = [{**tag, **instruction_only_summary}] if instruction_only_summary else []
 
     cell_counts_rows = _cell_counts(tag, kept_treatment, kept_baseline)
-    compliance_rows = [{**tag, **row} for row in response_compliance_table(treatment_rows + baseline_rows)]
+    compliance_rows = [{**tag, **row} for row in response_compliance_table(treatment_rows + baseline_rows + baseline_text_only_rows)]
 
     incomplete_unit_rows = (
         [{**tag, "unit_type": "treatment_superblock", **d} for d in incomplete_sb_diag]
         + [{**tag, "unit_type": "baseline_unit", **d} for d in incomplete_bu_diag]
+        + [{**tag, "unit_type": "baseline_text_only_unit", **d} for d in incomplete_bto_diag]
     )
 
     cost_summary_row = {**tag, **cost.compute_cost_summary(partition["rows"], config.get("provider"), config.get("requested_model"))}
@@ -435,6 +515,8 @@ def analyze_one_evaluator(evaluator_id, partition, study_config, is_frozen, n_bo
         "n_incomplete_treatment_superblocks": n_incomplete_sb,
         "n_complete_baseline_units": n_complete_bu,
         "n_incomplete_baseline_units": n_incomplete_bu,
+        "n_complete_baseline_text_only_units": n_complete_bto,
+        "n_incomplete_baseline_text_only_units": n_incomplete_bto,
         "pair_context_effects": tagged_pair_rows,
         "baseline_pair_strength": tagged_baseline_rows,
         "baseline_reliability": [reliability_row],
@@ -447,6 +529,8 @@ def analyze_one_evaluator(evaluator_id, partition, study_config, is_frozen, n_bo
         "response_compliance": compliance_rows,
         "cell_counts": cell_counts_rows,
         "incomplete_units": incomplete_unit_rows,
+        "instruction_only_pair_effects": tagged_instruction_only_pair_rows,
+        "instruction_only_effects": tagged_instruction_only_summary_rows,
         "cost_summary": [cost_summary_row],
     }
 
@@ -557,6 +641,8 @@ def write_all_csvs(per_evaluator_results, evaluator_inventory_rows):
         "evaluator_inventory.csv": evaluator_inventory_rows,
         "incomplete_superblocks.csv": collect("incomplete_units"),
         "cost_summary.csv": collect("cost_summary"),
+        "instruction_only_effects.csv": collect("instruction_only_effects"),
+        "instruction_only_pair_effects.csv": collect("instruction_only_pair_effects"),
     }
     for filename, rows in exports.items():
         if not rows:
@@ -592,6 +678,9 @@ def main():
     parser = argparse.ArgumentParser(description="v2 context-controllability analysis.")
     parser.add_argument("--treatment-results-file", default=TREATMENT_RESULTS_FILE)
     parser.add_argument("--baseline-results-file", default=BASELINE_RESULTS_FILE)
+    parser.add_argument("--baseline-text-only-results-file", default=BASELINE_TEXT_ONLY_RESULTS_FILE,
+                         help="The Wave 2 recovery's new no-context/text_only condition (optional -- absent by default "
+                              "until that condition has actually been run)")
     parser.add_argument("--study-config-file", default=STUDY_CONFIG_FILE)
     parser.add_argument("--bootstrap-draws", type=int, default=None, help="Default: bootstrap_draws from the study config")
     parser.add_argument("--strict-model-version", action="store_true",
@@ -608,9 +697,11 @@ def main():
 
     treatment_rows = load_rows(args.treatment_results_file)
     baseline_rows = load_rows(args.baseline_results_file)
-    print(f"Raw treatment rows: {len(treatment_rows)}  Raw baseline rows: {len(baseline_rows)}")
+    baseline_text_only_rows = load_rows(args.baseline_text_only_results_file)
+    print(f"Raw treatment rows: {len(treatment_rows)}  Raw baseline rows: {len(baseline_rows)}  "
+          f"Raw baseline_text_only rows: {len(baseline_text_only_rows)}")
 
-    all_rows = treatment_rows + baseline_rows
+    all_rows = treatment_rows + baseline_rows + baseline_text_only_rows
     partitions, unmatched, warnings = partition_by_resolved_evaluator(all_rows, study_config, strict=args.strict_model_version)
     for warning in warnings:
         print(f"WARNING: {warning}")

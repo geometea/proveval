@@ -41,11 +41,13 @@ def make_treatment_row(trial_id, superblock_id, replicate_number, contrast_id, i
 
 
 def make_baseline_row(trial_id, block_id, replicate_number, story_1_id, story_2_id, position, choice="A",
-                       provider="anthropic", requested_model="claude-sonnet-5", reasoning_profile="low"):
+                       provider="anthropic", requested_model="claude-sonnet-5", reasoning_profile="low",
+                       instruction_condition="matched_control"):
     return {
         "trial_id": trial_id, "block_id": block_id, "replicate_number": replicate_number,
         "evaluator": {"provider": provider, "requested_model": requested_model, "reasoning_profile": reasoning_profile},
         "trial_meta": {"story_1_id": story_1_id, "story_2_id": story_2_id, "position": position,
+                       "instruction_condition": instruction_condition,
                        "story_a_id": story_1_id if position == "story1_as_a" else story_2_id,
                        "story_b_id": story_2_id if position == "story1_as_a" else story_1_id},
         "attempts": [{"attempt_number": 1, "status": "valid", "response_model": "claude-sonnet-5-20250929"}],
@@ -295,3 +297,112 @@ class TestResponseCompliance:
         compliance = av2.response_compliance_table([row])
         assert compliance[0]["n_refusal_first_attempt"] == 1
         assert compliance[0]["n_invalid_first_attempt"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Wave 2 recovery: instruction-only effect (no-context text_only vs.
+# no-context matched_control). Never feeds baseline_strength, never
+# subtracted from any context-effect estimator.
+# ---------------------------------------------------------------------------
+
+class TestInstructionOnlyEffects:
+    def test_pair_rate_table_averages_across_both_positions(self):
+        rows = [
+            make_baseline_row("m1", "bm1", 1, "s1", "s2", "story1_as_a", choice="A"),
+            make_baseline_row("m2", "bm1", 1, "s1", "s2", "story2_as_a", choice="B"),
+        ]
+        table = av2.build_instruction_only_pair_rate_table(rows)
+        assert table[("s1", "s2")] == 1.0  # story1 chosen at both positions
+
+    def test_signed_effect_and_summary_from_a_single_pair(self):
+        matched_rows = [
+            make_baseline_row("m1", "bm1", 1, "s1", "s2", "story1_as_a", choice="A"),
+            make_baseline_row("m2", "bm1", 1, "s1", "s2", "story2_as_a", choice="B"),
+        ]  # story1-chosen rate = 1.0
+        text_only_rows = [
+            make_baseline_row("t1", "bt1", 1, "s1", "s2", "story1_as_a", choice="B", instruction_condition="text_only"),
+            make_baseline_row("t2", "bt1", 1, "s1", "s2", "story2_as_a", choice="A", instruction_condition="text_only"),
+        ]  # story1-chosen rate = 0.0
+        import random
+        pair_rows, summary = av2.build_instruction_only_effects(matched_rows, text_only_rows, ["s1", "s2"], 200, random.Random(0))
+        assert len(pair_rows) == 1
+        assert pair_rows[0]["matched_control_rate"] == 1.0
+        assert pair_rows[0]["text_only_rate"] == 0.0
+        assert pair_rows[0]["instruction_only_effect"] == pytest.approx(-1.0)
+        assert summary["n_story_pairs"] == 1
+        assert summary["instruction_only_effect_probability_points"] == pytest.approx(-1.0)
+        assert summary["instruction_only_effect_percentage_points"] == pytest.approx(-100.0)
+
+    def test_no_pairs_in_common_returns_empty_and_no_summary(self):
+        import random
+        pair_rows, summary = av2.build_instruction_only_effects([], [], [], 10, random.Random(0))
+        assert pair_rows == []
+        assert summary is None
+
+    def test_a_pair_present_in_only_one_condition_is_excluded_not_treated_as_zero(self):
+        matched_rows = [
+            make_baseline_row("m1", "bm1", 1, "s1", "s2", "story1_as_a", choice="A"),
+            make_baseline_row("m2", "bm1", 1, "s1", "s2", "story2_as_a", choice="B"),
+        ]
+        import random
+        pair_rows, summary = av2.build_instruction_only_effects(matched_rows, [], ["s1", "s2"], 10, random.Random(0))
+        assert pair_rows == []
+        assert summary is None
+
+
+class TestAnalyzeOneEvaluatorInstructionOnlySplit:
+    """Feeding the (new) baseline_text_only rows into analyze_one_evaluator
+    alongside the original baseline must never change baseline_strength or
+    the primary treatment estimators, and must populate the new
+    instruction-only outputs."""
+
+    FULL_STUDY_CONFIG = {
+        **STUDY_CONFIG,
+        "corpus_id": "corpus1",
+        "experiment_id": "context_controllability_v2",
+        "equivalence_margin": 0.05,
+    }
+
+    def _partition(self, rows):
+        return {"config": {**STUDY_CONFIG["primary_evaluator"]}, "rows": rows}
+
+    def test_baseline_strength_is_identical_with_or_without_baseline_text_only_rows(self):
+        baseline_rows = [
+            make_baseline_row("m1", "bm1", 1, "s1", "s2", "story1_as_a", choice="A"),
+            make_baseline_row("m2", "bm1", 1, "s1", "s2", "story2_as_a", choice="A"),
+        ]
+        text_only_rows = [
+            make_baseline_row("t1", "bt1", 1, "s1", "s2", "story1_as_a", choice="B", instruction_condition="text_only"),
+            make_baseline_row("t2", "bt1", 1, "s1", "s2", "story2_as_a", choice="B", instruction_condition="text_only"),
+        ]
+        without_text_only = av2.analyze_one_evaluator(
+            "e1", self._partition(baseline_rows), self.FULL_STUDY_CONFIG, True, 10, 0,
+        )
+        with_text_only = av2.analyze_one_evaluator(
+            "e1", self._partition(baseline_rows + text_only_rows), self.FULL_STUDY_CONFIG, True, 10, 0,
+        )
+        assert without_text_only["baseline_pair_strength"] == with_text_only["baseline_pair_strength"]
+        assert without_text_only["n_complete_baseline_units"] == with_text_only["n_complete_baseline_units"] == 1
+        assert without_text_only["n_complete_baseline_text_only_units"] == 0
+        assert with_text_only["n_complete_baseline_text_only_units"] == 1
+
+    def test_instruction_only_effects_are_populated_only_when_text_only_rows_are_present(self):
+        baseline_rows = [
+            make_baseline_row("m1", "bm1", 1, "s1", "s2", "story1_as_a", choice="A"),
+            make_baseline_row("m2", "bm1", 1, "s1", "s2", "story2_as_a", choice="B"),
+        ]  # story1-chosen rate = 1.0
+        text_only_rows = [
+            make_baseline_row("t1", "bt1", 1, "s1", "s2", "story1_as_a", choice="B", instruction_condition="text_only"),
+            make_baseline_row("t2", "bt1", 1, "s1", "s2", "story2_as_a", choice="A", instruction_condition="text_only"),
+        ]  # story1-chosen rate = 0.0
+        without_text_only = av2.analyze_one_evaluator(
+            "e1", self._partition(baseline_rows), self.FULL_STUDY_CONFIG, True, 10, 0,
+        )
+        with_text_only = av2.analyze_one_evaluator(
+            "e1", self._partition(baseline_rows + text_only_rows), self.FULL_STUDY_CONFIG, True, 10, 0,
+        )
+        assert without_text_only["instruction_only_pair_effects"] == []
+        assert without_text_only["instruction_only_effects"] == []
+        assert len(with_text_only["instruction_only_pair_effects"]) == 1
+        assert len(with_text_only["instruction_only_effects"]) == 1
+        assert with_text_only["instruction_only_pair_effects"][0]["instruction_only_effect"] == pytest.approx(-1.0)
