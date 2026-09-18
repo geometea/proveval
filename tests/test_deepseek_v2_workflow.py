@@ -23,10 +23,10 @@ class TestExistingTriggerUntouched:
         schedule = workflow[True]["schedule"]  # YAML parses bare "on" as True
         assert schedule == [{"cron": "7 3 18 9 *", "timezone": "America/Los_Angeles"}]
 
-    def test_mode_choices_include_recovery_alongside_the_originals(self):
+    def test_mode_choices_include_recovery_and_recovery_preflight_alongside_the_originals(self):
         workflow = _load_workflow()
         mode_input = workflow[True]["workflow_dispatch"]["inputs"]["mode"]
-        assert mode_input["options"] == ["preflight", "production", "recovery"]
+        assert mode_input["options"] == ["preflight", "production", "recovery-preflight", "recovery"]
         assert mode_input["default"] == "preflight"
 
     def test_production_steps_still_run_on_schedule_or_mode_production(self):
@@ -51,20 +51,64 @@ class TestRecoveryMode:
         assert step["with"]["name"] == "proveval-v2-results-35355521243"
         assert "recovery" in step["if"]
 
-    def test_every_recovery_step_is_gated_on_recovery_mode_only(self):
+    def test_every_paid_call_recovery_step_is_gated_on_the_exact_recovery_mode_string(self):
+        """These steps make (or gate) real API calls, or act on their
+        results -- they must fire for mode: recovery only, and GitHub
+        Actions' == is exact string equality, so 'recovery-preflight' can
+        never satisfy inputs.mode == 'recovery'."""
         steps = _steps()
-        recovery_step_names = {
-            "Restore previous recovery state", "Download Wave 1 artifact (run 35355521243)",
-            "Recovery preflight", "Run recovery (unresolved Wave 1 observations only)",
+        paid_call_step_names = {
+            "Restore previous recovery state", "Run recovery (unresolved Wave 1 observations only)",
             "Run new no-context/text_only baseline condition",
             "Run validation sample (500 non-primary duplicate observations)",
+            "Validation diagnostics report",
             "Merge Wave 1 + recovery results", "Analyze the merged Wave 2 dataset",
             "Save resumable recovery state", "Upload Wave 2 recovery results",
         }
         by_name = {s["name"]: s for s in steps}
-        assert recovery_step_names <= set(by_name)
-        for name in recovery_step_names:
-            assert "inputs.mode == 'recovery'" in by_name[name]["if"]
+        assert paid_call_step_names <= set(by_name)
+        for name in paid_call_step_names:
+            condition = by_name[name]["if"]
+            assert "inputs.mode == 'recovery'" in condition
+            assert "recovery-preflight" not in condition
+
+    def test_download_and_recovery_preflight_steps_fire_for_both_recovery_modes(self):
+        """The download + recovery-preflight steps are the ONLY two steps
+        mode: recovery-preflight ever reaches -- they must fire for either
+        mode: recovery or mode: recovery-preflight."""
+        steps = _steps()
+        by_name = {s["name"]: s for s in steps}
+        for name in ("Download Wave 1 artifact (run 35355521243)", "Recovery preflight"):
+            condition = by_name[name]["if"]
+            assert "inputs.mode == 'recovery'" in condition
+            assert "inputs.mode == 'recovery-preflight'" in condition
+
+    def test_recovery_preflight_mode_cannot_reach_any_api_running_step(self):
+        """Acceptance test for the standalone recovery-preflight mode: no
+        step that ever dispatches a model API call (recovery-run,
+        baseline-text-only, validation-run) can fire when
+        inputs.mode == 'recovery-preflight' -- each is gated on the exact
+        string 'recovery', which is never equal to 'recovery-preflight'."""
+        steps = _steps()
+        # "py baseline-text-only" (the actual subcommand invocation) is
+        # deliberately more specific than "baseline-text-only" alone, which
+        # would also match the unrelated --baseline-text-only-results-file
+        # CLI flag on the analysis step.
+        api_calling_run_texts = {
+            "recovery-run": None, "py baseline-text-only": None, "validation-run": None,
+        }
+        for step in steps:
+            run_text = step.get("run", "")
+            condition = step.get("if", "")
+            for keyword in api_calling_run_texts:
+                if keyword in run_text:
+                    api_calling_run_texts[keyword] = condition
+        for keyword, condition in api_calling_run_texts.items():
+            assert condition is not None, f"no step found containing {keyword!r}"
+            assert condition == "${{ inputs.mode == 'recovery' }}", (
+                f"step containing {keyword!r} has condition {condition!r} -- "
+                "it must be gated on exactly mode == 'recovery', excluding 'recovery-preflight'"
+            )
 
     def test_recovery_never_reruns_the_full_original_experiment(self):
         """The recovery job must call recovery-run/baseline-text-only/
@@ -88,3 +132,22 @@ class TestRecoveryMode:
         names = {s["with"]["name"] for s in upload_steps}
         assert "proveval-v2-results-${{ github.run_id }}" in names
         assert "proveval-v2-wave2-recovery-results-${{ github.run_id }}" in names
+
+    def test_analyze_step_reads_baseline_text_only_from_wave2_recovery_not_production(self):
+        by_name = {s["name"]: s for s in _steps()}
+        run_text = by_name["Analyze the merged Wave 2 dataset"]["run"]
+        assert "results/controllability_v2/wave2_recovery/baseline_text_only_raw.jsonl" in run_text
+        assert "results/controllability_v2/production/baseline_text_only_raw.jsonl" not in run_text
+
+    def test_recovery_cache_and_upload_cover_baseline_text_only_via_wave2_recovery_dir(self):
+        by_name = {s["name"]: s for s in _steps()}
+        for name in ("Restore previous recovery state", "Save resumable recovery state"):
+            assert by_name[name]["with"]["path"] == "results/controllability_v2/wave2_recovery"
+        upload_path = by_name["Upload Wave 2 recovery results"]["with"]["path"]
+        assert "results/controllability_v2/wave2_recovery/" in upload_path
+
+    def test_validation_report_step_is_wired_into_the_recovery_pipeline(self):
+        by_name = {s["name"]: s for s in _steps()}
+        assert "Validation diagnostics report" in by_name
+        run_text = by_name["Validation diagnostics report"]["run"]
+        assert "validation-report" in run_text

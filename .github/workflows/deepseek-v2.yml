@@ -11,6 +11,7 @@ on:
         options:
           - preflight
           - production
+          - recovery-preflight
           - recovery
 
   schedule:
@@ -102,15 +103,47 @@ jobs:
           retention-days: 30
 
       # -----------------------------------------------------------------
-      # Wave 2 recovery (mode: recovery). Recovers the failed DeepSeek
-      # production run from GitHub Actions run 35355521243: retains every
-      # Wave 1 observation that already has a valid A/B answer, reruns only
-      # the ones that don't, adds the new no-context/text_only condition,
-      # runs the 500-observation validation sample, merges everything, and
+      # Wave 2 recovery (mode: recovery-preflight, mode: recovery). Recovers
+      # the failed DeepSeek production run from GitHub Actions run
+      # 35355521243: retains every Wave 1 observation that already has a
+      # valid A/B answer, reruns only the ones that don't, adds the new
+      # no-context/text_only condition, runs the 500-observation validation
+      # sample, merges everything, verifies full completeness, and
       # re-analyzes. This never touches the scheduled/production steps
       # above, and never automatically reruns the entire original
       # experiment -- only the specific gaps recovery-preflight identifies.
+      #
+      # mode: recovery-preflight downloads the source artifact and runs
+      # ONLY the preflight check, then stops -- it makes no model API calls
+      # and cannot reach any paid-call step below (each of those is gated
+      # on the exact string "recovery", which 'recovery-preflight' never
+      # equals). Use it first to see the exact recovery plan before
+      # spending anything; then rerun with mode: recovery to execute it.
       # -----------------------------------------------------------------
+
+      # actions/download-artifact@v4 can fetch an artifact from a DIFFERENT
+      # completed run in this same repository via run-id + repository +
+      # github-token (requires the "actions: read" permission above) --
+      # no third-party action needed for this same-repo cross-run download.
+      - name: Download Wave 1 artifact (run 35355521243)
+        if: ${{ inputs.mode == 'recovery' || inputs.mode == 'recovery-preflight' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: proveval-v2-results-35355521243
+          run-id: 35355521243
+          repository: ${{ github.repository }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: wave1_artifact
+
+      - name: Recovery preflight
+        if: ${{ inputs.mode == 'recovery' || inputs.mode == 'recovery-preflight' }}
+        run: |
+          python3 run_controllability_v2.py recovery-preflight \
+            --source-results wave1_artifact/results/controllability_v2/production
+
+      # Everything below here is gated on the exact string "recovery" --
+      # mode: recovery-preflight stops at the step above and never reaches
+      # any of these (and therefore never makes an API call).
 
       - name: Restore previous recovery state
         if: ${{ inputs.mode == 'recovery' }}
@@ -121,26 +154,6 @@ jobs:
           restore-keys: |
             proveval-v2-wave2-recovery-
 
-      # actions/download-artifact@v4 can fetch an artifact from a DIFFERENT
-      # completed run in this same repository via run-id + repository +
-      # github-token (requires the "actions: read" permission above) --
-      # no third-party action needed for this same-repo cross-run download.
-      - name: Download Wave 1 artifact (run 35355521243)
-        if: ${{ inputs.mode == 'recovery' }}
-        uses: actions/download-artifact@v4
-        with:
-          name: proveval-v2-results-35355521243
-          run-id: 35355521243
-          repository: ${{ github.repository }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: wave1_artifact
-
-      - name: Recovery preflight
-        if: ${{ inputs.mode == 'recovery' }}
-        run: |
-          python3 run_controllability_v2.py recovery-preflight \
-            --source-results wave1_artifact/results/controllability_v2/production
-
       - name: Run recovery (unresolved Wave 1 observations only)
         if: ${{ inputs.mode == 'recovery' }}
         timeout-minutes: 120
@@ -149,6 +162,9 @@ jobs:
             --source-results wave1_artifact/results/controllability_v2/production \
             --concurrency 32
 
+      # baseline_text_only writes under results/controllability_v2/wave2_recovery/
+      # (not production/) specifically so the cache restore/save above and
+      # below preserves its progress across an interrupted/resumed run.
       - name: Run new no-context/text_only baseline condition
         if: ${{ inputs.mode == 'recovery' }}
         timeout-minutes: 60
@@ -162,6 +178,16 @@ jobs:
             --source-results wave1_artifact/results/controllability_v2/production \
             --concurrency 32
 
+      - name: Validation diagnostics report
+        if: ${{ inputs.mode == 'recovery' }}
+        run: python3 run_controllability_v2.py validation-report
+
+      # Merges Wave 1 + recovery, then HARD-FAILS (after writing every
+      # output) unless the merged dataset and the new baseline_text_only
+      # dataset are both fully complete -- this step's own exit code is
+      # what stops the workflow from reaching "Analyze" below on an
+      # incomplete recovery. Its outputs are never deleted on failure, so
+      # the job can simply be rerun.
       - name: Merge Wave 1 + recovery results
         if: ${{ inputs.mode == 'recovery' }}
         run: |
@@ -175,7 +201,7 @@ jobs:
           python3 analyze_controllability_v2.py \
             --treatment-results-file results/controllability_v2/wave2_recovery/merged_treatment_raw.jsonl \
             --baseline-results-file results/controllability_v2/wave2_recovery/merged_baseline_raw.jsonl \
-            --baseline-text-only-results-file results/controllability_v2/production/baseline_text_only_raw.jsonl
+            --baseline-text-only-results-file results/controllability_v2/wave2_recovery/baseline_text_only_raw.jsonl
 
       - name: Save resumable recovery state
         if: ${{ always() && inputs.mode == 'recovery' }}
@@ -191,7 +217,6 @@ jobs:
           name: proveval-v2-wave2-recovery-results-${{ github.run_id }}
           path: |
             results/controllability_v2/wave2_recovery/
-            results/controllability_v2/production/baseline_text_only_raw.jsonl
             results/controllability_v2/analysis/
           if-no-files-found: warn
           retention-days: 30

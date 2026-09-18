@@ -87,21 +87,43 @@ RECOVERY_DIR = os.path.join(RESULTS_DIR, "wave2_recovery")
 # analysis must never silently include exploratory results.
 TREATMENT_RESULTS_FILE = os.path.join(PRODUCTION_DIR, "treatment_raw.jsonl")
 BASELINE_RESULTS_FILE = os.path.join(PRODUCTION_DIR, "baseline_raw.jsonl")
-BASELINE_TEXT_ONLY_RESULTS_FILE = os.path.join(PRODUCTION_DIR, "baseline_text_only_raw.jsonl")
 EXPLORATORY_TREATMENT_RESULTS_FILE = os.path.join(EXPLORATORY_DIR, "treatment_raw.jsonl")
 EXPLORATORY_BASELINE_RESULTS_FILE = os.path.join(EXPLORATORY_DIR, "baseline_raw.jsonl")
 EXPLORATORY_BASELINE_TEXT_ONLY_RESULTS_FILE = os.path.join(EXPLORATORY_DIR, "baseline_text_only_raw.jsonl")
 
 # Wave 2 recovery outputs (see controllability_v2_recovery.py). The Wave 1
 # raw files above are only ever READ by the recovery/merge commands below --
-# nothing in this module ever opens them for writing.
+# nothing in this module ever opens them for writing. baseline_text_only is
+# a brand-new Wave 2 condition (never part of Wave 1), so its production
+# raw file lives under RECOVERY_DIR too -- NOT under PRODUCTION_DIR -- so
+# that the GitHub Actions recovery job's own cache restore/save (which only
+# covers RECOVERY_DIR) actually preserves its progress across an
+# interrupted/resumed recovery run instead of silently losing it every time.
+BASELINE_TEXT_ONLY_RESULTS_FILE = os.path.join(RECOVERY_DIR, "baseline_text_only_raw.jsonl")
 RECOVERY_RESULTS_FILE = os.path.join(RECOVERY_DIR, "recovery_raw.jsonl")
 VALIDATION_RESULTS_FILE = os.path.join(RECOVERY_DIR, "validation_raw.jsonl")
 MERGED_TREATMENT_RESULTS_FILE = os.path.join(RECOVERY_DIR, "merged_treatment_raw.jsonl")
 MERGED_BASELINE_RESULTS_FILE = os.path.join(RECOVERY_DIR, "merged_baseline_raw.jsonl")
 MERGE_DIAGNOSTICS_FILE = os.path.join(RECOVERY_DIR, "merge_diagnostics.json")
+VALIDATION_DIAGNOSTICS_FILE = os.path.join(RECOVERY_DIR, "validation_diagnostics.json")
+VALIDATION_AGREEMENT_BY_BIN_FILE = os.path.join(RECOVERY_DIR, "validation_agreement_by_bin.csv")
+VALIDATION_CONTEXT_EFFECT_FILE = os.path.join(RECOVERY_DIR, "validation_context_effect_comparison.csv")
 
 DEFAULT_CONCURRENCY = 32
+
+# The real frozen v2 design's Wave 1 planned-observation total (2640
+# treatment trials * 10 + 132 baseline trials * 10) -- cmd_merge's hard
+# completeness gate checks the merged dataset against this literal, known
+# constant of the CURRENT frozen design (the same style of hardcoded
+# structural invariant run_preflight already uses for the 2640/132 unique-
+# cell counts above), not merely "whatever this run's own arithmetic
+# produced" -- so a --source-results pointed at the wrong design, or a
+# study config that has silently drifted, is still caught.
+EXPECTED_WAVE1_PLANNED_TOTAL = 27720
+# The new no-context/text_only condition's known structural size: 132
+# unique cells (66 story pairs x 2 positions) x 10 replicates each.
+EXPECTED_BASELINE_TEXT_ONLY_TOTAL = 1320
+EXPECTED_BASELINE_TEXT_ONLY_UNIQUE_CELLS = 132
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +448,8 @@ def run_recovery_preflight(study_config, source_results_dir, allow_peak_pricing=
 
     ok = all(c[1] for c in checks)
     context.update({
+        "source_run_id": recovery.SOURCE_RUN_ID,
+        "wave1_max_output_tokens": study_config.get("max_output_tokens"),
         "n_planned": len(planned_index),
         "n_valid": len(classification["valid_by_id"]),
         "n_unresolved": len(classification["unresolved_ids"]),
@@ -440,16 +464,21 @@ def run_recovery_preflight(study_config, source_results_dir, allow_peak_pricing=
 def print_recovery_preflight_summary(context):
     primary = context["primary"]
     total = context["n_unresolved"] + context["n_new_baseline_text_only"] + context["n_validation"]
+    print(f"Source run ID: {context['source_run_id']}")
+    print()
     print(f"Wave 1 planned observations: {context['n_planned']}")
     print(f"Wave 1 valid retained: {context['n_valid']}")
     print(f"Wave 1 unresolved: {context['n_unresolved']}")
     print(f"Recovery observations planned: {context['n_unresolved']}")
-    print(f"New no-context/text-only observations: {context['n_new_baseline_text_only']}")
-    print(f"Validation duplicates: {context['n_validation']}")
-    print(f"Total API judgments planned for Wave 2: {total}")
-    print(f"DeepSeek model: {primary['requested_model']}")
-    print(f"Reasoning: {primary['reasoning_profile']}")
-    print(f"Max output tokens: {recovery.RECOVERY_MAX_OUTPUT_TOKENS}")
+    print()
+    print(f"New baseline_text_only observations: {context['n_new_baseline_text_only']}")
+    print(f"Validation duplicates planned: {context['n_validation']}")
+    print(f"Total Wave 2 model calls planned: {total}")
+    print()
+    print(f"Model: {primary['requested_model']}")
+    print(f"Reasoning effort: {primary['reasoning_profile']}")
+    print(f"Wave 1 max output tokens: {context['wave1_max_output_tokens']}")
+    print(f"Wave 2 max output tokens: {recovery.RECOVERY_MAX_OUTPUT_TOKENS}")
     print(f"Peak-pricing override: {'enabled' if context['allow_peak_pricing'] else 'disabled'}")
 
 
@@ -491,9 +520,14 @@ def cmd_recovery_run(args):
     plan = recovery.build_recovery_plan(classification["unresolved_ids"], planned_index, trials_by_id)
     recovery.assert_recovery_plan_matches_planned_index(plan, planned_index)
 
-    already_done = load_completed_observation_ids(RECOVERY_RESULTS_FILE)
+    # Wave 2 resume semantics (deliberately NOT load_completed_observation_ids):
+    # only a genuinely VALID prior recovery answer counts as "done" -- a
+    # 402/429/network failure, an exhausted-retries non-answer, or a
+    # malformed response must remain eligible for this same command to
+    # retry on a later invocation (e.g. a resumed GitHub Actions job).
+    already_done = recovery.load_valid_completed_observation_ids(RECOVERY_RESULTS_FILE)
     remaining = [entry for entry in plan if entry["observation_id"] not in already_done]
-    print(f"Recovery observations planned: {len(plan)}  Already completed: {len(plan) - len(remaining)}  Remaining: {len(remaining)}")
+    print(f"Recovery observations planned: {len(plan)}  Already completed (valid answer): {len(plan) - len(remaining)}  Remaining: {len(remaining)}")
 
     if args.dry_run:
         print("Dry run: no network calls made.")
@@ -542,9 +576,12 @@ def cmd_validation_run(args):
     for entry in plan:
         entry["observation_id"] = entry["validation_observation_id"]  # resumability key only -- never a real planned id
 
-    already_done = load_completed_observation_ids(VALIDATION_RESULTS_FILE)
+    # Same Wave 2 resume semantics as recovery-run: only a genuinely valid
+    # rerun answer counts as "done" -- a failed validation attempt remains
+    # eligible for a later invocation of this same command.
+    already_done = recovery.load_valid_completed_observation_ids(VALIDATION_RESULTS_FILE)
     remaining = [entry for entry in plan if entry["observation_id"] not in already_done]
-    print(f"Validation observations planned: {len(plan)}  Already completed: {len(plan) - len(remaining)}  Remaining: {len(remaining)}")
+    print(f"Validation observations planned: {len(plan)}  Already completed (valid answer): {len(plan) - len(remaining)}  Remaining: {len(remaining)}")
 
     if args.dry_run:
         print("Dry run: no network calls made.")
@@ -576,10 +613,61 @@ def cmd_validation_run(args):
     print(f"Done. Validation results appended to {VALIDATION_RESULTS_FILE}")
 
 
+def cmd_validation_report(args):
+    """Pure post-processing over an already-collected validation_raw.jsonl
+    -- makes no API calls. Reuses controllability_v2_recovery.compute_validation_agreement/
+    compute_validation_context_effect_comparison rather than duplicating any
+    logic. These validation duplicates are diagnostic only -- this command
+    never writes into, and never affects, the primary merged dataset or the
+    treatment/baseline/baseline_text_only analysis."""
+    from analyze import write_csv
+
+    rows = recovery.load_jsonl(args.validation_results) if os.path.exists(args.validation_results) else []
+    n_total = len(rows)
+    n_resolved = sum(1 for r in rows if r.get("parsing_status") == "resolved")
+    n_failed = n_total - n_resolved
+
+    agreement = recovery.compute_validation_agreement(rows)
+    context_effects = recovery.compute_validation_context_effect_comparison(rows)
+
+    os.makedirs(RECOVERY_DIR, exist_ok=True)
+    summary = {
+        "n_validation_attempted": n_total,
+        "n_validation_resolved": n_resolved,
+        "n_validation_failed": n_failed,
+        **agreement,
+    }
+    with open(VALIDATION_DIAGNOSTICS_FILE, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    bin_rows = [
+        {"reasoning_token_bin": b, "n": agreement["n_by_reasoning_token_bin"].get(b, 0), "agreement_rate": rate}
+        for b, rate in agreement["agreement_by_reasoning_token_bin"].items()
+    ]
+    if bin_rows:
+        write_csv(bin_rows, ["reasoning_token_bin", "n", "agreement_rate"], VALIDATION_AGREEMENT_BY_BIN_FILE)
+    if context_effects:
+        write_csv(context_effects, list(context_effects[0].keys()), VALIDATION_CONTEXT_EFFECT_FILE)
+
+    print(f"Validation attempted: {n_total}  resolved: {n_resolved}  failed: {n_failed}")
+    print(f"Overall A/B agreement rate: {agreement['agreement_rate']}")
+    print(f"Aggregate preference shift: {agreement['aggregate_preference_shift']}")
+    print(f"Context-effect comparisons calculable: {len(context_effects)}")
+    print(f"Wrote {VALIDATION_DIAGNOSTICS_FILE}")
+    if bin_rows:
+        print(f"Wrote {VALIDATION_AGREEMENT_BY_BIN_FILE}")
+    if context_effects:
+        print(f"Wrote {VALIDATION_CONTEXT_EFFECT_FILE}")
+
+
 def cmd_merge(args):
     """Pure post-processing, no API calls: merges Wave 1 valid answers with
     Wave 2 recovery answers into MERGED_TREATMENT_RESULTS_FILE/
-    MERGED_BASELINE_RESULTS_FILE, and writes the required diagnostics.
+    MERGED_BASELINE_RESULTS_FILE, writes the required diagnostics, and then
+    HARD-FAILS (after writing everything -- nothing is deleted) unless the
+    merged dataset AND the new baseline_text_only dataset are both fully
+    complete. This is the gate between recovery and analysis: an incomplete
+    dataset must never silently reach analyze_controllability_v2.py.
     Never opens a Wave 1 raw file for writing."""
     study_config = load_study_config()
     _treatment_trials, _baseline_trials, planned_index, _trials_by_id = _load_wave1_planned_index(study_config)
@@ -606,6 +694,26 @@ def cmd_merge(args):
     print(f"Wrote {len(split['baseline'])} merged baseline row(s) to {MERGED_BASELINE_RESULTS_FILE}")
     print(f"Wrote diagnostics to {MERGE_DIAGNOSTICS_FILE}")
 
+    baseline_text_only_trials = load_trials(BASELINE_TEXT_ONLY_TRIALS_FILE)
+    bto_planned_index = recovery.enumerate_planned_ids(
+        baseline_text_only_trials, study_config["baseline_replicate_count"],
+        study_config["primary_evaluator"]["evaluator_id"], "baseline_text_only",
+    )
+    bto_rows = recovery.load_jsonl(BASELINE_TEXT_ONLY_RESULTS_FILE) if os.path.exists(BASELINE_TEXT_ONLY_RESULTS_FILE) else []
+    bto_classification = recovery.classify_baseline_text_only_rows(bto_rows, bto_planned_index)
+    print(f"baseline_text_only_valid: {len(bto_classification['valid_by_id'])} / {len(bto_planned_index)}")
+
+    try:
+        recovery.assert_recovery_complete(diagnostics, expected_planned_total=EXPECTED_WAVE1_PLANNED_TOTAL)
+        recovery.assert_baseline_text_only_complete(
+            bto_classification, bto_planned_index,
+            expected_total=EXPECTED_BASELINE_TEXT_ONLY_TOTAL, expected_unique_cells=EXPECTED_BASELINE_TEXT_ONLY_UNIQUE_CELLS,
+        )
+    except ValueError as e:
+        raise SystemExit(f"MERGE GATE FAILED -- analysis will NOT run: {e}")
+
+    print("Wave 2 recovery and the new baseline_text_only condition are both fully complete. Analysis may proceed.")
+
 
 # ---------------------------------------------------------------------------
 # treatment / baseline
@@ -631,7 +739,8 @@ def cmd_baseline_text_only(args):
     _run(args, BASELINE_TEXT_ONLY_TRIALS_FILE, "block_id", plan_baseline_execution_order, "baseline",
          production_results_file=BASELINE_TEXT_ONLY_RESULTS_FILE,
          exploratory_results_file=EXPLORATORY_BASELINE_TEXT_ONLY_RESULTS_FILE,
-         max_output_tokens_override=recovery.RECOVERY_MAX_OUTPUT_TOKENS)
+         max_output_tokens_override=recovery.RECOVERY_MAX_OUTPUT_TOKENS,
+         use_valid_only_resume=True)
 
 
 def _cli_overrides(args):
@@ -640,7 +749,7 @@ def _cli_overrides(args):
 
 
 def _run(args, trials_file, unit_id_field, plan_fn, unit_kind, production_results_file=None,
-         exploratory_results_file=None, max_output_tokens_override=None):
+         exploratory_results_file=None, max_output_tokens_override=None, use_valid_only_resume=False):
     if args.production and args.allow_unfrozen:
         raise SystemExit("--production and --allow-unfrozen are mutually exclusive.")
     if not args.dry_run and not args.production and not args.allow_unfrozen:
@@ -711,7 +820,17 @@ def _run(args, trials_file, unit_id_field, plan_fn, unit_kind, production_result
     plan = plan_fn(trials, settings["replicates"], settings["seed"])
     attach_observation_ids(plan, EXPERIMENT_ID, settings["evaluator_id"])
 
-    already_completed = load_completed_observation_ids(results_file)
+    # Wave 1's own treatment/baseline commands keep the original "any
+    # terminal row (success or retries-exhausted failure) is done" resume
+    # semantics (use_valid_only_resume=False, the default). The Wave 2
+    # baseline_text_only condition uses valid-answer-only resume semantics
+    # instead -- a failed Wave 2 attempt must remain eligible for a later
+    # rerun of this same command (see controllability_v2_recovery.
+    # load_valid_completed_observation_ids).
+    if use_valid_only_resume:
+        already_completed = recovery.load_valid_completed_observation_ids(results_file)
+    else:
+        already_completed = load_completed_observation_ids(results_file)
     remaining_plan = filter_unresumed_plan(plan, already_completed)
 
     print(f"Mode: {output_label}  Output: {results_file}")
@@ -825,8 +944,17 @@ def main():
     validation_run_parser.add_argument("--dry-run", action="store_true")
     validation_run_parser.set_defaults(func=cmd_validation_run)
 
+    validation_report_parser = subparsers.add_parser(
+        "validation-report", help="Compute and write A/B agreement / preference-shift / context-effect diagnostics "
+                                   "from validation_raw.jsonl; makes no API calls"
+    )
+    validation_report_parser.add_argument("--validation-results", default=VALIDATION_RESULTS_FILE)
+    validation_report_parser.set_defaults(func=cmd_validation_report)
+
     merge_parser = subparsers.add_parser(
-        "merge", help="Merge Wave 1 valid answers with Wave 2 recovery answers into the analysis-ready merged dataset; makes no API calls"
+        "merge", help="Merge Wave 1 valid answers with Wave 2 recovery answers into the analysis-ready merged dataset, "
+                      "verify full completeness of both the merged dataset and the new baseline_text_only condition, "
+                      "and refuse to proceed if either is incomplete; makes no API calls"
     )
     merge_parser.add_argument("--source-results", required=True)
     merge_parser.add_argument("--recovery-results", default=RECOVERY_RESULTS_FILE)

@@ -69,6 +69,46 @@ def load_jsonl(path):
     return rows
 
 
+def load_valid_completed_observation_ids(results_file, id_field="observation_id"):
+    """Wave 2 resume semantics -- deliberately DIFFERENT from
+    controllability_v2_execution.load_completed_observation_ids, which is
+    correct for Wave 1's OWN execution (any terminal row, success or a
+    retries-exhausted failure, is "done, never repeat" -- and is left
+    completely untouched by this module).
+
+    For Wave 2 (recovery-run/baseline-text-only/validation-run), an
+    observation counts as completed for RESUME purposes only if a row
+    exists with a genuinely valid, re-parseable A/B answer
+    (parsing_status == "resolved"). A Wave 2 API failure -- a 402, a 429,
+    a network error, an exhausted-retries non-answer, a malformed/no-answer
+    response, or hitting the 4096-token cap without ever producing A/B --
+    must remain eligible for a later rerun of the SAME Wave 2 command; that
+    is the entire point of a recovery wave that is itself resumable across
+    interrupted/rerun GitHub Actions jobs. Multiple non-valid rows may
+    accumulate for the same id across reruns (harmless, never confused
+    with a valid answer); once one valid row exists for an id, every
+    later invocation skips it -- see merge_wave1_and_recovery, which
+    already only ever keeps a SINGLE valid answer per id and flags a
+    second one as a duplicate (structurally shouldn't happen once this
+    function is used to gate dispatch, but is still checked defensively).
+
+    Returns an empty set if the file doesn't exist yet."""
+    if not os.path.exists(results_file):
+        return set()
+    ids = set()
+    with open(results_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if row.get("parsing_status") == "resolved":
+                oid = row.get(id_field)
+                if oid is not None:
+                    ids.add(oid)
+    return ids
+
+
 def load_wave1_raw_rows(source_dir):
     """Reads treatment_raw.jsonl + baseline_raw.jsonl from `source_dir` (the
     extracted Wave 1 production artifact for run SOURCE_RUN_ID). Raises
@@ -510,6 +550,70 @@ def build_validation_result_row(plan_entry, evaluator_identity, observation,
         "agrees_with_original": agrees,
         **{k: observation[k] for k in _RESOLVED_OBSERVATION_FIELDS},
     }
+
+
+def assert_recovery_complete(diagnostics, expected_planned_total=27720):
+    """The hard gate between merge and analysis: the merged Wave 1 +
+    recovery dataset must be FULLY complete before analysis is allowed to
+    run on it -- a partially-recovered dataset silently analyzed would
+    understate/misrepresent the true sample. Raises ValueError (never
+    silently continues) listing every failing condition; never deletes or
+    alters anything already written to disk, so a failing check still
+    leaves a rerunnable state (rerun recovery-run, then merge again)."""
+    problems = []
+    if diagnostics["wave1_planned_total"] != expected_planned_total:
+        problems.append(f"wave1_planned_total={diagnostics['wave1_planned_total']} (expected {expected_planned_total})")
+    if diagnostics["still_unresolved_after_recovery"] != 0:
+        problems.append(f"still_unresolved_after_recovery={diagnostics['still_unresolved_after_recovery']} (must be 0)")
+    if diagnostics["final_completeness"] != 1.0:
+        problems.append(f"final_completeness={diagnostics['final_completeness']} (must be 1.0)")
+    if diagnostics["duplicate_planned_observation_ids"]:
+        problems.append(f"duplicate_planned_observation_ids={diagnostics['duplicate_planned_observation_ids']} (must be empty)")
+    if problems:
+        raise ValueError(
+            "Wave 2 recovery is INCOMPLETE -- refusing to proceed to analysis: " + "; ".join(problems) +
+            ". Raw Wave 1, recovery, and merged output files have all been preserved on disk; "
+            "rerun recovery-run (it will only attempt what's still missing) and then merge again."
+        )
+
+
+def classify_baseline_text_only_rows(rows, planned_index):
+    """The new no-context/text_only condition uses the exact same identity/
+    validity rules as Wave 1 (observation_id membership, single-clean-valid-
+    answer-per-id, re-parseable response) -- reuses classify_wave1_rows
+    directly rather than duplicating its logic under a new name."""
+    return classify_wave1_rows(rows, planned_index)
+
+
+def assert_baseline_text_only_complete(classification, planned_index,
+                                        expected_total=1320, expected_unique_cells=132):
+    """Verifies the new no-context/text_only dataset is not merely "1,320
+    rows exist" but 1,320 genuinely VALID, re-parseable A/B judgments whose
+    identities match the frozen baseline_text_only manifest exactly (132
+    unique cells x 10 replicates each). Raises ValueError listing every
+    failing condition; never mutates anything."""
+    problems = []
+    if len(planned_index) != expected_total:
+        problems.append(f"planned baseline_text_only observations={len(planned_index)} (expected {expected_total})")
+    unique_cells = {descriptor["trial_id"] for descriptor in planned_index.values()}
+    if len(unique_cells) != expected_unique_cells:
+        problems.append(f"unique baseline_text_only cells={len(unique_cells)} (expected {expected_unique_cells})")
+    n_valid = len(classification["valid_by_id"])
+    if n_valid != expected_total:
+        problems.append(f"valid baseline_text_only judgments={n_valid} (expected {expected_total})")
+    if classification["unresolved_ids"]:
+        problems.append(f"{len(classification['unresolved_ids'])} baseline_text_only observation(s) still unresolved")
+    if classification["unknown_ids"]:
+        problems.append(f"{len(classification['unknown_ids'])} baseline_text_only row(s) with an id outside the frozen manifest")
+    if classification["duplicate_valid_ids"]:
+        problems.append(f"duplicate valid baseline_text_only answers for {len(classification['duplicate_valid_ids'])} id(s)")
+    if classification["malformed_valid_ids"]:
+        problems.append(f"{len(classification['malformed_valid_ids'])} baseline_text_only row(s) marked resolved but unparseable")
+    if problems:
+        raise ValueError(
+            "New no-context/text_only baseline dataset is INCOMPLETE or invalid -- refusing to proceed to "
+            "analysis: " + "; ".join(problems) + ". Rerun baseline-text-only (it only attempts what's missing)."
+        )
 
 
 def compute_validation_agreement(validation_rows):
