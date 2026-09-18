@@ -135,11 +135,45 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: wave1_artifact
 
+      # Purely diagnostic (no API calls): actions/upload-artifact@v4 strips
+      # the LEAST COMMON ANCESTOR of every path passed to a single upload.
+      # The "Upload results" step above uploads BOTH
+      # results/controllability_v2/production/ and
+      # results/controllability_v2/analysis/, whose common ancestor is
+      # results/controllability_v2/ -- so the artifact's own internal
+      # layout is production/... and analysis/..., NOT
+      # results/controllability_v2/production/.... This step prints the
+      # actual downloaded layout so that never has to be re-guessed.
+      - name: Show downloaded Wave 1 artifact contents
+        if: ${{ inputs.mode == 'recovery' || inputs.mode == 'recovery-preflight' }}
+        run: |
+          echo "Downloaded Wave 1 artifact contents:"
+          find wave1_artifact -maxdepth 5 -type f -print | sort
+
+      # Resolves the one true Wave 1 source directory ONCE, from the actual
+      # upload-artifact layout described above (production/, not
+      # results/controllability_v2/production/), and fails loudly -- before
+      # any API call -- unless BOTH required raw files are present there.
+      # Every later step reads $WAVE1_RESULTS_DIR rather than re-deriving
+      # or duplicating this path.
+      - name: Resolve Wave 1 source directory
+        if: ${{ inputs.mode == 'recovery' || inputs.mode == 'recovery-preflight' }}
+        run: |
+          WAVE1_RESULTS_DIR="wave1_artifact/production"
+          if [ ! -f "$WAVE1_RESULTS_DIR/treatment_raw.jsonl" ] || [ ! -f "$WAVE1_RESULTS_DIR/baseline_raw.jsonl" ]; then
+            echo "ERROR: expected both treatment_raw.jsonl and baseline_raw.jsonl under $WAVE1_RESULTS_DIR" >&2
+            echo "but did not find them there. See the directory listing in the previous step" >&2
+            echo "for the artifact's actual downloaded layout." >&2
+            exit 1
+          fi
+          echo "Resolved Wave 1 source directory: $WAVE1_RESULTS_DIR"
+          echo "WAVE1_RESULTS_DIR=$WAVE1_RESULTS_DIR" >> "$GITHUB_ENV"
+
       - name: Recovery preflight
         if: ${{ inputs.mode == 'recovery' || inputs.mode == 'recovery-preflight' }}
         run: |
           python3 run_controllability_v2.py recovery-preflight \
-            --source-results wave1_artifact/results/controllability_v2/production
+            --source-results "$WAVE1_RESULTS_DIR"
 
       # Everything below here is gated on the exact string "recovery" --
       # mode: recovery-preflight stops at the step above and never reaches
@@ -159,7 +193,7 @@ jobs:
         timeout-minutes: 120
         run: |
           python3 run_controllability_v2.py recovery-run \
-            --source-results wave1_artifact/results/controllability_v2/production \
+            --source-results "$WAVE1_RESULTS_DIR" \
             --concurrency 32
 
       # baseline_text_only writes under results/controllability_v2/wave2_recovery/
@@ -175,7 +209,7 @@ jobs:
         timeout-minutes: 60
         run: |
           python3 run_controllability_v2.py validation-run \
-            --source-results wave1_artifact/results/controllability_v2/production \
+            --source-results "$WAVE1_RESULTS_DIR" \
             --concurrency 32
 
       - name: Validation diagnostics report
@@ -192,7 +226,7 @@ jobs:
         if: ${{ inputs.mode == 'recovery' }}
         run: |
           python3 run_controllability_v2.py merge \
-            --source-results wave1_artifact/results/controllability_v2/production \
+            --source-results "$WAVE1_RESULTS_DIR" \
             --recovery-results results/controllability_v2/wave2_recovery/recovery_raw.jsonl
 
       - name: Analyze the merged Wave 2 dataset

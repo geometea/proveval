@@ -151,3 +151,83 @@ class TestRecoveryMode:
         assert "Validation diagnostics report" in by_name
         run_text = by_name["Validation diagnostics report"]["run"]
         assert "validation-report" in run_text
+
+
+class TestWave1SourceDirectoryResolution:
+    """Regression coverage for the artifact-layout bug: actions/upload-artifact@v4
+    strips the LEAST COMMON ANCESTOR of every path given to one upload. The
+    "Upload results" step uploads both results/controllability_v2/production/
+    and results/controllability_v2/analysis/, whose common ancestor is
+    results/controllability_v2/ -- so the downloaded artifact's real layout
+    is production/... and analysis/..., never results/controllability_v2/production/....
+    Every Wave 1 consumer must read from ONE resolved directory rather than
+    each hardcoding a (previously wrong) path."""
+
+    def test_upload_results_step_implies_production_and_analysis_are_siblings_after_stripping(self):
+        """Confirms the actual upload configuration this fix is based on:
+        both paths share results/controllability_v2/ as their only common
+        ancestor, so that prefix is what upload-artifact strips."""
+        by_name = {s["name"]: s for s in _steps()}
+        upload_path = by_name["Upload results"]["with"]["path"]
+        assert "results/controllability_v2/production/" in upload_path
+        assert "results/controllability_v2/analysis/" in upload_path
+
+    def test_diagnostic_step_immediately_follows_download_and_makes_no_api_calls(self):
+        steps = _steps()
+        names = [s["name"] for s in steps]
+        download_index = names.index("Download Wave 1 artifact (run 35355521243)")
+        assert names[download_index + 1] == "Show downloaded Wave 1 artifact contents"
+        diagnostic_step = steps[download_index + 1]
+        assert "uses" not in diagnostic_step  # a plain shell step, not an action
+        assert "python3" not in diagnostic_step["run"]
+        assert "find wave1_artifact" in diagnostic_step["run"]
+        assert "inputs.mode == 'recovery'" in diagnostic_step["if"]
+        assert "inputs.mode == 'recovery-preflight'" in diagnostic_step["if"]
+
+    def test_resolver_step_derives_production_as_the_source_directory_and_validates_both_files(self):
+        by_name = {s["name"]: s for s in _steps()}
+        resolver = by_name["Resolve Wave 1 source directory"]
+        run_text = resolver["run"]
+        assert 'WAVE1_RESULTS_DIR="wave1_artifact/production"' in run_text
+        assert "treatment_raw.jsonl" in run_text
+        assert "baseline_raw.jsonl" in run_text
+        assert "GITHUB_ENV" in run_text
+        assert "exit 1" in run_text  # fails loudly rather than silently continuing
+        assert "python3" not in run_text  # pure bash, no API calls possible
+        assert "inputs.mode == 'recovery'" in resolver["if"]
+        assert "inputs.mode == 'recovery-preflight'" in resolver["if"]
+
+    def test_resolver_runs_before_recovery_preflight(self):
+        names = [s["name"] for s in _steps()]
+        assert names.index("Resolve Wave 1 source directory") < names.index("Recovery preflight")
+
+    def test_recovery_preflight_uses_the_resolved_directory_not_a_hardcoded_path(self):
+        by_name = {s["name"]: s for s in _steps()}
+        run_text = by_name["Recovery preflight"]["run"]
+        assert "--source-results \"$WAVE1_RESULTS_DIR\"" in run_text
+        assert "results/controllability_v2/production" not in run_text
+
+    def test_every_wave1_consumer_uses_the_same_resolved_directory_variable(self):
+        """recovery-run, validation-run, and merge must all read
+        $WAVE1_RESULTS_DIR -- the SAME variable recovery-preflight uses --
+        never a separately hardcoded (and therefore driftable) path."""
+        by_name = {s["name"]: s for s in _steps()}
+        consumer_steps = {
+            "Recovery preflight",
+            "Run recovery (unresolved Wave 1 observations only)",
+            "Run validation sample (500 non-primary duplicate observations)",
+            "Merge Wave 1 + recovery results",
+        }
+        for name in consumer_steps:
+            run_text = by_name[name]["run"]
+            assert "--source-results \"$WAVE1_RESULTS_DIR\"" in run_text, f"{name!r} does not use the resolved directory"
+            assert "results/controllability_v2/production" not in run_text, f"{name!r} still hardcodes the old wrong path"
+
+    def test_validation_report_does_not_need_or_use_the_wave1_directory(self):
+        """validation-report only ever reads validation_raw.jsonl -- it
+        never consumes Wave 1 directly, so it correctly has no
+        --source-results argument at all."""
+        by_name = {s["name"]: s for s in _steps()}
+        run_text = by_name["Validation diagnostics report"]["run"]
+        assert "--source-results" not in run_text
+        assert "WAVE1_RESULTS_DIR" not in run_text
