@@ -32,6 +32,7 @@ from controllability_v2_study_config import STUDY_CONFIG_FILE, load_study_config
 from controllability_v2_trials import BASELINE_TRIALS_FILE, TRIALS_FILE
 from freeze_controllability_v2 import verify_frozen
 from run_controllability_v2 import BASELINE_RESULTS_FILE, TREATMENT_RESULTS_FILE
+import controllability_v2_cost as cost
 import controllability_v2_stats as st
 
 ANALYSIS_DIR = "results/controllability_v2/analysis"
@@ -122,22 +123,45 @@ def partition_by_resolved_evaluator(rows, study_config, strict=False):
 # planned superblocks/baseline units)
 # ---------------------------------------------------------------------------
 
+def _diagnose_incomplete_unit(unit_id, replicate_number, group_rows, n_expected):
+    """Distinguish WHY a (unit, replicate) is incomplete (item 13):
+    "temporarily incomplete" -- the run just hasn't reached every cell yet
+    (rows for those cells don't exist at all, since a result row is only
+    ever written once an observation reaches a TERMINAL outcome -- see
+    run_one_observation/controllability_v2_execution.load_completed_observation_ids);
+    "terminally incomplete" -- every planned cell has been attempted, but at
+    least one exhausted its retry budget and never resolved. A unit missing
+    cells AND containing a terminal failure is reported as terminally
+    incomplete -- that failure will never resolve on its own by waiting."""
+    n_terminally_failed = sum(1 for r in group_rows if r["parsing_status"] != "resolved")
+    reason = "terminally_incomplete" if n_terminally_failed > 0 else "temporarily_incomplete"
+    return {
+        "unit_id": unit_id, "replicate_number": replicate_number,
+        "n_cells_present": len(group_rows), "n_cells_expected": n_expected,
+        "n_terminally_failed": n_terminally_failed, "reason": reason,
+    }
+
+
 def filter_complete_superblocks(rows):
     """Group by (superblock_id, replicate_number); a group counts as
     complete only if it has all 8 planned cells AND every one resolved to a
-    valid response. Returns (kept_rows, n_complete, n_incomplete)."""
+    valid response. Returns (kept_rows, n_complete, n_incomplete,
+    incomplete_diagnostics) -- the diagnostics list never affects which
+    rows are kept, only explains each excluded unit (see
+    _diagnose_incomplete_unit)."""
     groups = defaultdict(list)
     for row in rows:
         groups[(row["superblock_id"], row["replicate_number"])].append(row)
 
-    kept, n_complete, n_incomplete = [], 0, 0
-    for group_rows in groups.values():
+    kept, n_complete, n_incomplete, diagnostics = [], 0, 0, []
+    for (superblock_id, replicate_number), group_rows in groups.items():
         if len(group_rows) == 8 and all(r["parsing_status"] == "resolved" for r in group_rows):
             n_complete += 1
             kept.extend(group_rows)
         else:
             n_incomplete += 1
-    return kept, n_complete, n_incomplete
+            diagnostics.append(_diagnose_incomplete_unit(superblock_id, replicate_number, group_rows, 8))
+    return kept, n_complete, n_incomplete, diagnostics
 
 
 def filter_complete_baseline_units(rows):
@@ -145,14 +169,15 @@ def filter_complete_baseline_units(rows):
     for row in rows:
         groups[(row["block_id"], row["replicate_number"])].append(row)
 
-    kept, n_complete, n_incomplete = [], 0, 0
-    for group_rows in groups.values():
+    kept, n_complete, n_incomplete, diagnostics = [], 0, 0, []
+    for (block_id, replicate_number), group_rows in groups.items():
         if len(group_rows) == 2 and all(r["parsing_status"] == "resolved" for r in group_rows):
             n_complete += 1
             kept.extend(group_rows)
         else:
             n_incomplete += 1
-    return kept, n_complete, n_incomplete
+            diagnostics.append(_diagnose_incomplete_unit(block_id, replicate_number, group_rows, 2))
+    return kept, n_complete, n_incomplete, diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -298,8 +323,8 @@ def analyze_one_evaluator(evaluator_id, partition, study_config, is_frozen, n_bo
     treatment_rows = [r for r in partition["rows"] if "superblock_id" in r]
     baseline_rows = [r for r in partition["rows"] if "block_id" in r and "superblock_id" not in r]
 
-    kept_treatment, n_complete_sb, n_incomplete_sb = filter_complete_superblocks(treatment_rows)
-    kept_baseline, n_complete_bu, n_incomplete_bu = filter_complete_baseline_units(baseline_rows)
+    kept_treatment, n_complete_sb, n_incomplete_sb, incomplete_sb_diag = filter_complete_superblocks(treatment_rows)
+    kept_baseline, n_complete_bu, n_incomplete_bu, incomplete_bu_diag = filter_complete_baseline_units(baseline_rows)
 
     cell_rates = build_treatment_cell_rates(kept_treatment)
     pair_rows = build_pair_context_effects(cell_rates)
@@ -396,6 +421,13 @@ def analyze_one_evaluator(evaluator_id, partition, study_config, is_frozen, n_bo
     cell_counts_rows = _cell_counts(tag, kept_treatment, kept_baseline)
     compliance_rows = [{**tag, **row} for row in response_compliance_table(treatment_rows + baseline_rows)]
 
+    incomplete_unit_rows = (
+        [{**tag, "unit_type": "treatment_superblock", **d} for d in incomplete_sb_diag]
+        + [{**tag, "unit_type": "baseline_unit", **d} for d in incomplete_bu_diag]
+    )
+
+    cost_summary_row = {**tag, **cost.compute_cost_summary(partition["rows"], config.get("provider"), config.get("requested_model"))}
+
     return {
         "evaluator_id": evaluator_id,
         "config": config,
@@ -414,6 +446,8 @@ def analyze_one_evaluator(evaluator_id, partition, study_config, is_frozen, n_bo
         "leave_one_story_out": loo_rows,
         "response_compliance": compliance_rows,
         "cell_counts": cell_counts_rows,
+        "incomplete_units": incomplete_unit_rows,
+        "cost_summary": [cost_summary_row],
     }
 
 
@@ -439,6 +473,66 @@ def _cell_counts(tag, kept_treatment, kept_baseline):
 
 
 # ---------------------------------------------------------------------------
+# Response-model / system-fingerprint / usage inventory (item 7)
+# ---------------------------------------------------------------------------
+
+def _attempts(rows):
+    for row in rows:
+        for attempt in row.get("attempts") or []:
+            yield attempt
+
+
+def response_model_inventory(rows):
+    """{response_model: count}, over EVERY attempt that reported one (not
+    just the one that resolved each observation) -- a broader diagnostic
+    than the single resolved response_model partition_by_resolved_evaluator
+    already splits evaluators on."""
+    counts = defaultdict(int)
+    for attempt in _attempts(rows):
+        model = attempt.get("response_model")
+        if model is not None:
+            counts[model] += 1
+    return dict(counts)
+
+
+def system_fingerprint_inventory(rows):
+    """{system_fingerprint: count} across every attempt that reported one.
+    Differing fingerprints are never used to split or discard data (unlike
+    response_model) -- they are reported purely as a run diagnostic (item 7:
+    "Do not automatically discard data merely because fingerprints differ,
+    but surface this clearly as a run diagnostic")."""
+    counts = defaultdict(int)
+    for attempt in _attempts(rows):
+        fingerprint = attempt.get("system_fingerprint")
+        if fingerprint is not None:
+            counts[fingerprint] += 1
+    return dict(counts)
+
+
+def usage_totals(rows):
+    """Sums prompt/completion/reasoning/cache-hit/cache-miss tokens across
+    every attempt in `rows`. cache_hit/cache_miss stay None (not 0) if no
+    attempt anywhere reported the split at all, so "no cache data available"
+    is never confused with "zero cache hits"."""
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0,
+              "cache_hit_prompt_tokens": 0, "cache_miss_prompt_tokens": 0}
+    have_cache_breakdown = False
+    for attempt in _attempts(rows):
+        totals["prompt_tokens"] += attempt.get("input_tokens") or 0
+        totals["completion_tokens"] += attempt.get("output_tokens") or 0
+        totals["reasoning_tokens"] += attempt.get("reasoning_tokens") or 0
+        hit, miss = attempt.get("prompt_cache_hit_tokens"), attempt.get("prompt_cache_miss_tokens")
+        if hit is not None or miss is not None:
+            have_cache_breakdown = True
+            totals["cache_hit_prompt_tokens"] += hit or 0
+            totals["cache_miss_prompt_tokens"] += miss or 0
+    if not have_cache_breakdown:
+        totals["cache_hit_prompt_tokens"] = None
+        totals["cache_miss_prompt_tokens"] = None
+    return totals
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -461,6 +555,8 @@ def write_all_csvs(per_evaluator_results, evaluator_inventory_rows):
         "baseline_pair_strength.csv": collect("baseline_pair_strength"),
         "baseline_reliability.csv": collect("baseline_reliability"),
         "evaluator_inventory.csv": evaluator_inventory_rows,
+        "incomplete_superblocks.csv": collect("incomplete_units"),
+        "cost_summary.csv": collect("cost_summary"),
     }
     for filename, rows in exports.items():
         if not rows:
@@ -527,12 +623,16 @@ def main():
         result = analyze_one_evaluator(evaluator_id, partition, study_config, is_frozen, n_bootstrap_draws, study_config["random_seed"])
         per_evaluator_results.append(result)
         config = partition["config"]
+        usage = usage_totals(partition["rows"])
         evaluator_inventory_rows.append({
             "evaluator_id": evaluator_id, "role": config.get("role"), "provider": config.get("provider"),
             "requested_model": config.get("requested_model"), "response_model": config.get("response_model"),
             "reasoning_profile": config.get("reasoning_profile"), "n_rows": len(partition["rows"]),
             "n_complete_treatment_superblocks": result["n_complete_treatment_superblocks"],
             "n_complete_baseline_units": result["n_complete_baseline_units"],
+            "response_models_observed_json": json.dumps(response_model_inventory(partition["rows"])),
+            "system_fingerprints_observed_json": json.dumps(system_fingerprint_inventory(partition["rows"])),
+            **usage,
         })
         print(f"Evaluator {evaluator_id}: complete treatment superblocks={result['n_complete_treatment_superblocks']} "
               f"(incomplete={result['n_incomplete_treatment_superblocks']}), "

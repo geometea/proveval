@@ -213,3 +213,207 @@ def test_build_evaluator_identity_has_all_required_fields():
         assert field in identity
     assert identity["provider"] == "anthropic"
     assert identity["run_id"] == "wave1"
+
+
+def test_build_evaluator_identity_includes_run_config_id():
+    identity = ex.build_evaluator_identity(
+        provider="deepseek", requested_model="deepseek-flash", reasoning_profile="low",
+        provider_reasoning_settings={"reasoning_effort": "low"}, sampling_settings={},
+        max_output_tokens=512, retry_limit=3,
+    )
+    assert "run_config_id" in identity
+    assert identity["max_output_tokens"] == 512
+    assert identity["retry_limit"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Observation identity and run-config identity (item 9)
+# ---------------------------------------------------------------------------
+
+class TestObservationId:
+    def test_deterministic_from_its_four_inputs(self):
+        a = ex.make_observation_id("exp1", "deepseek__deepseek-flash__low", "trial1", 3)
+        b = ex.make_observation_id("exp1", "deepseek__deepseek-flash__low", "trial1", 3)
+        assert a == b
+
+    def test_differs_when_any_input_differs(self):
+        base = ex.make_observation_id("exp1", "eval1", "trial1", 1)
+        assert base != ex.make_observation_id("exp2", "eval1", "trial1", 1)
+        assert base != ex.make_observation_id("exp1", "eval2", "trial1", 1)
+        assert base != ex.make_observation_id("exp1", "eval1", "trial2", 1)
+        assert base != ex.make_observation_id("exp1", "eval1", "trial1", 2)
+
+
+class TestRunConfigId:
+    def test_deterministic_and_stable(self):
+        args = ("deepseek", "deepseek-flash", "low", {"reasoning_effort": "low"}, {}, 512, 3)
+        assert ex.make_run_config_id(*args) == ex.make_run_config_id(*args)
+
+    def test_changes_when_a_literal_setting_changes(self):
+        base = ex.make_run_config_id("deepseek", "deepseek-flash", "low", {"reasoning_effort": "low"}, {}, 512, 3)
+        assert base != ex.make_run_config_id("deepseek", "deepseek-flash", "high", {"reasoning_effort": "high"}, {}, 512, 3)
+        assert base != ex.make_run_config_id("deepseek", "deepseek-flash", "low", {"reasoning_effort": "low"}, {}, 256, 3)
+        assert base != ex.make_run_config_id("deepseek", "deepseek-flash", "low", {"reasoning_effort": "low"}, {}, 512, 5)
+
+
+# ---------------------------------------------------------------------------
+# Resumable, idempotent execution (item 4)
+# ---------------------------------------------------------------------------
+
+class TestResumableExecution:
+    def test_attach_observation_ids_stamps_every_entry(self):
+        plan = [{"trial_id": "t1", "replicate_number": 1}, {"trial_id": "t2", "replicate_number": 1}]
+        ex.attach_observation_ids(plan, "exp1", "eval1")
+        assert all("observation_id" in entry for entry in plan)
+        assert plan[0]["observation_id"] != plan[1]["observation_id"]
+
+    def test_load_completed_observation_ids_from_a_results_file(self, tmp_path):
+        import json
+
+        results_file = tmp_path / "results.jsonl"
+        results_file.write_text(
+            json.dumps({"observation_id": "a"}) + "\n" + json.dumps({"observation_id": "b"}) + "\n", encoding="utf-8"
+        )
+        assert ex.load_completed_observation_ids(str(results_file)) == {"a", "b"}
+
+    def test_load_completed_observation_ids_missing_file_returns_empty_set(self, tmp_path):
+        assert ex.load_completed_observation_ids(str(tmp_path / "does_not_exist.jsonl")) == set()
+
+    def test_filter_unresumed_plan_skips_completed_and_keeps_the_rest(self):
+        plan = [{"observation_id": "a"}, {"observation_id": "b"}, {"observation_id": "c"}]
+        remaining = ex.filter_unresumed_plan(plan, {"a", "c"})
+        assert [e["observation_id"] for e in remaining] == ["b"]
+
+    def test_a_successful_observation_is_skipped_on_resume(self, tmp_path):
+        import json
+
+        results_file = tmp_path / "results.jsonl"
+        results_file.write_text(json.dumps({"observation_id": "obs1", "parsing_status": "resolved"}) + "\n", encoding="utf-8")
+        completed = ex.load_completed_observation_ids(str(results_file))
+        plan = [{"observation_id": "obs1"}, {"observation_id": "obs2"}]
+        remaining = ex.filter_unresumed_plan(plan, completed)
+        assert [e["observation_id"] for e in remaining] == ["obs2"]
+
+    def test_a_retry_exhausted_terminal_failure_is_also_skipped_on_resume(self, tmp_path):
+        """A terminal failure (retries exhausted) must not be silently
+        converted into a new observation on resume -- both success and
+        terminal failure are "done", never re-run."""
+        import json
+
+        results_file = tmp_path / "results.jsonl"
+        results_file.write_text(json.dumps({"observation_id": "obs1", "parsing_status": "unresolved"}) + "\n", encoding="utf-8")
+        completed = ex.load_completed_observation_ids(str(results_file))
+        plan = [{"observation_id": "obs1"}, {"observation_id": "obs2"}]
+        remaining = ex.filter_unresumed_plan(plan, completed)
+        assert [e["observation_id"] for e in remaining] == ["obs2"]
+
+    def test_no_duplicate_observation_ids_across_a_full_resumed_run(self, tmp_path):
+        import json
+
+        results_file = tmp_path / "results.jsonl"
+        # simulate: run 1 wrote obs1, obs2; run 2 (resumed) should only add obs3
+        results_file.write_text(
+            json.dumps({"observation_id": "obs1", "parsing_status": "resolved"}) + "\n"
+            + json.dumps({"observation_id": "obs2", "parsing_status": "resolved"}) + "\n",
+            encoding="utf-8",
+        )
+        completed = ex.load_completed_observation_ids(str(results_file))
+        plan = [{"observation_id": "obs1"}, {"observation_id": "obs2"}, {"observation_id": "obs3"}]
+        remaining = ex.filter_unresumed_plan(plan, completed)
+        assert [e["observation_id"] for e in remaining] == ["obs3"]
+        # appending only the remaining plan's results would never duplicate obs1/obs2
+        all_ids_after = {"obs1", "obs2"} | {e["observation_id"] for e in remaining}
+        assert len(all_ids_after) == 3
+
+
+class TestFindDuplicateObservationIds:
+    def test_no_duplicates_returns_empty(self, tmp_path):
+        import json
+
+        results_file = tmp_path / "results.jsonl"
+        results_file.write_text(json.dumps({"observation_id": "a"}) + "\n" + json.dumps({"observation_id": "b"}) + "\n", encoding="utf-8")
+        assert ex.find_duplicate_observation_ids(str(results_file)) == []
+
+    def test_detects_a_duplicate(self, tmp_path):
+        import json
+
+        results_file = tmp_path / "results.jsonl"
+        results_file.write_text(
+            json.dumps({"observation_id": "a"}) + "\n" + json.dumps({"observation_id": "a"}) + "\n", encoding="utf-8"
+        )
+        assert ex.find_duplicate_observation_ids(str(results_file)) == ["a"]
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert ex.find_duplicate_observation_ids(str(tmp_path / "nope.jsonl")) == []
+
+
+# ---------------------------------------------------------------------------
+# Frozen-config-authoritative production settings (item 3)
+# ---------------------------------------------------------------------------
+
+FROZEN_STUDY_CONFIG = {
+    "primary_evaluator": {"evaluator_id": "deepseek__deepseek-flash__low", "provider": "deepseek",
+                           "requested_model": "deepseek-flash", "reasoning_profile": "low"},
+    "treatment_replicate_count": 10,
+    "baseline_replicate_count": 10,
+    "random_seed": 20260917,
+    "retry_limit": 3,
+    "max_output_tokens": 512,
+}
+
+
+class TestResolveProductionSettings:
+    def test_no_overrides_reads_everything_from_the_frozen_config(self):
+        settings = ex.resolve_production_settings({}, FROZEN_STUDY_CONFIG, "treatment")
+        assert settings["provider"] == "deepseek"
+        assert settings["model"] == "deepseek-flash"
+        assert settings["reasoning_profile"] == "low"
+        assert settings["replicates"] == 10
+        assert settings["seed"] == 20260917
+        assert settings["retry_limit"] == 3
+
+    def test_uses_the_baseline_replicate_count_for_baseline_unit_kind(self):
+        config = {**FROZEN_STUDY_CONFIG, "baseline_replicate_count": 7}
+        settings = ex.resolve_production_settings({}, config, "baseline")
+        assert settings["replicates"] == 7
+
+    def test_matching_override_is_accepted(self):
+        settings = ex.resolve_production_settings({"provider": "deepseek", "replicates": 10}, FROZEN_STUDY_CONFIG, "treatment")
+        assert settings["provider"] == "deepseek"
+
+    def test_rejects_model_mismatch(self):
+        import pytest as _pytest
+
+        with _pytest.raises(ValueError, match="model"):
+            ex.resolve_production_settings({"model": "claude-sonnet-5"}, FROZEN_STUDY_CONFIG, "treatment")
+
+    def test_rejects_replicate_count_mismatch(self):
+        import pytest as _pytest
+
+        for bad_value in (3, 5, 20):
+            with _pytest.raises(ValueError, match="replicates"):
+                ex.resolve_production_settings({"replicates": bad_value}, FROZEN_STUDY_CONFIG, "treatment")
+
+    def test_rejects_seed_mismatch(self):
+        import pytest as _pytest
+
+        with _pytest.raises(ValueError, match="seed"):
+            ex.resolve_production_settings({"seed": 1}, FROZEN_STUDY_CONFIG, "treatment")
+
+    def test_rejects_retry_limit_mismatch(self):
+        import pytest as _pytest
+
+        with _pytest.raises(ValueError, match="retry_limit"):
+            ex.resolve_production_settings({"retry_limit": 10}, FROZEN_STUDY_CONFIG, "treatment")
+
+    def test_rejects_provider_mismatch(self):
+        import pytest as _pytest
+
+        with _pytest.raises(ValueError, match="provider"):
+            ex.resolve_production_settings({"provider": "openai"}, FROZEN_STUDY_CONFIG, "treatment")
+
+    def test_invalid_unit_kind_raises(self):
+        import pytest as _pytest
+
+        with _pytest.raises(ValueError):
+            ex.resolve_production_settings({}, FROZEN_STUDY_CONFIG, "not_a_real_kind")

@@ -355,6 +355,87 @@ class TestDeepSeekDirectCall:
         assert result["response_text"] == "B"
         assert "TOP SECRET REASONING" not in str(result)
 
+    def test_default_model_is_deepseek_flash(self):
+        assert mp.DEFAULT_MODELS["deepseek"] == "deepseek-flash"
+
+    def test_exact_request_payload_for_deepseek_flash_low_reasoning(self, monkeypatch):
+        """item 10: the exact request payload generated for
+        deepseek + deepseek-flash + low must be deterministic -- same
+        kwargs every time, never varying across calls or replicates."""
+        fake_module, captured = _fake_deepseek_module()
+        monkeypatch.setitem(sys.modules, "openai", fake_module)
+
+        mp.call_model("deepseek", "deepseek-flash", "the experimental prompt", max_output_tokens=512, reasoning_profile="low")
+        kwargs = captured["kwargs"]
+        assert kwargs == {
+            "model": "deepseek-flash",
+            "messages": [{"role": "user", "content": "the experimental prompt"}],
+            "max_tokens": 512,
+            "extra_body": {"reasoning_effort": "low"},
+        }
+
+    def test_deepseek_flash_low_payload_is_identical_across_repeated_calls(self, monkeypatch):
+        fake_module, captured = _fake_deepseek_module()
+        monkeypatch.setitem(sys.modules, "openai", fake_module)
+
+        mp.call_model("deepseek", "deepseek-flash", "fixed prompt", max_output_tokens=512, reasoning_profile="low")
+        first = dict(captured["kwargs"])
+        mp.call_model("deepseek", "deepseek-flash", "fixed prompt", max_output_tokens=512, reasoning_profile="low")
+        second = dict(captured["kwargs"])
+        assert first == second
+
+    def test_deepseek_usage_and_cache_metadata_is_parsed_correctly(self, monkeypatch):
+        fake_module, _ = _fake_deepseek_module()
+        monkeypatch.setitem(sys.modules, "openai", fake_module)
+        result = mp.call_model("deepseek", "deepseek-flash", "hello", reasoning_profile="low")
+        # the fixture doesn't set cache/fingerprint fields -- must default to
+        # None rather than 0 or a fabricated value
+        assert result["system_fingerprint"] is None
+        assert result["prompt_cache_hit_tokens"] is None
+        assert result["prompt_cache_miss_tokens"] is None
+        assert result["prompt_tokens"] == result["input_tokens"]
+        assert result["completion_tokens"] == result["output_tokens"]
+
+    def test_deepseek_cache_and_fingerprint_fields_are_extracted_when_present(self, monkeypatch):
+        class FakeMessage:
+            content = "A"
+            reasoning_content = "hidden"
+
+        class FakeChoice:
+            message = FakeMessage()
+            finish_reason = "stop"
+
+        class FakeUsage:
+            prompt_tokens = 100
+            completion_tokens = 3
+            prompt_cache_hit_tokens = 70
+            prompt_cache_miss_tokens = 30
+
+        class FakeResponse:
+            choices = [FakeChoice()]
+            model = "deepseek-flash-2026-01"
+            id = "chatcmpl_xyz"
+            system_fingerprint = "fp_9f8e7d"
+            usage = FakeUsage()
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                return FakeResponse()
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeClient:
+            def __init__(self, api_key, base_url=None):
+                self.chat = FakeChat()
+
+        monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeClient))
+        result = mp.call_model("deepseek", "deepseek-flash", "hello", reasoning_profile="low")
+        assert result["system_fingerprint"] == "fp_9f8e7d"
+        assert result["prompt_cache_hit_tokens"] == 70
+        assert result["prompt_cache_miss_tokens"] == 30
+        assert result["response_model"] == "deepseek-flash-2026-01"
+
 
 # ---------------------------------------------------------------------------
 # Pure, network-free batch request payload construction

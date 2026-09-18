@@ -572,22 +572,45 @@ text-only), with primary analysis restricted to complete superblocks;
 randomised execution order (superblocks globally shuffled, cells shuffled
 within each, reproducible from one seed); bounded retries with every
 attempt recorded and first-attempt compliance reported separately; a
-frozen/lockable study config (`freeze_controllability_v2.py`) that
-production runs are checked against; a story-level bootstrap (resampling
-the 12 stories, not the 66 pairs) for every confidence interval, used for
-the ATEs, the control-vs-text-only difference, the equivalence test, and
-the ambiguity regression's slope; an equivalence classification against a
-pre-registered probability-scale margin; a `D_pair = intercept +
-beta * baseline_strength` regression (replacing v1's plain Pearson
-correlation) against the independently-collected blind baseline; and
-strict evaluator-identity separation that never pools different providers,
-models, reasoning profiles, or resolved model versions.
+frozen/lockable study config (`freeze_controllability_v2.py`) that a
+production run's provider/model/reasoning-profile/replicate-counts/seed/
+retry-limit are read from (and validated against) directly -- never
+silently overridable; a story-level bootstrap (resampling the 12 stories,
+not the 66 pairs) for every confidence interval, used for the ATEs, the
+control-vs-text-only difference, the equivalence test, and the ambiguity
+regression's slope; an equivalence classification against a pre-registered
+probability-scale margin; a `D_pair = intercept + beta * baseline_strength`
+regression (replacing v1's plain Pearson correlation) against the
+independently-collected blind baseline; and strict evaluator-identity
+separation that never pools different providers, models, reasoning
+profiles, or resolved model versions.
 
 The 5 context contrasts keep v1's exact frozen wording
 (`data/controllability_v2_contrasts.jsonl`). Manifest sizes are unchanged:
-66 pairs × 5 contrasts × 2 instruction conditions × 4 cells = 2,640 primary
-treatment prompts (330 superblocks); 66 pairs × 2 positions = 132 baseline
-prompts, collected independently from treatment.
+66 pairs × 5 contrasts × 2 instruction conditions × 4 cells = 2,640 unique
+primary treatment prompts (330 superblocks); 66 pairs × 2 positions = 132
+unique baseline prompts, collected independently from treatment. The
+current production study config runs **DeepSeek Flash** as the primary
+evaluator (Claude Sonnet 5, the earlier primary, is kept on as a
+replication evaluator) at **10 replicates per cell** -- 26,400 planned
+treatment observations + 1,320 planned baseline observations = 27,720
+total planned production observations; replication happens at execution
+time, never by inflating the manifests themselves.
+
+Execution (`run_controllability_v2.py`) is resumable/idempotent (every
+planned observation gets a stable `observation_id`; re-running the same
+command only executes what's still missing, and a terminal failure that
+exhausted its retry budget is never silently retried as a "new"
+observation), supports bounded concurrent request execution (`--concurrency`,
+default 32 -- changes transport timing only, never the planned/randomised
+observation set or order), and writes production vs. exploratory results to
+entirely separate directories so a `--allow-unfrozen` test run can never
+contaminate the production results `analyze_controllability_v2.py` reads by
+default. A `--production` run first runs a preflight (frozen lock validity,
+manifest sizes/completeness, evaluator/replicate/seed/retry-limit agreement,
+no duplicate `observation_id`s already on disk, API credential present) and
+prints a summary before making any calls; dry-run remains the default-safe
+mode and needs neither `--production` nor `--allow-unfrozen`.
 
 ```bash
 # generate the corpus metadata (12 story SHA-256 hashes + word counts,
@@ -603,28 +626,41 @@ python3 controllability_v2_trials.py
 # design is final -- it is never run automatically.
 python3 freeze_controllability_v2.py
 
+# preflight only -- validates everything a production run requires and
+# prints a summary (model, replicate counts, planned/completed/remaining
+# observations, concurrency, output directory); makes no API calls
+python3 run_controllability_v2.py preflight
+
 # dry-run treatment/baseline execution (randomised order, no network calls) --
-# --dry-run works whether or not the design is frozen
-python3 run_controllability_v2.py treatment --provider anthropic --model claude-sonnet-5 \
-    --reasoning-profile low --replicates 3 --seed 20260917 --dry-run
-python3 run_controllability_v2.py baseline --provider anthropic --model claude-sonnet-5 \
-    --reasoning-profile low --replicates 3 --seed 20260917 --dry-run
+# provider/model/replicates/seed/retry-limit default to the frozen primary
+# evaluator (DeepSeek Flash, 10 replicates) with no flags needed
+python3 run_controllability_v2.py treatment --dry-run
+python3 run_controllability_v2.py baseline --dry-run
 
-# for real (needs ANTHROPIC_API_KEY; refuses to run unless the design is
-# frozen and matches its lock -- pass --allow-unfrozen for an exploratory
-# run that will never feed the frozen study's primary analysis)
-python3 run_controllability_v2.py treatment --provider anthropic --model claude-sonnet-5 \
-    --reasoning-profile low --replicates 3 --seed 20260917 --run-id wave1
-python3 run_controllability_v2.py baseline --provider anthropic --model claude-sonnet-5 \
-    --reasoning-profile low --replicates 3 --seed 20260917 --run-id wave1
+# production (needs DEEPSEEK_API_KEY; refuses to run unless the design is
+# frozen, matches its lock, and every preflight check passes; settings are
+# read from the frozen config -- passing --model/--replicates/etc. anyway
+# is only accepted if it matches exactly)
+python3 run_controllability_v2.py treatment --production --concurrency 32
+python3 run_controllability_v2.py baseline --production --concurrency 32
 
-# analyze both results files -- per-evaluator CSVs/plots/headline_results.json
-# under results/controllability_v2/analysis/ (pair_context_effects.csv,
-# cue_ates.csv, controllability_effects.csv, equivalence_results.csv,
-# ambiguity_interactions.csv, position_effects.csv, leave_one_story_out.csv,
-# response_compliance.csv, cell_counts.csv, baseline_pair_strength.csv,
+# resume an interrupted production run -- identical command, only the
+# still-missing observation_ids are executed, nothing is duplicated
+python3 run_controllability_v2.py treatment --production --concurrency 32
+
+# exploratory (real calls, never frozen-checked, never entering production
+# results)
+python3 run_controllability_v2.py treatment --allow-unfrozen \
+    --provider anthropic --model claude-sonnet-5 --reasoning-profile low --replicates 1
+
+# analyze the production results files -- per-evaluator CSVs/plots/
+# headline_results.json under results/controllability_v2/analysis/
+# (pair_context_effects.csv, cue_ates.csv, controllability_effects.csv,
+# equivalence_results.csv, ambiguity_interactions.csv, position_effects.csv,
+# leave_one_story_out.csv, response_compliance.csv, cell_counts.csv,
+# incomplete_superblocks.csv, cost_summary.csv, baseline_pair_strength.csv,
 # baseline_reliability.csv, evaluator_inventory.csv, headline_results.json,
-# plus 4 SVG plots per evaluator)
+# plus 4 SVG plots per evaluator) -- never the exploratory results, by default
 python3 analyze_controllability_v2.py
 
 # design-planning simulator -- no model API calls; varies replicate counts,

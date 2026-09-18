@@ -10,7 +10,7 @@ model strings are always accepted, these are just the defaults):
     anthropic  -> claude-sonnet-5   (ANTHROPIC_API_KEY)
     openai     -> gpt-5.6           (OPENAI_API_KEY)
     gemini     -> gemini-3.8-flash  (GEMINI_API_KEY)
-    deepseek   -> deepseek-v4-pro   (DEEPSEEK_API_KEY)
+    deepseek   -> deepseek-flash    (DEEPSEEK_API_KEY)
 
 Every SDK is imported lazily, inside the function that actually needs it
 (matching the pre-existing run_trial.call_claude convention), so:
@@ -38,7 +38,7 @@ DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-5",
     "openai": "gpt-5.6",
     "gemini": "gemini-3.8-flash",
-    "deepseek": "deepseek-v4-pro",
+    "deepseek": "deepseek-flash",
 }
 
 API_KEY_ENV_VARS = {
@@ -109,7 +109,7 @@ REASONING_PROFILES = {
         "medium": {"thinking_config": {"thinking_level": "medium"}},
         "high": {"thinking_config": {"thinking_level": "high"}},
     },
-    # DeepSeek V4 Pro: explicitly set reasoning_effort on every request
+    # DeepSeek Flash: explicitly set reasoning_effort on every request
     # (sent via the OpenAI-compatible client's extra_body, since it isn't a
     # parameter name the openai-python client itself defines) rather than
     # relying on whatever DeepSeek's own default happens to be.
@@ -143,11 +143,20 @@ def default_max_output_tokens(provider):
 
 def normalize_response(provider, requested_model, response_text, response_model=None, request_id=None,
                         input_tokens=None, output_tokens=None, reasoning_tokens=None, stop_reason=None,
-                        reasoning_profile=DEFAULT_REASONING_PROFILE, provider_reasoning_settings=None, raw=None):
+                        reasoning_profile=DEFAULT_REASONING_PROFILE, provider_reasoning_settings=None, raw=None,
+                        system_fingerprint=None, prompt_cache_hit_tokens=None, prompt_cache_miss_tokens=None):
     """The one normalized shape every provider's direct-call and
     batch-collect path returns. `raw` is small, provider-native debug
     metadata (ids, stop reasons, token breakdowns) for troubleshooting --
-    never chain-of-thought/reasoning content."""
+    never chain-of-thought/reasoning content.
+
+    system_fingerprint/prompt_cache_hit_tokens/prompt_cache_miss_tokens are
+    DeepSeek-specific usage fields (see _call_deepseek); every other
+    provider leaves them at their None default rather than fabricating a
+    value. `prompt_tokens`/`completion_tokens` are literal aliases of
+    input_tokens/output_tokens -- some callers (and DeepSeek's own raw
+    usage shape) name them that way; both names always agree.
+    """
     return {
         "response_text": response_text,
         "provider": provider,
@@ -156,7 +165,12 @@ def normalize_response(provider, requested_model, response_text, response_model=
         "request_id": request_id,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
         "reasoning_tokens": reasoning_tokens,
+        "prompt_cache_hit_tokens": prompt_cache_hit_tokens,
+        "prompt_cache_miss_tokens": prompt_cache_miss_tokens,
+        "system_fingerprint": system_fingerprint,
         "stop_reason": stop_reason,
         "reasoning_profile": reasoning_profile,
         "provider_reasoning_settings": provider_reasoning_settings or {},
@@ -320,6 +334,9 @@ def _call_deepseek(model, prompt, max_output_tokens, reasoning_profile, settings
         output_tokens=getattr(usage, "completion_tokens", None) if usage is not None else None,
         reasoning_tokens=reasoning_tokens, stop_reason=choice.finish_reason,
         reasoning_profile=reasoning_profile, provider_reasoning_settings=settings,
+        system_fingerprint=getattr(response, "system_fingerprint", None),
+        prompt_cache_hit_tokens=getattr(usage, "prompt_cache_hit_tokens", None) if usage is not None else None,
+        prompt_cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None) if usage is not None else None,
         raw={"id": getattr(response, "id", None), "finish_reason": choice.finish_reason},
     )
 

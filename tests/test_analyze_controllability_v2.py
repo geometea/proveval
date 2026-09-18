@@ -98,33 +98,43 @@ class TestStory1Chosen:
 class TestFilterCompleteSuperblocks:
     def test_complete_superblock_is_kept(self):
         rows = make_full_superblock("sb1", 1)
-        kept, n_complete, n_incomplete = av2.filter_complete_superblocks(rows)
+        kept, n_complete, n_incomplete, diagnostics = av2.filter_complete_superblocks(rows)
         assert len(kept) == 8
         assert n_complete == 1
         assert n_incomplete == 0
+        assert diagnostics == []
 
     def test_incomplete_superblock_is_entirely_excluded(self):
         rows = make_full_superblock("sb1", 1)[:-1]  # drop one cell -- 7/8
-        kept, n_complete, n_incomplete = av2.filter_complete_superblocks(rows)
+        kept, n_complete, n_incomplete, diagnostics = av2.filter_complete_superblocks(rows)
         assert kept == []
         assert n_complete == 0
         assert n_incomplete == 1
+        assert len(diagnostics) == 1
+        assert diagnostics[0]["n_cells_present"] == 7
+        assert diagnostics[0]["n_cells_expected"] == 8
+        assert diagnostics[0]["reason"] == "temporarily_incomplete"  # missing, not failed
 
     def test_one_unresolved_cell_makes_the_whole_replicate_unit_incomplete(self):
         rows = make_full_superblock("sb1", 1)
         rows[0]["parsing_status"] = "unresolved"
         rows[0]["first_valid_response"] = None
-        kept, n_complete, n_incomplete = av2.filter_complete_superblocks(rows)
+        kept, n_complete, n_incomplete, diagnostics = av2.filter_complete_superblocks(rows)
         assert kept == []
         assert n_incomplete == 1
+        assert diagnostics[0]["n_cells_present"] == 8  # all 8 rows exist...
+        assert diagnostics[0]["n_terminally_failed"] == 1  # ...but one never resolved
+        assert diagnostics[0]["reason"] == "terminally_incomplete"
 
     def test_replicates_are_evaluated_independently(self):
         complete = make_full_superblock("sb1", 1)
         incomplete = make_full_superblock("sb1", 2)[:-1]
-        kept, n_complete, n_incomplete = av2.filter_complete_superblocks(complete + incomplete)
+        kept, n_complete, n_incomplete, diagnostics = av2.filter_complete_superblocks(complete + incomplete)
         assert len(kept) == 8
         assert n_complete == 1
         assert n_incomplete == 1
+        assert len(diagnostics) == 1
+        assert diagnostics[0]["replicate_number"] == 2
 
 
 class TestFilterCompleteBaselineUnits:
@@ -133,13 +143,16 @@ class TestFilterCompleteBaselineUnits:
             make_baseline_row("b1__a", "b1", 1, "s1", "s2", "story1_as_a"),
             make_baseline_row("b1__b", "b1", 1, "s1", "s2", "story2_as_a"),
         ]
-        kept, n_complete, n_incomplete = av2.filter_complete_baseline_units(rows)
+        kept, n_complete, n_incomplete, diagnostics = av2.filter_complete_baseline_units(rows)
         assert len(kept) == 2 and n_complete == 1 and n_incomplete == 0
+        assert diagnostics == []
 
     def test_missing_position_makes_the_unit_incomplete(self):
         rows = [make_baseline_row("b1__a", "b1", 1, "s1", "s2", "story1_as_a")]
-        kept, n_complete, n_incomplete = av2.filter_complete_baseline_units(rows)
+        kept, n_complete, n_incomplete, diagnostics = av2.filter_complete_baseline_units(rows)
         assert kept == [] and n_incomplete == 1
+        assert diagnostics[0]["n_cells_expected"] == 2
+        assert diagnostics[0]["reason"] == "temporarily_incomplete"
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ wording.
 
 import json
 
+import model_providers
 from controllability_v2_corpus import CORPUS_ID
 from controllability_v2_trials import (
     BASELINE_TRIALS_FILE,
@@ -32,13 +33,24 @@ DESIGN_VERSION = "v2"
 # evaluator plus zero or more "replication" evaluators (item 9/18). Each
 # evaluator_id is the analysis-side identity key -- see
 # analyze_controllability_v2.match_evaluator_config.
+#
+# DeepSeek Flash is the current production primary evaluator. Claude Sonnet
+# 5 (the earlier primary) is kept on as a future replication evaluator
+# rather than removed -- it is never run for the current production study.
 DEFAULT_EVALUATORS = [
+    {
+        "evaluator_id": "deepseek__deepseek-flash__low",
+        "provider": "deepseek",
+        "requested_model": "deepseek-flash",
+        "reasoning_profile": "low",
+        "role": "primary",
+    },
     {
         "evaluator_id": "anthropic__claude-sonnet-5__low",
         "provider": "anthropic",
         "requested_model": "claude-sonnet-5",
         "reasoning_profile": "low",
-        "role": "primary",
+        "role": "replication",
     },
     {
         "evaluator_id": "openai__gpt-5.6__low",
@@ -70,13 +82,14 @@ def build_study_config(evaluators=None, status="draft"):
         "corpus_id": CORPUS_ID,
         "primary_evaluator": primary[0],
         "replication_evaluators": [e for e in evaluators if e["role"] == "replication"],
-        "treatment_replicate_count": 3,
-        "baseline_replicate_count": 3,
+        "treatment_replicate_count": 10,
+        "baseline_replicate_count": 10,
         "random_seed": 20260917,
         "bootstrap_draws": 10000,
         "equivalence_margin": 0.05,
         "alpha": 0.05,
         "retry_limit": 3,
+        "max_output_tokens": model_providers.default_max_output_tokens(primary[0]["provider"]),
         "instruction_strings": {
             condition: INSTRUCTION_SENTENCES[condition] for condition in PRIMARY_INSTRUCTION_CONDITIONS
         },
