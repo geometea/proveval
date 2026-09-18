@@ -601,6 +601,19 @@ experiments* (manual only). Commands: `stress-preflight`, `profile-preflight`,
 `stress-adversarial-generate/-search/-select/-run`, `stress-dose-run`,
 `stress-analysis`.
 
+### v3 experimental families: adaptive dose, iterative red-team, capability sweep (implemented, not yet run)
+
+`STUDY_PROTOCOL_V3_EXPERIMENTAL.md`. Adaptive dose (`stress_dose_adaptive`:
+intervention × ambiguity-stratum units, IRLS logistic curve, D-optimal next
+dose for d10, frozen stopping rules, deterministic replay), iterative
+adversarial evolution (`stress_adversarial_iterative`: frozen population
+policy, development-only feedback, best-ever selection, held-out run only
+after freeze) and a paired capability sweep (`capability_sweep`: one
+manifest, several evaluator profiles). Plus `runtime-estimate` (empirical
+throughput; conservative scenario = observed 1.4 judgments/s) and
+`design-simulate` (hierarchical power/design simulator, advisory only).
+Workflow: *Proveval v3 experimental families* (manual only).
+
 ## Context-controllability experiment v2 (recommended)
 
 A from-scratch v2 redesign of the experiment above, generated and analyzed

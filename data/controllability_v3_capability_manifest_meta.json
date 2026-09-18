@@ -1,0 +1,168 @@
+{
+  "pair_selection_basis": "seeded_story_balanced_subset",
+  "pairs": [
+    {
+      "story_1_id": "afterlife",
+      "story_2_id": "buddy",
+      "stratum": "seeded_0"
+    },
+    {
+      "story_1_id": "afterlife",
+      "story_2_id": "dana_brownies",
+      "stratum": "seeded_1"
+    },
+    {
+      "story_1_id": "afterlife",
+      "story_2_id": "dunnest_smoke",
+      "stratum": "seeded_2"
+    },
+    {
+      "story_1_id": "afterlife",
+      "story_2_id": "gilbert",
+      "stratum": "seeded_0"
+    },
+    {
+      "story_1_id": "afterlife",
+      "story_2_id": "santa",
+      "stratum": "seeded_1"
+    },
+    {
+      "story_1_id": "afterlife",
+      "story_2_id": "saturn",
+      "stratum": "seeded_2"
+    },
+    {
+      "story_1_id": "buddy",
+      "story_2_id": "dunnest_smoke",
+      "stratum": "seeded_0"
+    },
+    {
+      "story_1_id": "buddy",
+      "story_2_id": "prophet",
+      "stratum": "seeded_1"
+    },
+    {
+      "story_1_id": "charlotte_train",
+      "story_2_id": "dana_brownies",
+      "stratum": "seeded_2"
+    },
+    {
+      "story_1_id": "charlotte_train",
+      "story_2_id": "eyecut_lowway",
+      "stratum": "seeded_0"
+    },
+    {
+      "story_1_id": "dana_brownies",
+      "story_2_id": "prophet",
+      "stratum": "seeded_1"
+    },
+    {
+      "story_1_id": "dana_brownies",
+      "story_2_id": "santa",
+      "stratum": "seeded_2"
+    },
+    {
+      "story_1_id": "dana_brownies",
+      "story_2_id": "saturn",
+      "stratum": "seeded_0"
+    },
+    {
+      "story_1_id": "dunnest_smoke",
+      "story_2_id": "gilbert",
+      "stratum": "seeded_1"
+    },
+    {
+      "story_1_id": "dunnest_smoke",
+      "story_2_id": "morrow_transport",
+      "stratum": "seeded_2"
+    },
+    {
+      "story_1_id": "dunnest_smoke",
+      "story_2_id": "qual_panic",
+      "stratum": "seeded_0"
+    },
+    {
+      "story_1_id": "dunnest_smoke",
+      "story_2_id": "saturn",
+      "stratum": "seeded_1"
+    },
+    {
+      "story_1_id": "eyecut_lowway",
+      "story_2_id": "gilbert",
+      "stratum": "seeded_2"
+    },
+    {
+      "story_1_id": "eyecut_lowway",
+      "story_2_id": "qual_panic",
+      "stratum": "seeded_0"
+    },
+    {
+      "story_1_id": "eyecut_lowway",
+      "story_2_id": "santa",
+      "stratum": "seeded_1"
+    },
+    {
+      "story_1_id": "gilbert",
+      "story_2_id": "qual_panic",
+      "stratum": "seeded_2"
+    },
+    {
+      "story_1_id": "gilbert",
+      "story_2_id": "santa",
+      "stratum": "seeded_0"
+    },
+    {
+      "story_1_id": "morrow_transport",
+      "story_2_id": "santa",
+      "stratum": "seeded_1"
+    },
+    {
+      "story_1_id": "prophet",
+      "story_2_id": "saturn",
+      "stratum": "seeded_2"
+    }
+  ],
+  "attack_condition_included": false,
+  "n_cells": 4080,
+  "design": {
+    "n_pairs_per_stratum": 8,
+    "strata": [
+      "strong",
+      "moderate",
+      "ambiguous"
+    ],
+    "interventions": [
+      "I0",
+      "I1",
+      "I4",
+      "I5",
+      "I7"
+    ],
+    "cues": [
+      "provenance_human_vs_llm",
+      "source_journal_vs_random",
+      "reception_positive_vs_negative",
+      "opinion_liked_vs_disliked",
+      "editing_edited_vs_first_draft"
+    ],
+    "conditions": [
+      "nocontext",
+      "ordinary",
+      "attack",
+      "dose"
+    ],
+    "doses": [
+      51,
+      80,
+      99
+    ],
+    "replicates": 3,
+    "pair_selection_seed": 20260920,
+    "profiles": [
+      "deepseek_flash_low",
+      "deepseek_flash_medium",
+      "deepseek_flash_high"
+    ],
+    "pair_selection": "blind-baseline strength tertiles (primary no-context I0) when available, else seeded story-balanced subset"
+  }
+}

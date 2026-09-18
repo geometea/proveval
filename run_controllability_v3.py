@@ -74,6 +74,13 @@ import controllability_v3_stress_adversarial as adv
 import controllability_v3_stress_dose as dose_module
 from controllability_v3_stress_config import load_stress_config
 from freeze_controllability_v3_stress import verify_frozen as verify_stress_frozen
+from context_trials import load_items, story_pairs
+import controllability_v3_adaptive_dose as ad
+import controllability_v3_capability_sweep as cap
+import controllability_v3_iterative_attack as it
+import controllability_v3_runtime as rt
+from controllability_v3_experimental_config import load_config as load_experimental_config
+from freeze_controllability_v3_experimental import verify_frozen as verify_experimental_frozen
 from controllability_v3_study_config import STUDY_CONFIG_FILE, load_study_config
 from controllability_v3_trials import (
     CONTEXT_UNIQUE_CELLS,
@@ -157,9 +164,29 @@ RUN_KIND_FILES = {
 }
 STRESS_RUN_KINDS = ("stress_adv_dev", "stress_adv_eval", "stress_dose")
 
-# Assumed judge throughput for planning ONLY (no v2/v3 throughput was ever
-# recorded in this repository); override with --assumed-throughput.
-DEFAULT_ASSUMED_JUDGMENTS_PER_SECOND = 8.0
+# Throughput for planning comes from controllability_v3_runtime: the only
+# observed rate is v2 recovery's ~1.4 judgments/s (conservative scenario);
+# supply --throughput-from-results or --throughput-jps for an empirical one.
+EXPERIMENTAL_DIR = os.path.join(RESULTS_DIR, "experimental")
+ADAPTIVE_DIR = os.path.join(RESULTS_DIR, "stress_dose_adaptive")
+ITERATIVE_DIR = os.path.join(RESULTS_DIR, "stress_adversarial_iterative")
+CAPABILITY_DIR = os.path.join(RESULTS_DIR, "capability_sweep")
+ADAPTIVE_RESULTS_FILE = os.path.join(ADAPTIVE_DIR, "adaptive_dose_raw.jsonl")
+ADAPTIVE_SCHEDULE_FILE = os.path.join(ADAPTIVE_DIR, "adaptive_dose_schedule.jsonl")
+ADAPTIVE_STATE_FILE = os.path.join(ADAPTIVE_DIR, "adaptive_dose_state.json")
+ITERATIVE_DEV_RESULTS_FILE = os.path.join(ITERATIVE_DIR, "dev_raw.jsonl")
+ITERATIVE_EVAL_RESULTS_FILE = os.path.join(ITERATIVE_DIR, "iterative_attack_heldout_results.jsonl")
+CAPABILITY_RESULTS_FILE = os.path.join(CAPABILITY_DIR, "capability_raw.jsonl")
+EXPERIMENTAL_ANALYSIS_DIR = os.path.join(ANALYSIS_DIR, "experimental")
+DESIGN_SIM_DIR = os.path.join(RESULTS_DIR, "design_simulation")
+
+RUN_KIND_FILES.update({
+    "adaptive": {"families": (ad.FAMILY,), "production": ADAPTIVE_RESULTS_FILE, "exploratory": os.path.join(EXPLORATORY_DIR, "adaptive_dose_raw.jsonl"), "id_prefix": "v3a::"},
+    "iterative_dev": {"families": (it.FAMILY_DEV,), "production": ITERATIVE_DEV_RESULTS_FILE, "exploratory": os.path.join(EXPLORATORY_DIR, "iterative_dev_raw.jsonl"), "id_prefix": "v3i::"},
+    "iterative_eval": {"families": (it.FAMILY_EVAL,), "production": ITERATIVE_EVAL_RESULTS_FILE, "exploratory": os.path.join(EXPLORATORY_DIR, "iterative_eval_raw.jsonl"), "id_prefix": "v3i::"},
+    "capability": {"families": (cap.FAMILY,), "production": CAPABILITY_RESULTS_FILE, "exploratory": os.path.join(EXPLORATORY_DIR, "capability_raw.jsonl"), "id_prefix": "v3c::"},
+})
+EXPERIMENTAL_RUN_KINDS = ("adaptive", "iterative_dev", "iterative_eval", "capability")
 
 
 # ---------------------------------------------------------------------------
@@ -604,18 +631,24 @@ def _run(args, run_kind):
         results_file = results_path_for_profile(files["production"], profile_id)
         collection = "pilot" if run_kind == "pilot" else "production"
 
-    provider, model, reasoning_profile = settings["provider"], settings["model"], settings["reasoning_profile"]
-    reasoning_settings = model_providers.resolve_reasoning_settings(provider, reasoning_profile)
-
     trials = _load_trials_for(run_kind, study_config, stress_config)
     trials = limit_to_first_n_units(trials, args.limit)
-    texts = load_story_texts()
+    _execute(args, run_kind, trials, _id_maker_for(run_kind), settings, results_file, collection, profile_id,
+             manifest_sha="+".join(sha256_of_file(p) for p in _manifest_paths_for(run_kind, study_config, stress_config)))
+
+
+def _execute(args, run_kind, trials, id_maker, settings, results_file, collection, profile_id, manifest_sha=None, plan=None, texts=None):
+    """Shared execution tail for every family: plan (or take a prepared
+    plan), valid-only resume by evaluation id, bounded concurrency, time
+    budget, append-only rows. Returns (n_planned, n_still_missing)."""
+    provider, model, reasoning_profile = settings["provider"], settings["model"], settings["reasoning_profile"]
+    reasoning_settings = model_providers.resolve_reasoning_settings(provider, reasoning_profile)
+    texts = texts or load_story_texts()
     verify_prompt_hashes(trials, texts)
-    plan = attach_observation_ids(plan_execution_order(trials, settings["replicates"], settings["seed"]), profile_id, _id_maker_for(run_kind))
+    if plan is None:
+        plan = attach_observation_ids(plan_execution_order(trials, settings["replicates"], settings["seed"]), profile_id, id_maker)
     already_valid = load_valid_completed_ids(results_file, profile_id)
     remaining = filter_unresumed_plan(plan, already_valid, key="evaluation_observation_id")
-
-    manifest_sha = "+".join(sha256_of_file(p) for p in _manifest_paths_for(run_kind, study_config, stress_config))
 
     print(f"Run kind: {run_kind}  Collection: {collection}  Evaluator profile: {profile_id}  Output: {results_file}")
     print(f"Provider: {provider}  Model: {model}  Reasoning profile: {reasoning_profile}  max_output_tokens: {settings['max_output_tokens']}")
@@ -625,10 +658,10 @@ def _run(args, run_kind):
     if args.dry_run:
         print("Dry run: no network calls made.")
         print(f"First 5 execution-order entries: {[(p['execution_order_index'], p['trial_id']) for p in remaining[:5]]}")
-        return
+        return len(plan), len(remaining)
     if not remaining:
         print("Nothing to do -- every planned observation already has a valid answer.")
-        return
+        return len(plan), 0
 
     evaluator_identity = build_evaluator_identity(
         provider=provider, requested_model=model, reasoning_profile=reasoning_profile,
@@ -649,11 +682,13 @@ def _run(args, run_kind):
             progress.record(observation)
         not_submitted = run_plan(remaining, task, args.concurrency, deadline)
 
-    still_missing = len(plan) - len(load_valid_completed_ids(results_file, profile_id))
+    valid_now = load_valid_completed_ids(results_file, profile_id)
+    still_missing = sum(1 for e in plan if e["evaluation_observation_id"] not in valid_now)
     print(f"Done. Results appended to {results_file}.  Not submitted (time budget): {not_submitted:,}  "
           f"Planned observations still without a valid answer: {still_missing:,}")
     if still_missing:
         print("Re-run this same command to resume; only the missing observations will be executed.")
+    return len(plan), still_missing
 
 
 def cmd_pilot(args):
@@ -765,7 +800,7 @@ def _stress_results_files(profile_id):
     return {kind: results_path_for_profile(RUN_KIND_FILES[kind]["production"], profile_id) for kind in STRESS_RUN_KINDS}
 
 
-def stress_cost_plan(stress_config, candidates=None, selected=None, assumed_throughput=DEFAULT_ASSUMED_JUDGMENTS_PER_SECOND):
+def stress_cost_plan(stress_config, candidates=None, selected=None, throughput_jps=None, throughput_basis=None):
     a = stress_config["adversarial"]
     n_valid = len(adv.valid_candidates(candidates)) if candidates else None
     n_sel = len(selected["selected"]) if selected else None
@@ -777,8 +812,9 @@ def stress_cost_plan(stress_config, candidates=None, selected=None, assumed_thro
         "adversarial_heldout_evaluation_judgments": adv_plan["eval_judgments"],
         "dose_response_judgments": dose_plan["judgments"],
     }
-    hours = {k: v / assumed_throughput / 3600 for k, v in stages.items() if k.endswith("judgments")}
-    return {"stages": stages, "assumed_judgments_per_second": assumed_throughput, "estimated_hours": hours,
+    scenarios = {k: rt.plan_scenarios(v, throughput_jps, throughput_basis) for k, v in stages.items() if k.endswith("judgments")}
+    hours = {k: {name: sc["hours"] for name, sc in plan["scenarios"].items()} for k, plan in scenarios.items()}
+    return {"stages": stages, "scenarios": scenarios, "estimated_hours": hours,
             "candidates_basis": "actual valid candidates" if n_valid is not None else "planned (8 per cue x intervention, all assumed valid)",
             "selected_basis": "actual selected attacks" if n_sel is not None else "planned (K=3 per cue x intervention)",
             "adversarial": adv_plan, "dose": dose_plan}
@@ -789,8 +825,13 @@ def print_stress_cost_plan(plan):
     for k, v in plan["stages"].items():
         line = f"{k}: {v:,}"
         if k in plan["estimated_hours"]:
-            line += f"  (~{plan['estimated_hours'][k]:.1f} h at {plan['assumed_judgments_per_second']:.0f} judgments/s -- ASSUMED throughput; none was ever recorded for v2/v3)"
+            h = plan["estimated_hours"][k]
+            line += f"  (hours: optimistic {h['optimistic']:.1f} / empirical {h['empirical']:.1f} / conservative {h['conservative']:.1f})"
         print(line)
+    first = next(iter(plan["scenarios"].values()), None)
+    if first:
+        for name, sc in first["scenarios"].items():
+            print(f"  {name}: {sc['judgments_per_second']:.2f} judgments/s  [{sc['basis']}]")
     print(f"candidates basis: {plan['candidates_basis']};  selected basis: {plan['selected_basis']}")
     d = plan["dose"]
     print(f"dose design: {d['story_pairs']} pairs x {d['doses']} doses x {d['interventions']} interventions x 4 cells = {d['unique_cells']:,} cells; "
@@ -947,7 +988,8 @@ def cmd_stress_preflight(args):
                                                args.skip_credential_check, families=families)
     for name, check_ok, detail in checks:
         print(f"[{'OK' if check_ok else 'FAIL'}] {name}: {detail}")
-    plan = stress_cost_plan(stress_config, context.get("candidates"), context.get("selected"), args.assumed_throughput)
+    jps, basis, summary = rt.resolve_throughput(getattr(args, "throughput_jps", None), getattr(args, "throughput_from_results", None))
+    plan = stress_cost_plan(stress_config, context.get("candidates"), context.get("selected"), jps, basis)
     print_stress_cost_plan(plan)
     if not ok:
         raise SystemExit("v3 stress preflight FAILED -- see the FAIL line(s) above. No API calls were made.")
@@ -1108,6 +1150,544 @@ def cmd_stress_analysis(args):
 
 
 # ---------------------------------------------------------------------------
+# Experimental families: runtime estimate, design simulator, adaptive dose,
+# iterative adversary, capability sweep. Zero API calls except the *-run /
+# generate / next-generation commands (judge or attacker).
+# ---------------------------------------------------------------------------
+
+def add_throughput_arguments(parser):
+    parser.add_argument("--throughput-jps", type=float, default=None, help="Empirical judgments/s to plan with (labelled as given on the command line)")
+    parser.add_argument("--throughput-from-results", default=None, help="Raw JSONL results file to MEASURE throughput from")
+
+
+def cmd_runtime_estimate(args):
+    jps, basis, summary = rt.resolve_throughput(args.throughput_jps, args.throughput_from_results, args.concurrency)
+    if summary:
+        print("=== empirical run summary ===")
+        for k, v in summary.items():
+            print(f"{k}: {v:.3f}" if isinstance(v, float) else f"{k}: {v}")
+    for label, n in (("primary", 116160), ("holdout", 13200), ("stress dose", 63360), ("stress attack dev", 28160), ("stress attack eval", 63360),
+                     ("adaptive dose (hard budget)", load_experimental_config()["adaptive_dose"]["arithmetic"]["max_judgments_hard_budget"]),
+                     ("iterative attack dev (max)", load_experimental_config()["iterative_attack"]["arithmetic"]["dev_judgments_max"]),
+                     ("iterative attack held-out", load_experimental_config()["iterative_attack"]["arithmetic"]["heldout_judgments"]),
+                     ("capability sweep per profile (no attacks)", load_experimental_config()["capability_sweep"]["arithmetic_without_attacks"]["judgments_per_profile"])):
+        if args.judgments and label != "custom":
+            continue
+        print(rt.format_scenarios(rt.plan_scenarios(n, jps, basis), label))
+    if args.judgments:
+        print(rt.format_scenarios(rt.plan_scenarios(args.judgments, jps, basis), "custom"))
+    print("No API calls were made.")
+
+
+def cmd_design_simulate(args):
+    import controllability_v3_design_simulator as dsim
+    designs = [d for d in dsim.DEFAULT_DESIGNS if not args.designs or d["name"] in args.designs]
+    out = dsim.run_simulation(designs, None, args.n_sims, args.n_draws, args.seed, args.out_dir)
+    print(f"Simulated {len(designs)} design(s) x {args.n_sims} sims; outputs in {args.out_dir}")
+    for row in out["power"]:
+        print(f"  {row['design']:34s} P(best)={row['p_identify_best_suppression']}  P(detect attack)={row['p_detect_attack_vulnerability']}  FPR={row['false_positive_rate_null_attack']}")
+    print(f"recommended_design: {out['recommendation']['recommended_design']}  (advisory only; no design is changed)")
+
+
+# ---------------- adaptive dose ----------------
+
+def _experimental_settings(profile_id, config, replicates, cli_overrides=None):
+    profile = get_profile(profile_id)
+    return resolve_profile_settings(profile, replicates, config["random_seed"], config["retry_limit"], cli_overrides)
+
+
+def _baseline_strength_for_profile(profile_id, study_config):
+    """{pair_id: strength} from the primary no-context I0 rows of this profile, or {} when unavailable."""
+    import analyze_controllability_v3 as an
+    rows = an.load_rows(results_path_for_profile(PRIMARY_RESULTS_FILE, profile_id))
+    if not rows:
+        return {}
+    by_id, _ = an.include_rows(rows, (FAMILY_PRIMARY_NOCONTEXT,), study_config, profile_id)
+    valid = [e["valid"] for e in by_id.values() if e["valid"] is not None and e["valid"]["intervention_id"] == "I0"]
+    kept, _, _ = an.complete_units(valid, 2, by_id)
+    return {f"{r['story_1_id']}_vs_{r['story_2_id']}": r["baseline_strength"] for r in an.baseline_strength_table(kept)}
+
+
+def adaptive_paths(profile_id):
+    return {"raw": results_path_for_profile(ADAPTIVE_RESULTS_FILE, profile_id), "schedule": results_path_for_profile(ADAPTIVE_SCHEDULE_FILE, profile_id),
+            "state": results_path_for_profile(ADAPTIVE_STATE_FILE, profile_id)}
+
+
+def load_or_create_adaptive_state(paths, policy, study_config, profile_id, allow_create=True):
+    if os.path.exists(paths["state"]):
+        with open(paths["state"], "r", encoding="utf-8") as f:
+            return json.load(f)
+    if not allow_create:
+        return None
+    items = load_items()
+    pair_ids = [f"{a['id']}_vs_{b['id']}" for a, b in story_pairs(items)]
+    strength = _baseline_strength_for_profile(profile_id, study_config)
+    strata = ad.assign_strata(pair_ids, strength, policy["n_strata"])
+    state = {"evaluator_profile_id": profile_id, "strata": strata, "strata_basis": "blind baseline tertiles (primary no-context I0)" if strength else "single pooled stratum (no blind baseline available)",
+             "policy_sha256": sha256_hex(json.dumps(policy, sort_keys=True)), "created": datetime.now(timezone.utc).isoformat()}
+    os.makedirs(os.path.dirname(paths["state"]), exist_ok=True)
+    with open(paths["state"], "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    return state
+
+
+def load_schedule(path):
+    return [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()] if os.path.exists(path) else []
+
+
+def adaptive_replay(policy, state, schedule, raw_path, profile_id, verify=True):
+    """Rebuild unit state from the schedule + valid rows, re-deriving every
+    recorded decision from the data available at the time (verify=True)
+    and refusing on any mismatch -- resume can never decide differently."""
+    from controllability_v3_execution import iter_rows
+    valid_by_id = {}
+    for r in iter_rows(raw_path):
+        if r.get("parsing_status") == "resolved" and profile_id_from_row_safe(r) == profile_id:
+            valid_by_id.setdefault(r["planned_observation_id"], r)
+    strata = state["strata"]
+    n_pairs_by_stratum = {}
+    for p, st_ in strata.items():
+        n_pairs_by_stratum[st_] = n_pairs_by_stratum.get(st_, 0) + 1
+    units = {ad.unit_key(i, s): {"rounds": [], "visits": {}, "stopped": None, "pending_ids": [], "rows": []} for i, s in ad.units_for(policy, strata)}
+    for entry in schedule:
+        u = units[entry["unit"]]
+        if verify:
+            _, stratum = entry["unit"].split("|")
+            expected = ad.decide_next_dose(policy, len(u["rounds"]), u["visits"], u["rows"], n_pairs_by_stratum[stratum])
+            if (expected["dose"], expected["stop"]) != (entry.get("dose"), entry.get("stop")):
+                raise SystemExit(f"Adaptive replay mismatch for {entry['unit']} round {entry.get('round')}: recorded dose={entry.get('dose')} stop={entry.get('stop')}, "
+                                 f"re-derived dose={expected['dose']} stop={expected['stop']}. Refusing to continue.")
+        if entry.get("stop"):
+            u["stopped"] = entry["stop"]
+            continue
+        done = [i for i in entry["observation_ids"] if i in valid_by_id]
+        u["rounds"].append({"round": entry["round"], "dose": entry["dose"], "ids": entry["observation_ids"], "complete": len(done) == len(entry["observation_ids"])})
+        u["visits"][entry["dose"]] = u["visits"].get(entry["dose"], 0) + 1
+        u["rows"].extend(valid_by_id[i] for i in done)
+        u["pending_ids"].extend(i for i in entry["observation_ids"] if i not in valid_by_id)
+    return units, n_pairs_by_stratum, valid_by_id
+
+
+def profile_id_from_row_safe(row):
+    from controllability_v3_evaluator_profiles import profile_id_from_row
+    return profile_id_from_row(row)
+
+
+def run_adaptive_preflight(config, study_config, profile_id, skip_credential_check=False, paths=None):
+    checks = []
+    ok, reason = verify_frozen()
+    checks.append(("primary_v3_lock_verifies", ok, reason or "ok"))
+    ok, reason = verify_stress_frozen("design")
+    checks.append(("stress_design_stage_verifies_fixed_grid_untouched", ok, reason or "ok"))
+    ok, reason = verify_v2_unchanged()
+    checks.append(("v2_files_unchanged", ok, reason or "ok"))
+    ok, reason = verify_experimental_frozen("adaptive_design")
+    checks.append(("adaptive_design_policy_stopping_rule_and_budget_frozen", ok, reason or "ok"))
+    policy = config["adaptive_dose"]["policy"]
+    def policy_ok():
+        if set(policy["anchor_doses"]) - set(policy["allowed_doses"]):
+            raise ValueError("anchor doses not on the allowed grid")
+        if list(policy["allowed_doses"]) != sorted(policy["allowed_doses"]) or any(d not in sd.DOSE_GRID and d not in ad.ALLOWED_DOSES for d in policy["allowed_doses"]):
+            raise ValueError("allowed grid must be monotone and drawn from the adaptive grid")
+        a = ad.design_arithmetic(policy)
+        if policy["global_max_judgments"] != a["max_judgments_hard_budget"]:
+            raise ValueError("global budget disagrees with the policy arithmetic")
+        return f"grid {policy['allowed_doses']}, anchors {policy['anchor_doses']}, hard budget {a['max_judgments_hard_budget']:,} judgments"
+    _check(checks, "adaptive_grid_monotone_anchors_valid_budget_consistent", policy_ok)
+    p_ok, p_checks = run_profile_preflight(profile_id, study_config)
+    checks.extend(p_checks)
+    if profile_id.startswith("attacker_"):
+        checks.append(("judge_profile_is_not_an_attacker", False, profile_id)); p_ok = False
+    paths = paths or adaptive_paths(profile_id)
+    def state_ok():
+        state = load_or_create_adaptive_state(paths, policy, study_config, profile_id, allow_create=False)
+        if state is None:
+            return "no state yet (created on first run)"
+        if state["policy_sha256"] != sha256_hex(json.dumps(policy, sort_keys=True)):
+            raise ValueError("saved state was created under a different policy")
+        schedule = load_schedule(paths["schedule"])
+        adaptive_replay(policy, state, schedule, paths["raw"], profile_id, verify=True)
+        return f"state ok ({state['strata_basis']}); {len(schedule)} recorded decision(s) replay identically"
+    _check(checks, "adaptive_state_and_schedule_replay_deterministically", state_ok)
+    def outputs_clean():
+        dup = find_duplicate_valid_ids(paths["raw"])
+        foreign = find_foreign_ids(paths["raw"], (ad.FAMILY,), ("v3a::",))
+        if dup or foreign:
+            raise ValueError(f"{len(dup)} duplicate valid id(s), {len(foreign)} foreign row(s)")
+    _check(checks, "adaptive_outputs_have_no_duplicate_valid_or_foreign_ids", outputs_clean)
+    if skip_credential_check:
+        checks.append(("api_credential_present", True, "skipped"))
+    elif p_ok:
+        try:
+            model_providers.get_api_key(get_profile(profile_id)["provider"]); checks.append(("api_credential_present", True, "ok"))
+        except RuntimeError as e:
+            checks.append(("api_credential_present", False, str(e)))
+    return all(c[1] for c in checks), checks
+
+
+def cmd_adaptive_dose_preflight(args):
+    config, study_config = load_experimental_config(), load_study_config()
+    ok, checks = run_adaptive_preflight(config, study_config, args.evaluator_profile, args.skip_credential_check)
+    for name, c_ok, detail in checks:
+        print(f"[{'OK' if c_ok else 'FAIL'}] {name}: {detail}")
+    a = config["adaptive_dose"]["arithmetic"]
+    print(f"adaptive units: {a['units']}  judgments/round/unit: {a['judgments_per_round_per_unit']}  anchors-only: {a['min_judgments_anchors_only']:,}  hard budget: {a['max_judgments_hard_budget']:,}")
+    jps, basis, _ = rt.resolve_throughput(getattr(args, "throughput_jps", None), getattr(args, "throughput_from_results", None))
+    print(rt.format_scenarios(rt.plan_scenarios(a["max_judgments_hard_budget"], jps, basis), "adaptive hard budget"))
+    if not ok:
+        raise SystemExit("Adaptive-dose preflight FAILED. No API calls were made.")
+    print("Adaptive-dose preflight PASSED. No API calls were made.")
+
+
+def cmd_adaptive_dose_run(args):
+    """Rounds until every unit stops, the global budget is spent, or the
+    time budget runs out. Each round: replay (verified) -> deterministic
+    decisions -> schedule entries appended -> judgments executed."""
+    if args.production and args.allow_unfrozen:
+        raise SystemExit("--production and --allow-unfrozen are mutually exclusive.")
+    if not args.dry_run and not args.production and not args.allow_unfrozen:
+        raise SystemExit("A real execution must pass --production (frozen) or --allow-unfrozen (exploratory).")
+    config, study_config = load_experimental_config(), load_study_config()
+    policy = config["adaptive_dose"]["policy"]
+    profile_id = args.evaluator_profile
+    if args.production:
+        ok, checks = run_adaptive_preflight(config, study_config, profile_id)
+        for name, c_ok, detail in checks:
+            print(f"[{'OK' if c_ok else 'FAIL'}] {name}: {detail}")
+        if not ok:
+            raise SystemExit("Adaptive-dose preflight FAILED -- refusing to run. No API calls were made.")
+    paths = adaptive_paths(profile_id) if not args.allow_unfrozen else {k: results_path_for_profile(os.path.join(EXPLORATORY_DIR, os.path.basename(v)), profile_id) for k, v in adaptive_paths(profile_id).items()}
+    collection = "production" if args.production else "exploratory"
+    state = load_or_create_adaptive_state(paths, policy, study_config, profile_id)
+    settings = _experimental_settings(profile_id, config, 1, _cli_overrides(args))
+    items = load_items()
+    pairs_by_id = {f"{a['id']}_vs_{b['id']}": (a["id"], b["id"]) for a, b in story_pairs(items)}
+    texts = load_story_texts()
+    deadline = time.time() + args.time_budget_minutes * 60 if args.time_budget_minutes else None
+    total_rounds = 0
+    while True:
+        schedule = load_schedule(paths["schedule"])
+        units, n_pairs_by_stratum, valid_by_id = adaptive_replay(policy, state, schedule, paths["raw"], profile_id, verify=True)
+        spent = sum(len(e.get("observation_ids", [])) for e in schedule)
+        # 1. finish pending rounds (resume)
+        pending = [(k, u) for k, u in units.items() if u["pending_ids"]]
+        entries = []
+        for key, u in pending:
+            for rnd in u["rounds"]:
+                if not rnd["complete"]:
+                    entries += _adaptive_round_entries(key, rnd["dose"], rnd["round"], u["visits"][rnd["dose"]], state, pairs_by_id, texts, profile_id, rnd["ids"])
+        if not entries:
+            decisions = ad.next_round_decisions(policy, state["strata"], units, n_pairs_by_stratum)
+            if not decisions:
+                print("Every adaptive unit has stopped."); break
+            if spent >= policy["global_max_judgments"]:
+                print(f"Global hard budget reached ({spent:,} >= {policy['global_max_judgments']:,}); stopping."); break
+            with open(paths["schedule"], "a", encoding="utf-8") as f:
+                for key in sorted(decisions):
+                    d = decisions[key]
+                    u = units[key]
+                    entry = {"unit": key, "round": len(u["rounds"]) + 1, "dose": d["dose"], "stop": d["stop"], "reason": d["reason"],
+                             "state_before": {"rounds_done": d["rounds_done"], "visits": u["visits"], "n_observations": d["n_observations"], "fit": d["fit"]},
+                             "candidates": d["candidates"], "data_available_valid_rows": len(u["rows"]), "timestamp": datetime.now(timezone.utc).isoformat()}
+                    if d["dose"] is not None:
+                        visit = u["visits"].get(d["dose"], 0) + 1
+                        round_entries = _adaptive_round_entries(key, d["dose"], entry["round"], visit, state, pairs_by_id, texts, profile_id)
+                        entry["observation_ids"] = [e["planned_observation_id"] for e in round_entries]
+                        entries += round_entries
+                    else:
+                        entry["observation_ids"] = []
+                    f.write(json.dumps(entry, sort_keys=True) + "\n")
+            if not entries:
+                continue
+        if args.dry_run:
+            print(f"Dry run: {len(entries)} judgment(s) would be executed this round for {len({e['unit'] for e in entries})} unit(s). No network calls made.")
+            return
+        for i, e in enumerate(entries, start=1):
+            e["execution_order_index"] = i
+        n_planned, missing = _execute(args, "adaptive", [e["trial"] for e in entries], None, settings, paths["raw"], collection, profile_id, plan=entries, texts=texts)
+        total_rounds += 1
+        if missing:
+            print("Round left unresolved observations; re-run to retry them before the next decision."); break
+        if deadline and time.time() > deadline:
+            print("Time budget reached; re-run to continue."); break
+    print(f"Adaptive run finished this invocation after {total_rounds} executed round(s). Schedule: {paths['schedule']}")
+
+
+def _adaptive_round_entries(unit, dose, round_no, visit, state, pairs_by_id, texts, profile_id, expected_ids=None):
+    from controllability_v3_evaluator_profiles import make_evaluation_observation_id
+    iid, stratum = unit.split("|")
+    pairs = sorted(p for p, s in state["strata"].items() if s == stratum)
+    cells = ad.build_round_cells([pairs_by_id[p] for p in pairs], iid, dose, visit, texts)
+    entries = []
+    for c in cells:
+        c["experiment_id"] = "context_controllability_v3_experimental"
+        c["stratum"], c["round"], c["unit"] = stratum, round_no, unit
+        pid = ad.make_observation_id(c["trial_id"], visit)
+        entries.append({"trial_id": c["trial_id"], "block_id": c["block_id"], "family": ad.FAMILY, "replicate_number": visit, "random_seed": None, "trial": c,
+                        "planned_observation_id": pid, "evaluator_profile_id": profile_id, "evaluation_observation_id": make_evaluation_observation_id(pid, profile_id), "unit": unit})
+    if expected_ids is not None and [e["planned_observation_id"] for e in entries] != list(expected_ids):
+        raise SystemExit(f"Adaptive round reconstruction for {unit} round {round_no} does not reproduce the recorded observation ids.")
+    return entries
+
+
+def cmd_adaptive_dose_analysis(args):
+    import analyze_controllability_v3_experimental as ax
+    config, study_config = load_experimental_config(), load_study_config()
+    profile_id = args.evaluator_profile
+    paths = adaptive_paths(profile_id)
+    state = load_or_create_adaptive_state(paths, config["adaptive_dose"]["policy"], study_config, profile_id, allow_create=False)
+    if state is None:
+        raise SystemExit("No adaptive state/results for this profile yet.")
+    res = ax.analyze_adaptive(ax.load_rows(paths["raw"]), load_schedule(paths["schedule"]), state, config["adaptive_dose"]["policy"], profile_id, study_config,
+                              fixed_rows=ax.load_rows(results_path_for_profile(DOSE_RESULTS_FILE, profile_id)), n_draws=args.bootstrap_draws or config["bootstrap_draws"], seed=config["random_seed"])
+    out_dir = args.analysis_dir if profile_id == PRIMARY_PROFILE_ID else os.path.join(args.analysis_dir, "profiles", profile_id)
+    print(f"Wrote {ax.write_outputs(res, out_dir)} to {out_dir}")
+
+
+# ---------------- iterative adversary ----------------
+
+def iterative_paths(profile_id):
+    return {"dev": results_path_for_profile(ITERATIVE_DEV_RESULTS_FILE, profile_id), "eval": results_path_for_profile(ITERATIVE_EVAL_RESULTS_FILE, profile_id)}
+
+
+def _iterative_scores(config, study_config, profile_id, records):
+    import analyze_controllability_v3_experimental as ax
+    import analyze_controllability_v3_stress as ast
+    policy = config["iterative_attack"]["policy"]
+    dev_effects, _ = ax.iterative_dev_effects(ax.load_rows(iterative_paths(profile_id)["dev"]), profile_id, study_config)
+    split = sd.load_split(config["iterative_attack"]["split_file"])
+    ordinary = {}
+    primary_rows = ax.load_rows(results_path_for_profile(PRIMARY_RESULTS_FILE, profile_id))
+    if primary_rows:
+        by_id, _ = ast.an.include_rows(primary_rows, (FAMILY_PRIMARY_CONTEXT,), study_config, profile_id)
+        pv = [e["valid"] for e in by_id.values() if e["valid"] is not None]
+        kept, _, _ = ast.an.complete_units(pv, 4, by_id)
+        ordinary = ast.ordinary_pair_effects(ast.an.pair_context_effects(ast.an.context_cell_rates(kept)), set(split["attack_development_pairs"]))
+    leaked = {p for pairs in dev_effects.values() for p in pairs if f"{p[0]}_vs_{p[1]}" in set(split["attack_evaluation_pairs"])}
+    if leaked:
+        raise SystemExit(f"Iterative development results contain held-out pairs {sorted(leaked)[:3]} -- refusing.")
+    return it.score_members(it.members(records), dev_effects, ordinary, policy["min_dev_pairs_for_score"]), split
+
+
+def _iterative_gate(args, config, stage="iterative_policy"):
+    ok, reason = verify_experimental_frozen(stage)
+    if not ok and not getattr(args, "allow_unfrozen", False):
+        raise SystemExit(f"Experimental stage {stage!r} is not frozen ({reason}); freeze it or pass --allow-unfrozen for an exploratory run.")
+    for check, label in ((verify_frozen, "primary"), (verify_v2_unchanged, "v2")):
+        ok, reason = check()
+        if not ok:
+            raise SystemExit(f"{label} integrity check failed: {reason}")
+
+
+def _attacker_call_fn(args, config):
+    attacker_id = args.attacker_profile or config["iterative_attack"]["default_attacker_profile_id"]
+    ok, reason = validate_profile(attacker_id)
+    if not ok:
+        raise SystemExit(f"Attacker profile invalid: {reason}")
+    attacker = get_profile(attacker_id)
+    gate = DeepSeekPricingGate(allow_peak=args.allow_peak_pricing)
+    return make_call_fn(attacker["provider"], attacker["model"], attacker["reasoning_profile"], attacker["max_output_tokens"], gate), attacker
+
+
+def cmd_iterative_attack_generate(args):
+    config = load_experimental_config()
+    _iterative_gate(args, config)
+    policy = config["iterative_attack"]["policy"]
+    contrasts = load_contrasts(load_study_config()["contrast_file"])
+    frozen = adv.load_candidates(load_stress_config()["adversarial"]["candidates_file"]) if policy["seed_from_frozen_candidates"] else []
+    texts = load_story_texts()
+    records = it.load_population(config["iterative_attack"]["population_file"])
+    todo = [k for k in it.keys(policy) if it.current_generation(records, k) is None]
+    print(f"Generation 0: {len(todo)} key(s) to seed (population {policy['population_size']}, frozen candidates available: {len(adv.valid_candidates(frozen))})")
+    if args.dry_run:
+        print("Dry run: no attacker calls made."); return
+    call_fn, attacker = _attacker_call_fn(args, config)
+    with SafeJsonlWriter(config["iterative_attack"]["population_file"]) as w:
+        n = it.build_generation_zero(policy, contrasts, frozen, call_fn, attacker, texts, w.write, records)
+    print(f"Seeded {n} key(s) -> {config['iterative_attack']['population_file']}")
+
+
+def cmd_iterative_attack_evaluate_dev(args):
+    config, study_config = load_experimental_config(), load_study_config()
+    _iterative_gate(args, config)
+    policy = config["iterative_attack"]["policy"]
+    records = it.load_population(config["iterative_attack"]["population_file"])
+    split = sd.load_split(config["iterative_attack"]["split_file"])
+    valid_members = [m for m in it.members(records) if m.get("validation_ok")]
+    trials = it.build_dev_trials(valid_members, split, load_story_texts())
+    it.assert_manifest_pairs(trials, split, it.FAMILY_DEV)
+    settings = _experimental_settings(args.evaluator_profile, config, policy["dev_replicates"], _cli_overrides(args))
+    _execute(args, "iterative_dev", limit_to_first_n_units(trials, args.limit), it.make_observation_id, settings,
+             iterative_paths(args.evaluator_profile)["dev"] if args.production else RUN_KIND_FILES["iterative_dev"]["exploratory"], "production" if args.production else "exploratory", args.evaluator_profile)
+
+
+def cmd_iterative_attack_next_generation(args):
+    config, study_config = load_experimental_config(), load_study_config()
+    _iterative_gate(args, config)
+    policy = config["iterative_attack"]["policy"]
+    records = it.load_population(config["iterative_attack"]["population_file"])
+    scores, split = _iterative_scores(config, study_config, args.evaluator_profile, records)
+    contrasts = load_contrasts(study_config["contrast_file"])
+    if args.dry_run:
+        ready = [k for k in it.keys(policy) if it.current_generation(records, k) is not None and it.current_generation(records, k) < policy["generations"]]
+        print(f"Dry run: {len(ready)} key(s) below the generation cap; no attacker calls made."); return
+    call_fn, attacker = _attacker_call_fn(args, config)
+    with SafeJsonlWriter(config["iterative_attack"]["population_file"]) as w:
+        n = it.build_next_generation(policy, contrasts, records, scores, call_fn, attacker, load_story_texts(), w.write, split)
+    print(f"Advanced {n} key(s) to their next generation -> {config['iterative_attack']['population_file']}")
+
+
+def cmd_iterative_attack_freeze(args):
+    import freeze_controllability_v3_experimental as fx
+    config, study_config = load_experimental_config(), load_study_config()
+    _iterative_gate(args, config)
+    ic = config["iterative_attack"]
+    if os.path.exists(iterative_paths(args.evaluator_profile)["eval"]):
+        raise SystemExit("Held-out results already exist; the selection can never be revised after evaluation.")
+    records = it.load_population(ic["population_file"])
+    scores, split = _iterative_scores(config, study_config, args.evaluator_profile, records)
+    selected = it.select_final(records, scores, ic["policy"])
+    if not selected:
+        raise SystemExit("No scored members to select.")
+    out = {"selected": selected, "rule": ic["policy"]["final_selection_rule"], "evaluator_profile_id": args.evaluator_profile, "split_sha256": adv.sha256_hex(json.dumps(split, sort_keys=True)),
+           "population_sha256": sha256_of_file(ic["population_file"]), "timestamp": datetime.now(timezone.utc).isoformat()}
+    with open(ic["selected_file"], "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2); f.write("\n")
+    trials = it.build_eval_trials(out, split, load_story_texts())
+    it.assert_manifest_pairs(trials, split, it.FAMILY_EVAL)
+    sd.write_manifest(trials, ic["eval_manifest_file"])
+    lock = fx.freeze("iterative_attacks")
+    print(f"Selected {len(selected)} final attacks; held-out manifest {len(trials)} cells; stage 'iterative_attacks' frozen at {lock['stages']['iterative_attacks']['frozen_at']}")
+
+
+def cmd_iterative_attack_run_heldout(args):
+    config = load_experimental_config()
+    _iterative_gate(args, config, "iterative_attacks")
+    ic = config["iterative_attack"]
+    trials = sd.load_manifest(ic["eval_manifest_file"])
+    split = sd.load_split(ic["split_file"])
+    it.assert_manifest_pairs(trials, split, it.FAMILY_EVAL)
+    settings = _experimental_settings(args.evaluator_profile, config, ic["policy"]["eval_replicates"], _cli_overrides(args))
+    _execute(args, "iterative_eval", limit_to_first_n_units(trials, args.limit), it.make_observation_id, settings,
+             iterative_paths(args.evaluator_profile)["eval"] if args.production else RUN_KIND_FILES["iterative_eval"]["exploratory"], "production" if args.production else "exploratory", args.evaluator_profile)
+
+
+def cmd_iterative_attack_analysis(args):
+    import analyze_controllability_v3_experimental as ax
+    config, study_config = load_experimental_config(), load_study_config()
+    ic = config["iterative_attack"]
+    pid = args.evaluator_profile
+    records = it.load_population(ic["population_file"])
+    split = sd.load_split(ic["split_file"])
+    paths = iterative_paths(pid)
+    res = ax.analyze_iterative(records, ax.load_rows(paths["dev"]), ax.load_rows(paths["eval"]), ax.load_rows(results_path_for_profile(PRIMARY_RESULTS_FILE, pid)),
+                               ic["policy"], split, pid, study_config, n_draws=args.bootstrap_draws or config["bootstrap_draws"], seed=config["random_seed"])
+    out_dir = args.analysis_dir if pid == PRIMARY_PROFILE_ID else os.path.join(args.analysis_dir, "profiles", pid)
+    print(f"Wrote {ax.write_outputs(res, out_dir)} to {out_dir}")
+
+
+# ---------------- capability sweep ----------------
+
+def cmd_capability_generate(args):
+    config, study_config = load_experimental_config(), load_study_config()
+    design = config["capability_sweep"]["design"]
+    strength = _baseline_strength_for_profile(PRIMARY_PROFILE_ID, study_config)
+    strongest = None
+    ok, _ = verify_stress_frozen("attacks")
+    if ok:
+        sel = adv.load_selected(load_stress_config()["adversarial"]["selected_attacks_file"])
+        strongest = {(r["cue_id"], r["intervention_id"]): r for r in sel["selected"] if r["rank"] == 1}
+    trials, meta = cap.build_capability_trials(design, baseline_strength=strength or None, strongest_attacks=strongest)
+    cap.assert_capability_manifest_well_formed(trials, design)
+    sd.write_manifest(trials, cap.TRIALS_FILE)
+    with open(cap.META_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2); f.write("\n")
+    a = cap.design_arithmetic(design, meta["attack_condition_included"])
+    print(f"capability manifest: {len(trials)} cells ({meta['pair_selection_basis']}; attacks included: {meta['attack_condition_included']}) -> {cap.TRIALS_FILE}")
+    print(f"judgments per profile: {a['judgments_per_profile']:,}  profiles: {a['profiles']}  all profiles: {a['judgments_all_profiles']:,}")
+
+
+def run_capability_preflight(config, study_config, profile_ids_, skip_credential_check=False):
+    checks = []
+    for check, label in ((verify_frozen, "primary_v3_lock_verifies"), (lambda: verify_stress_frozen("design"), "stress_design_stage_verifies"), (verify_v2_unchanged, "v2_files_unchanged"),
+                         (lambda: verify_experimental_frozen("capability_design"), "capability_design_frozen")):
+        ok, reason = check()
+        checks.append((label, ok, reason or "ok"))
+    design = config["capability_sweep"]["design"]
+    def manifest_ok():
+        trials = sd.load_manifest(config["capability_sweep"]["manifest_file"])
+        cap.assert_capability_manifest_well_formed(trials, design)
+        verify_prompt_hashes(trials, load_story_texts())
+        with open(config["capability_sweep"]["meta_file"], "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        a = cap.design_arithmetic(design, meta["attack_condition_included"])
+        if len(trials) != a["unique_cells"]:
+            raise ValueError(f"manifest has {len(trials)} cells, design expects {a['unique_cells']}")
+        return f"{len(trials)} cells, {a['judgments_per_profile']:,} judgments per profile, attacks included: {meta['attack_condition_included']}, prompts hash-verified"
+    _check(checks, "capability_manifest_balanced_expected_counts_and_hashes", manifest_ok)
+    for pid in profile_ids_:
+        ok, p_checks = run_profile_preflight(pid, study_config)
+        checks.extend((f"{pid}: {n}", o, d) for n, o, d in p_checks)
+        if pid.startswith("attacker_"):
+            checks.append((f"{pid}: judge_profile_is_not_an_attacker", False, pid))
+        path = results_path_for_profile(CAPABILITY_RESULTS_FILE, pid)
+        dup, foreign = find_duplicate_valid_ids(path), find_foreign_ids(path, (cap.FAMILY,), ("v3c::",))
+        checks.append((f"{pid}: outputs_clean", not dup and not foreign, "ok" if not dup and not foreign else f"{len(dup)} dup / {len(foreign)} foreign"))
+        if not skip_credential_check:
+            try:
+                model_providers.get_api_key(get_profile(pid)["provider"]); checks.append((f"{pid}: api_credential_present", True, "ok"))
+            except (RuntimeError, KeyError) as e:
+                checks.append((f"{pid}: api_credential_present", False, str(e)))
+    return all(c[1] for c in checks), checks
+
+
+def cmd_capability_preflight(args):
+    config, study_config = load_experimental_config(), load_study_config()
+    profiles = args.profiles or config["capability_sweep"]["design"]["profiles"]
+    ok, checks = run_capability_preflight(config, study_config, profiles, args.skip_credential_check)
+    for name, c_ok, detail in checks:
+        print(f"[{'OK' if c_ok else 'FAIL'}] {name}: {detail}")
+    a = config["capability_sweep"]["arithmetic_without_attacks"]
+    jps, basis, _ = rt.resolve_throughput(getattr(args, "throughput_jps", None), getattr(args, "throughput_from_results", None))
+    print(rt.format_scenarios(rt.plan_scenarios(a["judgments_per_profile"], jps, basis), "capability sweep, per profile"))
+    if not ok:
+        raise SystemExit("Capability preflight FAILED. No API calls were made.")
+    print("Capability preflight PASSED. No API calls were made.")
+
+
+def cmd_capability_run(args):
+    if args.production and args.allow_unfrozen:
+        raise SystemExit("--production and --allow-unfrozen are mutually exclusive.")
+    if not args.dry_run and not args.production and not args.allow_unfrozen:
+        raise SystemExit("A real execution must pass --production or --allow-unfrozen.")
+    config, study_config = load_experimental_config(), load_study_config()
+    if args.production:
+        ok, checks = run_capability_preflight(config, study_config, [args.evaluator_profile])
+        for name, c_ok, detail in checks:
+            print(f"[{'OK' if c_ok else 'FAIL'}] {name}: {detail}")
+        if not ok:
+            raise SystemExit("Capability preflight FAILED -- refusing to run. No API calls were made.")
+    design = config["capability_sweep"]["design"]
+    trials = limit_to_first_n_units(sd.load_manifest(config["capability_sweep"]["manifest_file"]), args.limit)
+    settings = _experimental_settings(args.evaluator_profile, config, design["replicates"], _cli_overrides(args))
+    _execute(args, "capability", trials, cap.make_observation_id, settings,
+             results_path_for_profile(CAPABILITY_RESULTS_FILE if args.production else RUN_KIND_FILES["capability"]["exploratory"], args.evaluator_profile),
+             "production" if args.production else "exploratory", args.evaluator_profile, manifest_sha=sha256_of_file(config["capability_sweep"]["manifest_file"]))
+
+
+def cmd_capability_analysis(args):
+    import analyze_controllability_v3_experimental as ax
+    config, study_config = load_experimental_config(), load_study_config()
+    profiles = args.profiles or config["capability_sweep"]["design"]["profiles"]
+    rows = {pid: ax.load_rows(results_path_for_profile(CAPABILITY_RESULTS_FILE, pid)) for pid in profiles}
+    rows = {pid: r for pid, r in rows.items() if r}
+    if not rows:
+        raise SystemExit("No capability results for the requested profiles.")
+    res = ax.analyze_capability(rows, config["capability_sweep"]["design"], study_config, n_draws=args.bootstrap_draws or config["bootstrap_draws"], seed=config["random_seed"])
+    print(f"Wrote {ax.write_outputs(res, args.analysis_dir)} to {args.analysis_dir}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1180,7 +1760,7 @@ def build_parser():
         p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
         p.add_argument("--allow-peak-pricing", action="store_true")
         p.add_argument("--skip-credential-check", action="store_true")
-        p.add_argument("--assumed-throughput", type=float, default=DEFAULT_ASSUMED_JUDGMENTS_PER_SECOND, help="judgments/s used ONLY for the runtime estimate")
+        add_throughput_arguments(p)
         p.set_defaults(func=fn)
 
     p = sub.add_parser("stress-dose-generate", help="(Re)generate the deterministic dose-response manifest; no API calls")
@@ -1221,6 +1801,71 @@ def build_parser():
     p.add_argument("--analysis-dir", default=STRESS_ANALYSIS_DIR)
     p.add_argument("--bootstrap-draws", type=int, default=None)
     p.set_defaults(func=cmd_stress_analysis)
+
+    # ---- experimental families ----
+    p = sub.add_parser("runtime-estimate", help="Measure throughput from a results file and print runtime scenarios; no API calls")
+    add_throughput_arguments(p)
+    p.add_argument("--concurrency", type=int, default=None)
+    p.add_argument("--judgments", type=int, default=None)
+    p.set_defaults(func=cmd_runtime_estimate)
+
+    p = sub.add_parser("design-simulate", help="Simulation-based power/design tool (advisory; changes nothing); no API calls")
+    p.add_argument("--n-sims", type=int, default=20)
+    p.add_argument("--n-draws", type=int, default=200)
+    p.add_argument("--seed", type=int, default=20260921)
+    p.add_argument("--designs", nargs="*", default=None)
+    p.add_argument("--out-dir", default=DESIGN_SIM_DIR)
+    p.set_defaults(func=cmd_design_simulate)
+
+    for name, fn in (("adaptive-dose-preflight", cmd_adaptive_dose_preflight), ("capability-preflight", cmd_capability_preflight)):
+        p = sub.add_parser(name, help="Zero API calls")
+        p.add_argument("--evaluator-profile", default=PRIMARY_PROFILE_ID, choices=judge_profiles)
+        p.add_argument("--profiles", nargs="*", default=None)
+        p.add_argument("--skip-credential-check", action="store_true")
+        add_throughput_arguments(p)
+        p.set_defaults(func=fn)
+
+    p = sub.add_parser("adaptive-dose-run", help="Adaptive dose rounds (judge; resumable; deterministic replay)")
+    add_execution_arguments(p)
+    p.set_defaults(func=cmd_adaptive_dose_run)
+    p = sub.add_parser("adaptive-dose-analysis", help="Adaptive thresholds/slopes/stopping/decisions; no API calls")
+    p.add_argument("--evaluator-profile", default=PRIMARY_PROFILE_ID, choices=judge_profiles)
+    p.add_argument("--analysis-dir", default=EXPERIMENTAL_ANALYSIS_DIR)
+    p.add_argument("--bootstrap-draws", type=int, default=None)
+    p.set_defaults(func=cmd_adaptive_dose_analysis)
+
+    for name, fn in (("iterative-attack-generate", cmd_iterative_attack_generate), ("iterative-attack-next-generation", cmd_iterative_attack_next_generation)):
+        p = sub.add_parser(name, help="ATTACKER model (paid); development feedback only")
+        p.add_argument("--evaluator-profile", default=PRIMARY_PROFILE_ID, choices=judge_profiles)
+        p.add_argument("--attacker-profile", default=None, choices=profile_ids())
+        p.add_argument("--allow-unfrozen", action="store_true")
+        p.add_argument("--allow-peak-pricing", action="store_true")
+        p.add_argument("--dry-run", action="store_true")
+        p.set_defaults(func=fn)
+    for name, fn in (("iterative-attack-evaluate-dev", cmd_iterative_attack_evaluate_dev), ("iterative-attack-run-heldout", cmd_iterative_attack_run_heldout)):
+        p = sub.add_parser(name, help="Judge (paid; resumable)")
+        add_execution_arguments(p)
+        p.set_defaults(func=fn)
+    p = sub.add_parser("iterative-attack-freeze", help="Select final attacks (best-ever dev score), build held-out manifest, freeze; no API calls")
+    p.add_argument("--evaluator-profile", default=PRIMARY_PROFILE_ID, choices=judge_profiles)
+    p.add_argument("--allow-unfrozen", action="store_true")
+    p.set_defaults(func=cmd_iterative_attack_freeze)
+    p = sub.add_parser("iterative-attack-analysis", help="Generation summary, learning curve, generalization; no API calls")
+    p.add_argument("--evaluator-profile", default=PRIMARY_PROFILE_ID, choices=judge_profiles)
+    p.add_argument("--analysis-dir", default=EXPERIMENTAL_ANALYSIS_DIR)
+    p.add_argument("--bootstrap-draws", type=int, default=None)
+    p.set_defaults(func=cmd_iterative_attack_analysis)
+
+    p = sub.add_parser("capability-generate", help="Build the paired capability-sweep manifest; no API calls")
+    p.set_defaults(func=cmd_capability_generate)
+    p = sub.add_parser("capability-run", help="Judge under one evaluator profile (paid; resumable)")
+    add_execution_arguments(p)
+    p.set_defaults(func=cmd_capability_run)
+    p = sub.add_parser("capability-analysis", help="Per-profile and between-profile paired analysis; no API calls")
+    p.add_argument("--profiles", nargs="*", default=None)
+    p.add_argument("--analysis-dir", default=EXPERIMENTAL_ANALYSIS_DIR)
+    p.add_argument("--bootstrap-draws", type=int, default=None)
+    p.set_defaults(func=cmd_capability_analysis)
     return parser
 
 

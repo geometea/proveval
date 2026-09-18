@@ -83,7 +83,7 @@ def run_args(profile=PRIMARY_PROFILE_ID, **over):
 
 
 def preflight_args(**over):
-    d = dict(family="all", evaluator_profile=PRIMARY_PROFILE_ID, concurrency=4, allow_peak_pricing=True, skip_credential_check=True, assumed_throughput=8.0)
+    d = dict(family="all", evaluator_profile=PRIMARY_PROFILE_ID, concurrency=4, allow_peak_pricing=True, skip_credential_check=True, throughput_jps=None, throughput_from_results=None)
     d.update(over)
     return argparse.Namespace(**d)
 
@@ -249,4 +249,9 @@ class TestDoseAndProfiles:
     def test_cost_plan_numbers(self, stress_env):
         plan = rv3.stress_cost_plan(rv3.load_stress_config())
         assert plan["stages"]["dose_response_judgments"] == 63360 and plan["stages"]["adversarial_attack_generation_calls"] == 40
-        assert plan["estimated_hours"]["dose_response_judgments"] == pytest.approx(63360 / 8 / 3600)
+        hours = plan["estimated_hours"]["dose_response_judgments"]
+        assert hours["conservative"] == pytest.approx(63360 / 1.4 / 3600)   # observed v2 recovery rate, never faster
+        assert "ASSUMED" in plan["scenarios"]["dose_response_judgments"]["scenarios"]["empirical"]["basis"]
+        measured = rv3.stress_cost_plan(rv3.load_stress_config(), throughput_jps=2.8, throughput_basis="measured")
+        assert measured["estimated_hours"]["dose_response_judgments"]["empirical"] == pytest.approx(63360 / 2.8 / 3600)
+        assert measured["estimated_hours"]["dose_response_judgments"]["conservative"] == pytest.approx(63360 / 1.4 / 3600)

@@ -1,0 +1,230 @@
+name: Proveval v3 experimental families (adaptive dose, iterative red-team, capability sweep)
+
+# Separate from the frozen primary (proveval-v3-selective-suppression.yml)
+# and stress (proveval-v3-stress.yml) workflows and from deepseek-v2.yml.
+# Manual dispatch only. Each paid step is gated on the exact mode string
+# that pays for it; preflight / analysis-only can never reach one.
+# Time budgets assume the OBSERVED v2 recovery rate of ~1.4 judgments/s
+# with a safety margin (controllability_v3_runtime), never 8 judgments/s:
+# a 300-minute step covers ~20,000 judgments; everything larger resumes
+# across dispatches through the cache.
+#
+# Modes:
+#   preflight                     adaptive + capability + profile preflights; zero API calls
+#   adaptive-dose                 adaptive rounds (judge), resumable, deterministic replay
+#   iterative-generate            attacker seeds generation 0 (uploads population artifact to commit)
+#   iterative-step                judge evaluates the current generation on DEVELOPMENT pairs,
+#                                 then the attacker writes the next generation (upload to commit)
+#   iterative-freeze              select best-ever attacks, build held-out manifest, freeze (upload to commit)
+#   iterative-heldout             judge evaluates the frozen attacks on HELD-OUT pairs
+#   capability-sweep              judge under the chosen evaluator profile on the paired manifest
+#   analysis-only                 all three analyses on cached results; zero API calls
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What should this run do?
+        required: true
+        default: preflight
+        type: choice
+        options:
+          - preflight
+          - adaptive-dose
+          - iterative-generate
+          - iterative-step
+          - iterative-freeze
+          - iterative-heldout
+          - capability-sweep
+          - analysis-only
+      evaluator_profile:
+        description: Evaluator profile (model-side identity; scientific manifests never change)
+        required: true
+        default: deepseek_flash_low
+        type: choice
+        options:
+          - deepseek_flash_low
+          - deepseek_flash_medium
+          - deepseek_flash_high
+          - anthropic_claude_sonnet_5_low
+          - openai_gpt_5_6_low
+          - gemini_3_8_flash_low
+      attacker_profile:
+        description: Attacker profile (iterative-generate / iterative-step only)
+        required: false
+        default: attacker_deepseek_flash_high
+        type: string
+      time_budget_minutes:
+        description: Paid steps stop submitting new calls after this many minutes (in-flight calls complete; re-dispatch to resume)
+        required: false
+        default: "280"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proveval-v3-experimental
+  cancel-in-progress: false
+
+jobs:
+  experimental:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore previous experimental state
+        if: ${{ inputs.mode != 'preflight' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            results/controllability_v3/stress_dose_adaptive
+            results/controllability_v3/stress_adversarial_iterative
+            results/controllability_v3/capability_sweep
+          key: proveval-v3-experimental-${{ inputs.evaluator_profile }}-${{ github.run_id }}
+          restore-keys: |
+            proveval-v3-experimental-${{ inputs.evaluator_profile }}-
+
+      # Primary raw results are READ for blind-baseline strata, ordinary
+      # references and analyses; never written by this workflow.
+      - name: Restore primary production results (read-only reference)
+        if: ${{ inputs.mode != 'preflight' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: results/controllability_v3/production
+          key: proveval-v3-production-never-matches-${{ github.run_id }}
+          restore-keys: |
+            proveval-v3-production-
+
+      - name: Evaluator profile preflight (zero API calls)
+        if: ${{ inputs.mode != 'analysis-only' }}
+        run: python3 run_controllability_v3.py profile-preflight --profiles ${{ inputs.evaluator_profile }}
+
+      - name: Adaptive-dose preflight (zero API calls)
+        if: ${{ inputs.mode == 'preflight' || inputs.mode == 'adaptive-dose' }}
+        run: python3 run_controllability_v3.py adaptive-dose-preflight --evaluator-profile ${{ inputs.evaluator_profile }}
+
+      - name: Capability preflight (zero API calls)
+        if: ${{ inputs.mode == 'preflight' || inputs.mode == 'capability-sweep' }}
+        run: python3 run_controllability_v3.py capability-preflight --profiles ${{ inputs.evaluator_profile }}
+
+      # ---------------- adaptive dose ----------------
+      - name: Adaptive-dose rounds (judge)
+        if: ${{ inputs.mode == 'adaptive-dose' }}
+        timeout-minutes: 300
+        run: |
+          python3 run_controllability_v3.py adaptive-dose-run --production --concurrency 32 \
+            --evaluator-profile ${{ inputs.evaluator_profile }} \
+            --run-id "v3-adaptive-${{ github.run_id }}" \
+            --time-budget-minutes ${{ inputs.time_budget_minutes }}
+
+      # ---------------- iterative adversary ----------------
+      - name: Iterative generation 0 (ATTACKER model)
+        if: ${{ inputs.mode == 'iterative-generate' }}
+        timeout-minutes: 60
+        run: python3 run_controllability_v3.py iterative-attack-generate --attacker-profile ${{ inputs.attacker_profile }} --evaluator-profile ${{ inputs.evaluator_profile }}
+
+      - name: Iterative development evaluation (judge, DEVELOPMENT pairs only)
+        if: ${{ inputs.mode == 'iterative-step' }}
+        timeout-minutes: 240
+        run: |
+          python3 run_controllability_v3.py iterative-attack-evaluate-dev --production --concurrency 32 \
+            --evaluator-profile ${{ inputs.evaluator_profile }} \
+            --run-id "v3-iterative-dev-${{ github.run_id }}" \
+            --time-budget-minutes ${{ inputs.time_budget_minutes }}
+
+      - name: Iterative next generation (ATTACKER model, aggregate dev feedback only)
+        if: ${{ inputs.mode == 'iterative-step' }}
+        timeout-minutes: 60
+        run: python3 run_controllability_v3.py iterative-attack-next-generation --attacker-profile ${{ inputs.attacker_profile }} --evaluator-profile ${{ inputs.evaluator_profile }}
+
+      - name: Iterative freeze (select best-ever, build held-out manifest; zero API calls)
+        if: ${{ inputs.mode == 'iterative-freeze' }}
+        run: python3 run_controllability_v3.py iterative-attack-freeze --evaluator-profile ${{ inputs.evaluator_profile }}
+
+      - name: Upload iterative population / selection (commit into data/ before the next stage)
+        if: ${{ always() && (inputs.mode == 'iterative-generate' || inputs.mode == 'iterative-step' || inputs.mode == 'iterative-freeze') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: proveval-v3-iterative-attacks-${{ github.run_id }}
+          path: |
+            data/controllability_v3_iterative_attack_population.jsonl
+            data/controllability_v3_iterative_attack_selected.json
+            data/controllability_v3_iterative_attack_eval_trials.jsonl
+            data/controllability_v3_experimental_frozen_lock.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Iterative held-out evaluation (judge, HELD-OUT pairs)
+        if: ${{ inputs.mode == 'iterative-heldout' }}
+        timeout-minutes: 300
+        run: |
+          python3 run_controllability_v3.py iterative-attack-run-heldout --production --concurrency 32 \
+            --evaluator-profile ${{ inputs.evaluator_profile }} \
+            --run-id "v3-iterative-heldout-${{ github.run_id }}" \
+            --time-budget-minutes ${{ inputs.time_budget_minutes }}
+
+      # ---------------- capability sweep ----------------
+      - name: Capability sweep (judge under the chosen profile)
+        if: ${{ inputs.mode == 'capability-sweep' }}
+        timeout-minutes: 300
+        run: |
+          python3 run_controllability_v3.py capability-run --production --concurrency 32 \
+            --evaluator-profile ${{ inputs.evaluator_profile }} \
+            --run-id "v3-capability-${{ github.run_id }}" \
+            --time-budget-minutes ${{ inputs.time_budget_minutes }}
+
+      # ---------------- analyses (zero API calls) ----------------
+      - name: Adaptive-dose analysis
+        if: ${{ inputs.mode == 'adaptive-dose' || inputs.mode == 'analysis-only' }}
+        run: python3 run_controllability_v3.py adaptive-dose-analysis --evaluator-profile ${{ inputs.evaluator_profile }} || echo "no adaptive results yet"
+
+      - name: Iterative-attack analysis
+        if: ${{ inputs.mode == 'iterative-heldout' || inputs.mode == 'analysis-only' }}
+        run: python3 run_controllability_v3.py iterative-attack-analysis --evaluator-profile ${{ inputs.evaluator_profile }} || echo "no iterative results yet"
+
+      - name: Capability analysis
+        if: ${{ inputs.mode == 'capability-sweep' || inputs.mode == 'analysis-only' }}
+        run: python3 run_controllability_v3.py capability-analysis || echo "no capability results yet"
+
+      - name: Save resumable experimental state
+        if: ${{ always() && inputs.mode != 'preflight' && inputs.mode != 'analysis-only' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            results/controllability_v3/stress_dose_adaptive
+            results/controllability_v3/stress_adversarial_iterative
+            results/controllability_v3/capability_sweep
+          key: proveval-v3-experimental-${{ inputs.evaluator_profile }}-${{ github.run_id }}
+
+      - name: Upload experimental results
+        if: ${{ always() && inputs.mode != 'preflight' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: proveval-v3-experimental-results-${{ inputs.evaluator_profile }}-${{ github.run_id }}
+          path: |
+            results/controllability_v3/stress_dose_adaptive/
+            results/controllability_v3/stress_adversarial_iterative/
+            results/controllability_v3/capability_sweep/
+            results/controllability_v3/analysis/experimental/
+          if-no-files-found: warn
+          retention-days: 30

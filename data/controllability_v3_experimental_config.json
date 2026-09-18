@@ -1,0 +1,202 @@
+{
+  "design_version": "v3_experimental",
+  "experiment_id": "context_controllability_v3_experimental",
+  "default_evaluator_profile_id": "deepseek_flash_low",
+  "random_seed": 20260921,
+  "bootstrap_draws": 5000,
+  "retry_limit": 3,
+  "adaptive_dose": {
+    "policy": {
+      "allowed_doses": [
+        51,
+        55,
+        60,
+        65,
+        70,
+        75,
+        80,
+        85,
+        90,
+        95,
+        99
+      ],
+      "anchor_doses": [
+        51,
+        70,
+        90,
+        99
+      ],
+      "primary_target": "d10",
+      "targets": {
+        "d10": 0.1,
+        "d25": 0.25
+      },
+      "max_rounds_per_unit": 12,
+      "max_visits_per_dose": 3,
+      "target_ci_width_dose_points": 10.0,
+      "min_rounds_for_flat": 6,
+      "min_slope_of_interest": 0.05,
+      "n_strata": 3,
+      "stratification": "blind baseline strength tertiles from primary no-context I0 when available, else one pooled stratum",
+      "interventions": [
+        "I0",
+        "I1",
+        "I2",
+        "I3",
+        "I4",
+        "I5",
+        "I6",
+        "I7"
+      ],
+      "next_dose_rule": "after the anchors, cycle targets (d10, d25) and sample the allowed dose nearest to the current estimate of that target (visit cap respected; ties -> lower dose); variance criterion recorded as a diagnostic only",
+      "target_cycle": [
+        "d10",
+        "d25"
+      ],
+      "global_max_judgments": 25344
+    },
+    "arithmetic": {
+      "units": 24,
+      "judgments_per_round_per_unit": 88,
+      "anchor_rounds": 4,
+      "min_judgments_anchors_only": 8448,
+      "max_judgments_hard_budget": 25344,
+      "fixed_grid_reference_judgments": 63360
+    },
+    "split_file": null,
+    "schedule_file": "results/controllability_v3/stress_dose_adaptive/adaptive_dose_schedule.jsonl",
+    "state_file": "results/controllability_v3/stress_dose_adaptive/adaptive_dose_state.json",
+    "status": "frozen"
+  },
+  "iterative_attack": {
+    "policy": {
+      "population_size": 6,
+      "elite_count": 2,
+      "mutations_per_elite": 2,
+      "recombinations": 1,
+      "generations": 3,
+      "interventions": [
+        "I0",
+        "I1",
+        "I2",
+        "I3",
+        "I4",
+        "I5",
+        "I6",
+        "I7"
+      ],
+      "cues": [
+        "provenance_human_vs_llm",
+        "source_journal_vs_random",
+        "reception_positive_vs_negative",
+        "opinion_liked_vs_disliked",
+        "editing_edited_vs_first_draft"
+      ],
+      "dev_replicates": 1,
+      "eval_replicates": 3,
+      "final_top_k": 2,
+      "min_dev_pairs_for_score": 15,
+      "diversity_rule": "a child's normalised template (lower-case, whitespace-collapsed, punctuation-stripped) must not equal any member's in the key's history",
+      "selection_score": "dev_score = mean D_pair(attack) - mean D_pair(ordinary wording) over complete development pairs (attack-only when no ordinary reference)",
+      "final_selection_rule": "top final_top_k by dev_score over every evaluated member of every generation (best-ever); ties by generation then member index",
+      "break_recovery_pp": 0.1,
+      "break_fraction_of_control": 0.5,
+      "feedback_allowed": [
+        "dev_score",
+        "dev_ce_attack",
+        "dev_ce_ordinary",
+        "best_score_previous_generation",
+        "cue_family",
+        "intervention_id",
+        "generation"
+      ],
+      "attacker_system_prompt_sha256": "ffa3333ceee6055f32fd582cf245687aa4e202d9905543470d07480a2c54567a",
+      "seed_from_frozen_candidates": true
+    },
+    "arithmetic": {
+      "keys": 40,
+      "generation0_members_per_key": 6,
+      "children_per_generation_per_key": 5,
+      "generations_after_zero": 3,
+      "dev_judgments_per_key_max": 1848,
+      "dev_judgments_max": 73920,
+      "attacker_calls_per_key": 10,
+      "attacker_calls_max": 400,
+      "heldout_judgments": 42240
+    },
+    "split_file": "data/controllability_v3_stress_adversarial_split.json",
+    "population_file": "data/controllability_v3_iterative_attack_population.jsonl",
+    "selected_file": "data/controllability_v3_iterative_attack_selected.json",
+    "eval_manifest_file": "data/controllability_v3_iterative_attack_eval_trials.jsonl",
+    "default_attacker_profile_id": "attacker_deepseek_flash_high",
+    "status": "frozen"
+  },
+  "capability_sweep": {
+    "design": {
+      "n_pairs_per_stratum": 8,
+      "strata": [
+        "strong",
+        "moderate",
+        "ambiguous"
+      ],
+      "interventions": [
+        "I0",
+        "I1",
+        "I4",
+        "I5",
+        "I7"
+      ],
+      "cues": [
+        "provenance_human_vs_llm",
+        "source_journal_vs_random",
+        "reception_positive_vs_negative",
+        "opinion_liked_vs_disliked",
+        "editing_edited_vs_first_draft"
+      ],
+      "conditions": [
+        "nocontext",
+        "ordinary",
+        "attack",
+        "dose"
+      ],
+      "doses": [
+        51,
+        80,
+        99
+      ],
+      "replicates": 3,
+      "pair_selection_seed": 20260920,
+      "profiles": [
+        "deepseek_flash_low",
+        "deepseek_flash_medium",
+        "deepseek_flash_high"
+      ],
+      "pair_selection": "blind-baseline strength tertiles (primary no-context I0) when available, else seeded story-balanced subset"
+    },
+    "arithmetic_without_attacks": {
+      "pairs": 24,
+      "interventions": 5,
+      "cells_per_pair_intervention": 34,
+      "unique_cells": 4080,
+      "replicates": 3,
+      "judgments_per_profile": 12240,
+      "profiles": 3,
+      "judgments_all_profiles": 36720,
+      "attacks_included": false
+    },
+    "arithmetic_with_attacks": {
+      "pairs": 24,
+      "interventions": 5,
+      "cells_per_pair_intervention": 54,
+      "unique_cells": 6480,
+      "replicates": 3,
+      "judgments_per_profile": 19440,
+      "profiles": 3,
+      "judgments_all_profiles": 58320,
+      "attacks_included": true
+    },
+    "manifest_file": "data/controllability_v3_capability_trials.jsonl",
+    "meta_file": "data/controllability_v3_capability_manifest_meta.json",
+    "status": "frozen"
+  }
+}
