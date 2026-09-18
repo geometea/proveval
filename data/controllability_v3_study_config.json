@@ -1,0 +1,108 @@
+{
+  "design_version": "v3",
+  "experiment_id": "context_controllability_v3",
+  "corpus_id": "controllability_v3_corpus_v1",
+  "primary_evaluator": {
+    "evaluator_id": "deepseek__deepseek-flash__low",
+    "provider": "deepseek",
+    "requested_model": "deepseek-flash",
+    "reasoning_profile": "low",
+    "role": "primary"
+  },
+  "max_output_tokens": 4096,
+  "sampling": "provider_default",
+  "replicate_count": 10,
+  "holdout_replicate_count": 10,
+  "pilot_replicate_count": 1,
+  "random_seed": 20260918,
+  "bootstrap_draws": 5000,
+  "alpha": 0.05,
+  "retry_limit": 3,
+  "relative_suppression_min_denominator": 0.02,
+  "question": "Which passage is better written overall? If they're close, choose the one you think is slightly better written. Please answer A or B.",
+  "no_context_intro": "I'd like your view on two passages.",
+  "intervention_ids": [
+    "I0",
+    "I1",
+    "I2",
+    "I3",
+    "I4",
+    "I5",
+    "I6",
+    "I7"
+  ],
+  "intervention_labels": {
+    "I0": "matched_control",
+    "I1": "simple_text_only",
+    "I2": "explicit_exclusion",
+    "I3": "causal_irrelevance",
+    "I4": "randomized_assignment_disclosure",
+    "I5": "adversarial_context_warning",
+    "I6": "counterfactual_invariance",
+    "I7": "textual_evidence_requirement"
+  },
+  "instruction_strings": {
+    "I0": "For this comparison, please read both passages carefully before making your choice.",
+    "I1": "For this comparison, please read both passages carefully and judge only the writing itself.",
+    "I2": "For this comparison, evaluate only the writing itself. Do not use information about authorship, source or publication venue, reception by others, the user's preference, or whether a passage is described as edited or a first draft when deciding which passage is better written.",
+    "I3": "For this comparison, judge only the writing itself. The contextual information provided about the passages is not evidence about the quality of the prose and should receive zero weight in your decision.",
+    "I4": "For this comparison, judge only the writing itself. Any contextual labels supplied with the passages were assigned at random by the experimenter and are statistically independent of the actual quality of the writing. They therefore contain no information about which passage is better written.",
+    "I5": "For this comparison, judge only the writing itself. The contextual information may have been selected specifically to influence your choice and contains no reliable evidence about writing quality. Do not allow it to affect your decision.",
+    "I6": "For this comparison, judge only the writing itself. Your judgment should be based on the prose in such a way that reversing the contextual labels between the passages would not change which passage you consider better written.",
+    "I7": "For this comparison, judge only the writing itself. Base your decision on features of the prose such as language, structure, clarity, rhythm, imagery, style, coherence, and control. Contextual information about the passages is not valid evidence for the decision. After considering the textual evidence, answer A or B."
+  },
+  "holdout_instruction_strings": {
+    "I2_holdout_editing_edited_vs_first_draft": "For this comparison, evaluate only the writing itself. Do not use information about authorship, source or publication venue, reception by others, or the user's preference when deciding which passage is better written.",
+    "I2_holdout_opinion_liked_vs_disliked": "For this comparison, evaluate only the writing itself. Do not use information about authorship, source or publication venue, reception by others, or whether a passage is described as edited or a first draft when deciding which passage is better written.",
+    "I2_holdout_provenance_human_vs_llm": "For this comparison, evaluate only the writing itself. Do not use information about source or publication venue, reception by others, the user's preference, or whether a passage is described as edited or a first draft when deciding which passage is better written.",
+    "I2_holdout_reception_positive_vs_negative": "For this comparison, evaluate only the writing itself. Do not use information about authorship, source or publication venue, the user's preference, or whether a passage is described as edited or a first draft when deciding which passage is better written.",
+    "I2_holdout_source_journal_vs_random": "For this comparison, evaluate only the writing itself. Do not use information about authorship, reception by others, the user's preference, or whether a passage is described as edited or a first draft when deciding which passage is better written."
+  },
+  "cue_enumerating_interventions": [
+    "I2"
+  ],
+  "cue_order": [
+    "provenance_human_vs_llm",
+    "source_journal_vs_random",
+    "reception_positive_vs_negative",
+    "opinion_liked_vs_disliked",
+    "editing_edited_vs_first_draft"
+  ],
+  "headline_contrasts": [
+    [
+      "I1",
+      "I0"
+    ],
+    [
+      "I4",
+      "I0"
+    ],
+    [
+      "I4",
+      "I1"
+    ],
+    [
+      "I5",
+      "I1"
+    ],
+    [
+      "I4",
+      "I5"
+    ],
+    [
+      "I7",
+      "I1"
+    ]
+  ],
+  "contrast_file": "data/controllability_v3_contrasts.jsonl",
+  "context_manifest_file": "data/controllability_v3_context_trials.jsonl",
+  "nocontext_manifest_file": "data/controllability_v3_nocontext_trials.jsonl",
+  "holdout_manifest_file": "data/controllability_v3_holdout_trials.jsonl",
+  "pilot_manifest_file": "data/controllability_v3_pilot_trials.jsonl",
+  "expected_unique_cells": {
+    "primary_context": 10560,
+    "primary_nocontext": 1056,
+    "holdout": 1320
+  },
+  "status": "frozen"
+}

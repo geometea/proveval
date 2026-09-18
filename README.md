@@ -553,6 +553,39 @@ See `controllability_trials.py` and `analyze_controllability.py` for the
 full rationale; `FINAL_DESIGN.md` is not rewritten around this experiment
 for the same reason as above.
 
+## Context-controllability experiment v3 (selective suppression; implemented, not yet run)
+
+v3 asks which kinds of instruction let the judge suppress irrelevant
+contextual influence **without** changing the judgment it would have made
+with no context shown. Eight intervention sentences (I0 matched control,
+I1 simple text-only = v2's treatment, I2 explicit exclusion, I3 causal
+irrelevance, I4 randomized-assignment disclosure, I5 adversarial warning,
+I6 counterfactual invariance, I7 textual-evidence requirement), each run
+with context present and with no context, plus a held-out-cue
+generalization experiment for I2. Same 12 stories, same five cues, same
+question, same evaluator configuration as v2 (DeepSeek Flash, low
+reasoning, 4096-token ceiling). See `STUDY_PROTOCOL_V3.md`.
+
+Everything is a separate `v3` namespace and never touches v2:
+
+| purpose | file |
+|---|---|
+| frozen wording / cue table / prompt template | `controllability_v3_design.py` |
+| manifests (10,560 context + 1,056 no-context + 1,320 holdout cells; 784-cell pilot) | `controllability_v3_trials.py` → `data/controllability_v3_*_trials.jsonl` |
+| study config, corpus metadata, v2 snapshot, freeze/lock | `controllability_v3_study_config.py`, `controllability_v3_corpus.py`, `controllability_v3_v2_guard.py`, `freeze_controllability_v3.py` |
+| execution (interleaved randomisation, valid-only resume, time budget) | `controllability_v3_execution.py`, `run_controllability_v3.py` |
+| statistics and analysis (suppression, noise-corrected drift, frontier, ambiguity, held-out transfer) | `controllability_v3_stats.py`, `analyze_controllability_v3.py`, `controllability_v3_plots.py` |
+| workflow | `.github/workflows/proveval-v3-selective-suppression.yml` |
+| tests | `tests/test_*v3*.py` |
+
+```
+python3 run_controllability_v3.py preflight        # 20 structural checks, zero API calls
+python3 run_controllability_v3.py pilot --production --concurrency 32 && python3 run_controllability_v3.py pilot-report
+python3 run_controllability_v3.py production --production --concurrency 32 --time-budget-minutes 290   # resumable
+python3 run_controllability_v3.py holdout --production --concurrency 32                                # resumable
+python3 run_controllability_v3.py analysis         # results/controllability_v3/analysis/
+```
+
 ## Context-controllability experiment v2 (recommended)
 
 A from-scratch v2 redesign of the experiment above, generated and analyzed

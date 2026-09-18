@@ -1,0 +1,147 @@
+name: Proveval v3 selective suppression experiment
+
+# Entirely separate from deepseek-v2.yml. This workflow only ever invokes
+# run_controllability_v3.py (never run_controllability_v2.py or
+# analyze_controllability_v2.py), only ever touches results/controllability_v3/,
+# and has NO schedule trigger -- every run is an explicit manual dispatch.
+#
+# Modes:
+#   preflight      structural/frozen-design checks only; makes zero API calls
+#   pilot          preflight + the ~784-call deterministic pilot + pilot report
+#   production     preflight + resumable primary run (+ held-out cue run) + analysis
+#   analysis-only  re-run the analysis on cached production results; zero API calls
+#
+# Every step that can dispatch a paid model call is gated on the EXACT mode
+# string ('pilot' or 'production'); 'preflight' and 'analysis-only' can never
+# reach one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What should this run do?
+        required: true
+        default: preflight
+        type: choice
+        options:
+          - preflight
+          - pilot
+          - production
+          - analysis-only
+      run_holdout:
+        description: In production mode, also run the held-out-cue generalization manifest (13,200 additional judgments)
+        required: false
+        default: true
+        type: boolean
+      time_budget_minutes:
+        description: Production/holdout steps stop submitting new calls after this many minutes (in-flight calls complete; re-dispatch to resume)
+        required: false
+        default: "290"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proveval-v3-production
+  cancel-in-progress: false
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Restore any previous production state so the valid-answer-only
+      # resume logic executes only what is still missing.
+      - name: Restore previous v3 production state
+        if: ${{ inputs.mode == 'production' || inputs.mode == 'analysis-only' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: results/controllability_v3/production
+          key: proveval-v3-production-${{ github.run_id }}
+          restore-keys: |
+            proveval-v3-production-
+
+      - name: v3 preflight (zero API calls)
+        if: ${{ inputs.mode != 'analysis-only' }}
+        run: python3 run_controllability_v3.py preflight --concurrency 32
+
+      # ---------------------------------------------------------------
+      # Pilot (mode: pilot only). Pilot rows live in results/controllability_v3/pilot/
+      # and carry the "pilot" family -- they can never enter the primary analysis.
+      # ---------------------------------------------------------------
+      - name: Run v3 pilot
+        if: ${{ inputs.mode == 'pilot' }}
+        timeout-minutes: 60
+        run: python3 run_controllability_v3.py pilot --production --concurrency 32 --run-id "v3-pilot-${{ github.run_id }}"
+
+      - name: v3 pilot report (compliance/tokens/latency only; no effect sizes)
+        if: ${{ inputs.mode == 'pilot' }}
+        run: python3 run_controllability_v3.py pilot-report
+
+      - name: Upload v3 pilot results
+        if: ${{ always() && inputs.mode == 'pilot' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: proveval-v3-pilot-${{ github.run_id }}
+          path: results/controllability_v3/pilot/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ---------------------------------------------------------------
+      # Production (mode: production only). Resumable; re-dispatch to continue.
+      # ---------------------------------------------------------------
+      - name: Run v3 primary experiment (context + no-context, interleaved)
+        if: ${{ inputs.mode == 'production' }}
+        timeout-minutes: 300
+        run: |
+          python3 run_controllability_v3.py production --production --concurrency 32 \
+            --run-id "v3-production-${{ github.run_id }}" \
+            --time-budget-minutes ${{ inputs.time_budget_minutes }}
+
+      - name: Run v3 held-out-cue generalization experiment
+        if: ${{ inputs.mode == 'production' && inputs.run_holdout }}
+        timeout-minutes: 120
+        run: |
+          python3 run_controllability_v3.py holdout --production --concurrency 32 \
+            --run-id "v3-holdout-${{ github.run_id }}" \
+            --time-budget-minutes 100
+
+      - name: v3 analysis (zero API calls)
+        if: ${{ inputs.mode == 'production' || inputs.mode == 'analysis-only' }}
+        run: python3 run_controllability_v3.py analysis
+
+      - name: Save resumable v3 production state
+        if: ${{ always() && inputs.mode == 'production' }}
+        uses: actions/cache/save@v4
+        with:
+          path: results/controllability_v3/production
+          key: proveval-v3-production-${{ github.run_id }}
+
+      - name: Upload v3 results
+        if: ${{ always() && (inputs.mode == 'production' || inputs.mode == 'analysis-only') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: proveval-v3-results-${{ github.run_id }}
+          path: |
+            results/controllability_v3/production/
+            results/controllability_v3/analysis/
+          if-no-files-found: warn
+          retention-days: 30
