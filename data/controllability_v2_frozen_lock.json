@@ -1,0 +1,12 @@
+{
+  "design_version": "v2",
+  "experiment_id": "context_controllability_v2",
+  "frozen_at": "2026-09-18T04:57:54.254325+00:00",
+  "hashes": {
+    "study_config_sha256": "fc19aca097e32557bf693cf9381dd272297dee9e89833867504dba17f77c831b",
+    "contrasts_sha256": "44dab20a8d90472f5cbc51a781a1e969cf253c2df3f057472280b06d1cc0cb93",
+    "corpus_sha256": "582e2cd53f2372c61061f78b3599d26cff0629627356d6f314bf4564609f1cae",
+    "baseline_manifest_sha256": "20cad7acfbdd59efe386bebcdc7a3d4242d6e4d9a064de0f0c6bb4a732a1e12f",
+    "treatment_manifest_sha256": "7abd33ab819092d65de05ba7e933080c01a4a6b4207b65406de79c23cf8cf422"
+  }
+}
