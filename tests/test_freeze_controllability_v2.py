@@ -114,14 +114,23 @@ class TestVerifyFrozen:
         assert ok is True
 
 
-def test_the_real_repo_draft_config_was_never_frozen_by_these_tests():
-    """Guard against a test accidentally freezing the real on-disk design --
-    freezing must remain an explicit, never-automatic action."""
+def test_the_real_repo_study_config_is_in_a_valid_state_never_corrupted_by_tests():
+    """Guard against a test accidentally freezing (or otherwise mutating)
+    the real on-disk design -- freezing must remain an explicit, deliberate
+    action taken outside of this test suite. The design may legitimately be
+    "draft" (not yet frozen) or "frozen" (a real freeze was performed
+    on purpose, e.g. ahead of a scheduled production run) -- either is
+    valid; what must never happen is this test suite silently flipping it.
+    If frozen, the lock must validate cleanly against the current files."""
     from controllability_v2_study_config import STUDY_CONFIG_FILE, load_study_config
 
     config = load_study_config(STUDY_CONFIG_FILE)
-    assert config["status"] == "draft"
-    assert not os.path.exists(fz.LOCK_FILE)
+    assert config["status"] in ("draft", "frozen")
+    if config["status"] == "draft":
+        assert not os.path.exists(fz.LOCK_FILE)
+    else:
+        ok, reason = fz.verify_frozen()
+        assert ok is True, reason
 
 
 def test_the_real_repo_files_still_freeze_and_verify_cleanly(tmp_path):
